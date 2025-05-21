@@ -121,8 +121,7 @@ def main():
         shuffle=True,
         collate_fn=zero_pad_collator,
         num_workers=0,
-        pin_memory=False,
-    )
+        pin_memory=False)
 
     # fetch a batch
     batch = next(iter(loader))
@@ -137,5 +136,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+               
     
 
