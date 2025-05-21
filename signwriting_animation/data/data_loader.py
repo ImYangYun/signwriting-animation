@@ -1,104 +1,140 @@
-#dataloader
 import os
+import random
 import torch
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from pose_format import Pose
+from pose_format.torch.masked.collator import zero_pad_collator
+from pose_format.pose import Pose
+from pose_anonymization.data.normalization import normalize_mean_std  # FIXED IMPORT
+from signwriting.visualizer.visualize import signwriting_to_image
+from transformers import CLIPProcessor
+from PIL import Image
 
-class PosePredictionDataset(Dataset):
-    def __init__(self, data_dir, segmentation_csv, past_frames=40, future_frames=20, with_metadata=False):
+class DynamicPosePredictionDataset(Dataset):
     """
-    Dataset for SignWriting skeletal pose animation prediction.
-    
-    Args:
-        csv_path (str or Path): Path to the CSV file containing segmentation information
-                                with columns: ['pose', 'start', 'end'].
-        data_dir (str or Path): Path to the directory containing raw .pose files.
-        past_frames (int): Number of frames used as input (past pose).
-        future_frames (int): Number of frames to be predicted (target pose).
-        dtype (np.dtype): Data type for the pose arrays. Default is np.float32.
-        with_metadata (bool): Whether to include pose metadata (e.g., FPS, width, height). Default: False.
+    Dataset for dynamic on-the-fly sampling of normalized pose data
+    with SignWriting condition images and scalar metadata packed as length-1 tensors.
     """
+    def __init__(
+        self,
+        data_dir: str,
+        csv_path: str,
+        num_past_frames: int = 40,
+        num_future_frames: int = 20,
+        with_metadata: bool = True,
+        clip_model_name: str = "openai/clip-vit-base-patch32",
+    ):
+        super().__init__()
         self.data_dir = data_dir
+        self.num_past_frames = num_past_frames
+        self.num_future_frames = num_future_frames
         self.with_metadata = with_metadata
-        self.past_frames = past_frames
-        self.future_frames = future_frames
-        self.samples = []
 
-        df = pd.read_csv(segmentation_csv)
-        for _, row in df.iterrows():
-            pose_file = row["pose"]
-            sample_path = os.path.join(data_dir, "raw_poses", pose_file)
-            if not os.path.exists(sample_path):
-                continue
-            self.samples.append({
-                "path": sample_path,
-                "id": pose_file,
-                "start": int(row["start"]),
-                "end": int(row["end"])
-            })
+        # Load CSV into records
+        self.records = pd.read_csv(csv_path).to_dict(orient="records")
+
+        # Initialize CLIP processor for signwriting images
+        self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        item = self.samples[idx]
-        with open(item["path"], "rb") as f:
-            pose = Pose.read(f.read())
+        rec = self.records[idx]
+        start = rec.get("start", 0)
+        total = rec.get("end", start + self.num_past_frames + self.num_future_frames)
+        end = min(start + self.num_past_frames + self.num_future_frames, total)
 
-        data = pose.body.data.data
-        mask = pose.body.data.mask
+        # Load & normalize pose bytes
+        pose_path = os.path.join(self.data_dir, rec["pose"])
+        with open(pose_path, "rb") as f:
+            raw = f.read()
+        pose = Pose.read(raw)
+        pose = normalize_mean_std(pose)
 
-        clip = data[item["start"]:item["end"]]
-        clip_mask = mask[item["start"]:item["end"]]
+        # Slice the PoseBody, then convert to TorchPose and extract data+mask
+        input_pose_torch = pose.body[max(start, 0): start + self.num_past_frames].torch()
+        target_pose_torch = pose.body[start + self.num_past_frames: start + self.num_past_frames + self.num_future_frames].torch()
 
-        input_pose = clip[:self.past_frames]
-        target_pose = clip[self.past_frames:]
-        input_mask = clip_mask[:self.past_frames]
+        input_data = input_pose_torch.data.zero_filled().float()
+        input_mask = torch.logical_not(input_pose_torch.data.mask)
+        target_data = target_pose_torch.data.zero_filled().float()
+        target_mask = torch.logical_not(target_pose_torch.data.mask)
+        
+        # Render SignWriting to PIL (fallback size if missing)
+        sw_text = rec.get("text")
+        if not isinstance(sw_text, str) or not sw_text.strip():
+            pil_img = Image.new("RGB", (224, 224), color=(0, 0, 0))
+        else:
+            pil_img = signwriting_to_image(sw_text)  # Removed fallback default
+                
+        # Ensure valid RGB PIL Image
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        pil_img = pil_img.resize((224, 224))  # Resize to CLIP expected size
 
-        result = {
-            "input_pose": torch.tensor(input_pose, dtype=torch.float32),
-            "target_pose": torch.tensor(target_pose, dtype=torch.float32),
-            "mask": torch.tensor(input_mask, dtype=torch.bool),
-            "id": item["id"]
+        # CLIP preprocessing → [1,3,224,224]
+        clip_inputs = self.clip_processor(images=[pil_img], return_tensors="pt")
+        sign_img = clip_inputs.pixel_values.squeeze(0)
+
+        sample = {
+            "data": target_data,
+            "conditions": {
+                "input_pose": input_data,
+                "input_mask": input_mask,
+                "target_mask": target_mask,
+                "sign_image": sign_img,
+            },
+            "id": rec.get("id", os.path.basename(pose_path)),
         }
 
         if self.with_metadata:
-            result["metadata"] = {
-                "total_frames": item["end"] - item["start"]
+            meta = {
+                "total_frames": total,
+                "sample_start": start,
+                "sample_end": end,
+                "orig_start": rec.get("start", 0),
+                "orig_end": rec.get("end", total),
+            }
+            sample["metadata"] = {
+                k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()
             }
 
-        return result
+        return sample
 
-def collate_pose_fn(batch):
-    input_poses = [item["input_pose"] for item in batch]
-    target_poses = [item["target_pose"] for item in batch]
-    masks = [item["mask"] for item in batch]
+def main():
+    # define paths
+    data_dir = "/scratch/yayun/pose_data/raw_poses"
+    csv_path = os.path.join(os.path.dirname(data_dir), "data.csv")
 
-    input_padded = pad_sequence(input_poses, batch_first=True)
-    target_padded = pad_sequence(target_poses, batch_first=True)
-    mask_padded = pad_sequence(masks, batch_first=True)
+    # create dataset & loader
+    dataset = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=zero_pad_collator,
+        num_workers=0,
+        pin_memory=False,
+    )
 
-    return {
-        "input_pose": input_padded,
-        "target_pose": target_padded,
-        "mask": mask_padded,
-        "id": [item["id"] for item in batch],
-        "metadata": [item.get("metadata", {}) for item in batch]
-    }
+    # fetch a batch
+    batch = next(iter(loader))
+    print("Batch:", batch["data"].shape)
+    print("Input pose:", batch["conditions"]["input_pose"].shape)
+    print("Input mask:", batch["conditions"]["input_mask"].shape)
+    print("Target mask:", batch["conditions"]["target_mask"].shape)
+    print("Sign image:", batch["conditions"]["sign_image"].shape)
+    if "metadata" in batch:
+        for k, v in batch["metadata"].items():
+            print(f"Metadata {k}:", v.shape)
 
 if __name__ == "__main__":
-    data_dir = "/scratch/yayun/pose_data"
-    segmentation_csv = os.path.join(data_dir, "data_segmentation.csv")
+    main()
 
-    dataset = PosePredictionDataset(data_dir, segmentation_csv, past_frames=40, future_frames=20, with_metadata=True)
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_pose_fn, num_workers=0)
-
-    for batch in loader:
-        print("Loaded batch")
-        print("Input Pose:", batch["input_pose"].shape)
-        print("Target Pose:", batch["target_pose"].shape)
-        print("Mask:", batch["mask"].shape)
-        print("IDs:", batch["id"])
-        break
