@@ -8,8 +8,17 @@ from pose_anonymization.data.normalization import normalize_mean_std
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image_tensor
 from transformers import CLIPProcessor
 
+
 class DynamicPosePredictionDataset(Dataset):
-    def __init__(self, data_dir: str, csv_path: str, num_past_frames: int = 40, num_future_frames: int = 20, with_metadata: bool = True, clip_model_name: str = "openai/clip-vit-base-patch32"):
+    def __init__(
+        self,
+        data_dir: str,
+        csv_path: str,
+        num_past_frames: int = 40,
+        num_future_frames: int = 20,
+        with_metadata: bool = True,
+        clip_model_name: str = "openai/clip-vit-base-patch32",
+    ):
         super().__init__()
         self.data_dir = data_dir
         self.num_past_frames = num_past_frames
@@ -45,7 +54,9 @@ class DynamicPosePredictionDataset(Dataset):
         if input_mask.sum() == 0:
             raise ValueError("Input mask contains no valid frames.")
 
-        sign_img = signwriting_to_clip_image_tensor(rec.get("text", ""), self.clip_processor)
+        sign_img = signwriting_to_clip_image_tensor(
+            rec.get("text", ""), self.clip_processor
+        )
 
         sample = {
             "data": target_data,
@@ -66,7 +77,9 @@ class DynamicPosePredictionDataset(Dataset):
                 "orig_start": rec.get("start", 0),
                 "orig_end": rec.get("end", total),
             }
-            sample["metadata"] = {k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()}
+            sample["metadata"] = {
+                k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()
+            }
 
         return sample
 
@@ -100,6 +113,7 @@ def main():
     if "metadata" in batch:
         for k, v in batch["metadata"].items():
             print(f"Metadata {k}:", v.shape)
+
 
 if __name__ == "__main__":
     main()
