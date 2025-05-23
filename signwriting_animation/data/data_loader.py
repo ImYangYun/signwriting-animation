@@ -5,11 +5,17 @@ from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
 from pose_anonymization.data.normalization import normalize_mean_std
-from signwriting_evaluation.metrics.clip import signwriting_to_clip_image_tensor
+from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
 
 class DynamicPosePredictionDataset(Dataset):
+    """
+    A PyTorch Dataset for dynamic sampling of normalized pose sequences,
+    conditioned on SignWriting images and optional scalar metadata.
+    Each sample includes past and future pose segments, associated masks,
+    and a CLIP-ready rendering of the SignWriting annotation.
+    """
     def __init__(
         self,
         data_dir: str,
@@ -54,9 +60,8 @@ class DynamicPosePredictionDataset(Dataset):
         if input_mask.sum() == 0:
             raise ValueError("Input mask contains no valid frames.")
 
-        sign_img = signwriting_to_clip_image_tensor(
-            rec.get("text", ""), self.clip_processor
-        )
+        pil_img = signwriting_to_clip_image(rec.get("text", ""))
+        sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
 
         sample = {
             "data": target_data,
