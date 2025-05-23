@@ -5,9 +5,8 @@ from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
 from pose_anonymization.data.normalization import normalize_mean_std
-from signwriting.visualizer.visualize import signwriting_to_image
+from signwriting_evaluation.metrics.clip import signwriting_to_clip_image_tensor
 from transformers import CLIPProcessor
-from PIL import Image
 
 class DynamicPosePredictionDataset(Dataset):
     def __init__(self, data_dir: str, csv_path: str, num_past_frames: int = 40, num_future_frames: int = 20, with_metadata: bool = True, clip_model_name: str = "openai/clip-vit-base-patch32"):
@@ -30,25 +29,23 @@ class DynamicPosePredictionDataset(Dataset):
 
         pose_path = os.path.join(self.data_dir, rec["pose"])
         with open(pose_path, "rb") as f:
-            pose = Pose.read(f)
+            raw_pose = Pose.read(f)
+        pose = normalize_mean_std(raw_pose)
 
-        pose = normalize_mean_std(pose)
+        past_end = start + self.num_past_frames
+        future_end = past_end + self.num_future_frames
+        input_pose = pose.body[max(start, 0):past_end].torch()
+        target_pose = pose.body[past_end:future_end].torch()
 
-        input_pose_torch = pose.body[max(start, 0): start + self.num_past_frames].torch()
-        target_pose_torch = pose.body[start + self.num_past_frames: start + self.num_past_frames + self.num_future_frames].torch()
+        input_data = input_pose.data.zero_filled()
+        target_data = target_pose.data.zero_filled()
+        input_mask = input_pose.data.mask
+        target_mask = target_pose.data.mask
 
-        input_data = input_pose_torch.data.zero_filled()
-        target_data = target_pose_torch.data.zero_filled()
+        if input_mask.sum() == 0:
+            raise ValueError("Input mask contains no valid frames.")
 
-        input_mask = input_pose_torch.data.mask
-        target_mask = target_pose_torch.data.mask
-
-        sw_text = rec.get("text", "")
-        pil_img = signwriting_to_image(sw_text)
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        pil_img = pil_img.resize((224, 224))
-        sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
+        sign_img = signwriting_to_clip_image_tensor(rec.get("text", ""), self.clip_processor)
 
         sample = {
             "data": target_data,
@@ -58,7 +55,7 @@ class DynamicPosePredictionDataset(Dataset):
                 "target_mask": target_mask,
                 "sign_image": sign_img,
             },
-            "id": rec.get("id", os.path.basename(pose_path)),
+            "id": rec.get("id", os.path.basename(rec["pose"])),
         }
 
         if self.with_metadata:
@@ -69,9 +66,7 @@ class DynamicPosePredictionDataset(Dataset):
                 "orig_start": rec.get("start", 0),
                 "orig_end": rec.get("end", total),
             }
-            sample["metadata"] = {
-                k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()
-            }
+            sample["metadata"] = {k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()}
 
         return sample
 
@@ -108,4 +103,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
