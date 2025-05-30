@@ -49,6 +49,12 @@ def main():
                                                         num_past_frames=num_past_frames,
                                                         num_keypoints=num_keypoints,
                                                         num_dims=num_dims_per_keypoint)
+        # --- 这里打印每个sample的shape ---
+        print(f"\nSample for target={val}")
+        print("  x.shape:", x.shape)
+        print("  timesteps.shape:", timesteps.shape)
+        print("  past_motion.shape:", past_motion.shape)
+        print("  sw_img.shape:", sw_img.shape)
         samples.append((x, timesteps, past_motion, sw_img, val))
 
     # 训练
@@ -56,10 +62,12 @@ def main():
     for epoch in range(100):
         epoch_loss = 0
         for x, timesteps, past_motion, sw_img, val in samples:
+            # --- 每次送进模型前打印shape ---
+            print("\n[FORWARD] x.shape:", x.shape)
+            print("[FORWARD] past_motion.shape:", past_motion.shape)
+            print("[FORWARD] sw_img.shape:", sw_img.shape)
             optimizer.zero_grad()
-            # forward: x, timesteps, past_motion, signwriting_im_batch
             output = model(x, timesteps, past_motion, sw_img)
-            # loss与目标的比较，目标和x一致
             target = torch.full_like(output, val)
             loss = loss_fn(output, target)
             loss.backward()
@@ -71,11 +79,15 @@ def main():
     model.eval()
     with torch.no_grad():
         for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
+            print(f"\n[EVAL] Sample {idx + 1} (target={val})")
+            print("[EVAL] x.shape:", x.shape)
+            print("[EVAL] past_motion.shape:", past_motion.shape)
+            print("[EVAL] sw_img.shape:", sw_img.shape)
             output = model(x, timesteps, past_motion, sw_img)
             rounded = torch.round(output)
-            print(f"\nSample {idx + 1} (target={val}):")
             print("Prediction after round:\n", rounded.cpu().numpy())
             print("Target:\n", torch.full_like(output, val).cpu().numpy())
+
 
 if __name__ == "__main__":
     main()
