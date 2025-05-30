@@ -25,8 +25,8 @@ def get_toy_samples(clip_processor, device="cpu"):
     pose_ones = torch.ones(seq_len, num_keypoints, num_dims_per_keypoint, device=device)
 
     return [
-        (sw_imgs[0], pose_zeros, pose_zeros), # sw_img, past_pose, future_pose
-        (sw_imgs[1], pose_ones, pose_ones)
+    (pose_zeros, sw_imgs[0], pose_zeros),  
+    (pose_ones, sw_imgs[1], pose_ones)
     ]
 
 def main():
