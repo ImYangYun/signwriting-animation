@@ -42,7 +42,7 @@ def main():
     # all zero and all one sample
     sample_configs = [
         # zeros
-        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.0),
+        #("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.0),
         # ones
         ("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.0)
     ]
@@ -57,7 +57,7 @@ def main():
         samples.append((x, timesteps, past_motion, sw_img, val))
 
     # training
-    num_epochs = 1000
+    num_epochs = 2000
     losses = []
     model.train()
     for epoch in range(num_epochs):
@@ -72,8 +72,10 @@ def main():
             epoch_loss += loss.item()
         avg_loss = epoch_loss / len(samples)
         losses.append(avg_loss)
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
+        if epoch % 10 == 0:          
+          print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
+        if epoch % 100 == 0:
+          print("Output min/max:", output.min().item(), output.max().item())
           
     plt.figure()
     plt.plot(losses)
