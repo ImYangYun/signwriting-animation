@@ -27,22 +27,22 @@ def main():
         num_keypoints=num_keypoints,
         num_dims_per_keypoint=num_dims_per_keypoint,
         embedding_arch="openai/clip-vit-base-patch32",
-        num_latent_dims=256,
-        ff_size=1024,
-        num_layers=8,
-        num_heads=4,
-        dropout=0.2,
-        activation="gelu",
-        arch="trans_enc",
+        num_latent_dims=64,
+        ff_size=128,
+        num_layers=2,
+        num_heads=2,
+        dropout=0.0,
+        #activation="gelu",
+        #arch="trans_enc",
         cond_mask_prob=0
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)
     loss_fn = torch.nn.MSELoss()
 
     sample_configs = [
-        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.),  # zeros
-        ("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.) # ones
+        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.)  # zeros
+        #("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.) # ones
     ]
 
     samples = []
@@ -55,7 +55,7 @@ def main():
         samples.append((x, timesteps, past_motion, sw_img, val))
 
     # Training
-    num_epochs = 500
+    num_epochs = 1000
     losses = []
     model.train()
     for epoch in range(num_epochs):
@@ -86,15 +86,18 @@ def main():
     # Evaluation
     model.eval()
     with torch.no_grad():
-        for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
-            output = model(x, timesteps, past_motion, sw_img)
-            rounded = torch.round(output)
-            target = torch.full_like(output, val)
-            print(f"\n[EVAL] Sample {idx + 1} (target={val})")
-            print("Prediction after round:\n", rounded.cpu().numpy())
-            print("Target:\n", target.cpu().numpy())
-            # Assert output matches target after rounding (allclose is tolerant of tiny float errors)
-            assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
+    for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
+        output = model(x, timesteps, past_motion, sw_img)
+        rounded = torch.round(output)
+        target = torch.full_like(output, val)
+        print(f"\n[EVAL] Sample {idx + 1} (target={val})")
+        print("Output min/max:", output.min().item(), output.max().item())
+        print("Rounded unique:", rounded.unique())
+        print("Target unique:", target.unique())
+        print("Prediction after round:\n", rounded.cpu().numpy())
+        print("Target:\n", target.cpu().numpy())
+        # Assert output matches target after rounding (allclose is tolerant of tiny float errors)
+        assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
 
     print("All overfit sanity checks passed!")
 
