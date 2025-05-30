@@ -1,48 +1,51 @@
 import torch
 import torch.optim as optim
-from transformers import CLIPProcessor
 import matplotlib.pyplot as plt
+from transformers import CLIPProcessor
 
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
 def make_sample(signwriting_str, value, device, clip_processor,
                 batch_size=1, num_past_frames=10, num_keypoints=21, num_dims=3):
+    """
+    value = 0 or 1: pose 全部为 0 或 1，极端case
+    """
     x = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), value, device=device)
     timesteps = torch.zeros(batch_size, dtype=torch.long, device=device)
     past_motion = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), value, device=device)
     pil_img = signwriting_to_clip_image(signwriting_str)
-    signwriting_im_batch = clip_processor(images=pil_img, return_tensors="pt").pixel_values.to(device)
-    return x, timesteps, past_motion, signwriting_im_batch
+    sw_img = clip_processor(images=pil_img, return_tensors="pt").pixel_values.to(device)
+    return x, timesteps, past_motion, sw_img
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
+    # 极简模型配置，加快overfit
     num_keypoints = 21
     num_dims_per_keypoint = 3
     num_past_frames = 10
-
     model = SignWritingToPoseDiffusion(
         num_keypoints=num_keypoints,
         num_dims_per_keypoint=num_dims_per_keypoint,
         embedding_arch="openai/clip-vit-base-patch32",
-        num_latent_dims=64,
-        ff_size=128,
+        num_latent_dims=32,      # 低维 latent
+        ff_size=64,
         num_layers=2,
         num_heads=2,
         dropout=0.0,
-        #activation="gelu",
-        #arch="trans_enc",
         cond_mask_prob=0
     ).to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-2)
+    optimizer = optim.Adam(model.parameters(), lr=5e-2)  # 学习率大一点
     loss_fn = torch.nn.MSELoss()
 
+    # 导师建议的两个样本（记得字符串和fluent-pose项目一致）
     sample_configs = [
-        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.),  # zeros
-        ("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.) # ones
+        # zeros
+        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.0),
+        # ones
+        ("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.0)
     ]
 
     samples = []
@@ -54,8 +57,8 @@ def main():
             num_dims=num_dims_per_keypoint)
         samples.append((x, timesteps, past_motion, sw_img, val))
 
-    # Training
-    num_epochs = 1000
+    # 训练
+    num_epochs = 300
     losses = []
     model.train()
     for epoch in range(num_epochs):
@@ -73,7 +76,7 @@ def main():
         if epoch % 10 == 0:
             print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
 
-    # Plot loss curve
+    # Loss 曲线可视化
     plt.figure()
     plt.plot(losses)
     plt.xlabel("Epoch")
@@ -83,23 +86,22 @@ def main():
     plt.savefig("overfit_loss_curve.png")
     print("Saved loss curve to overfit_loss_curve.png")
 
-    # Evaluation
     model.eval()
     with torch.no_grad():
-      for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
-          output = model(x, timesteps, past_motion, sw_img)
-          rounded = torch.round(output)
-          target = torch.full_like(output, val)
-          print(f"\n[EVAL] Sample {idx + 1} (target={val})")
-          print("Output min/max:", output.min().item(), output.max().item())
-          print("Rounded unique:", rounded.unique())
-          print("Target unique:", target.unique())
-          print("Prediction after round:\n", rounded.cpu().numpy())
-          print("Target:\n", target.cpu().numpy())
-          # Assert output matches target after rounding (allclose is tolerant of tiny float errors)
-          assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
+        for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
+            output = model(x, timesteps, past_motion, sw_img)
+            rounded = torch.round(output)
+            target = torch.full_like(output, val)
+            print(f"\n[EVAL] Sample {idx + 1} (target={val})")
+            print("Output min/max:", output.min().item(), output.max().item())
+            print("Rounded unique:", rounded.unique())
+            print("Target unique:", target.unique())
+            print("Prediction after round:\n", rounded.cpu().numpy())
+            print("Target:\n", target.cpu().numpy())
+            assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
 
     print("All overfit sanity checks passed!")
 
 if __name__ == "__main__":
     main()
+
