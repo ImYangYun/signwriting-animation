@@ -86,18 +86,18 @@ def main():
     # Evaluation
     model.eval()
     with torch.no_grad():
-    for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
-        output = model(x, timesteps, past_motion, sw_img)
-        rounded = torch.round(output)
-        target = torch.full_like(output, val)
-        print(f"\n[EVAL] Sample {idx + 1} (target={val})")
-        print("Output min/max:", output.min().item(), output.max().item())
-        print("Rounded unique:", rounded.unique())
-        print("Target unique:", target.unique())
-        print("Prediction after round:\n", rounded.cpu().numpy())
-        print("Target:\n", target.cpu().numpy())
-        # Assert output matches target after rounding (allclose is tolerant of tiny float errors)
-        assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
+      for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
+          output = model(x, timesteps, past_motion, sw_img)
+          rounded = torch.round(output)
+          target = torch.full_like(output, val)
+          print(f"\n[EVAL] Sample {idx + 1} (target={val})")
+          print("Output min/max:", output.min().item(), output.max().item())
+          print("Rounded unique:", rounded.unique())
+          print("Target unique:", target.unique())
+          print("Prediction after round:\n", rounded.cpu().numpy())
+          print("Target:\n", target.cpu().numpy())
+          # Assert output matches target after rounding (allclose is tolerant of tiny float errors)
+          assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
 
     print("All overfit sanity checks passed!")
 
