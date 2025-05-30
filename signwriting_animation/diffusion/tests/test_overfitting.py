@@ -36,7 +36,7 @@ def main():
         dropout=0.0,
         cond_mask_prob=0
     ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-2)  
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)  
     loss_fn = torch.nn.MSELoss()
 
     # all zero and all one sample
