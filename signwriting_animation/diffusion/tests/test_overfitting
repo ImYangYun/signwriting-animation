@@ -20,7 +20,7 @@ def get_toy_samples(clip_processor, device="cpu"):
         sw_img = clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
         sw_imgs.append(sw_img.to(device))
 
-    # pose target: 一个全零，一个全一
+    # pose target
     pose_zeros = torch.zeros(seq_len, num_keypoints, num_dims_per_keypoint, device=device)
     pose_ones = torch.ones(seq_len, num_keypoints, num_dims_per_keypoint, device=device)
 
@@ -39,7 +39,7 @@ def main():
     model = SignWritingToPoseDiffusion(
         num_keypoints=num_keypoints,
         num_dims_per_keypoint=num_dims_per_keypoint,
-        embedding_arch="openai/clip-vit-base-patch32", # 跟你处理方式一致
+        embedding_arch="openai/clip-vit-base-patch32", 
         num_latent_dims=256,
         ff_size=1024,
         num_layers=8,
