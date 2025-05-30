@@ -6,18 +6,13 @@ from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
 def make_sample(signwriting_str, value, device, clip_processor,
                 batch_size=1, num_past_frames=10, num_keypoints=21, num_dims=3):
-    # [B, num_past_frames, num_keypoints, num_dims] → [B, num_past_frames, num_dims, num_keypoints]
+    # 注意，num_keypoints 必须是21，num_dims必须是3，不能反
     x = torch.full((batch_size, num_past_frames, num_keypoints, num_dims), value, device=device)
-    x = x.permute(0, 1, 3, 2)  
-    # timesteps: [B]
     timesteps = torch.zeros(batch_size, dtype=torch.long, device=device)
-    # past_motion: [B, num_keypoints, num_dims, num_past_frames] → [B, num_keypoints, num_dims, num_past_frames]（不动，保持不变）
     past_motion = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), value, device=device)
     pil_img = signwriting_to_clip_image(signwriting_str)
     signwriting_im_batch = clip_processor(images=pil_img, return_tensors="pt").pixel_values.to(device)
     return x, timesteps, past_motion, signwriting_im_batch
-
-
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
