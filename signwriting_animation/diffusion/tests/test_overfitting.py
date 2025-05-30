@@ -86,7 +86,7 @@ def main():
             output = model(x, timesteps, past_motion, sw_img)   # 直接传原始变量！
             rounded = torch.round(output)
             print("Prediction after round:\n", rounded.cpu().numpy())
-            print("Target:\n", torch.full_like(output, val).cpu().numpy()))
+            print("Target:\n", torch.full_like(output, val).cpu().numpy())
 
 
 if __name__ == "__main__":
