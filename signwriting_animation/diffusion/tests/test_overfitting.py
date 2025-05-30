@@ -74,10 +74,7 @@ def main():
     model.eval()
     with torch.no_grad():
         for idx, (sw_img, past_pose, future_pose) in enumerate(samples):
-            output = model(
-                sw_img=sw_img, 
-                past_pose=past_pose
-            )
+            output = model(sw_img, past_pose)
             rounded = torch.round(output)
             print(f"\nSample {idx+1}:")
             print("Prediction after round:\n", rounded.cpu().numpy())
