@@ -5,8 +5,7 @@ from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusi
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
 def make_sample(signwriting_str, value, device, clip_processor,
-                batch_size=1, num_past_frames=10, num_keypoints=21, num_dims=3):
-    # 注意，num_keypoints 必须是21，num_dims必须是3，不能反
+                batch_size=1, num_past_frames=10, num_keypoints=3, num_dims=21):
     x = torch.full((batch_size, num_past_frames, num_keypoints, num_dims), value, device=device)
     timesteps = torch.zeros(batch_size, dtype=torch.long, device=device)
     past_motion = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), value, device=device)
@@ -18,8 +17,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-    num_keypoints = 21
-    num_dims_per_keypoint = 3
+    num_keypoints = 3
+    num_dims_per_keypoint = 21
     num_past_frames = 10
 
     model = SignWritingToPoseDiffusion(
