@@ -22,7 +22,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-    # 极简模型配置，加快overfit
     num_keypoints = 21
     num_dims_per_keypoint = 3
     num_past_frames = 10
@@ -30,20 +29,20 @@ def main():
         num_keypoints=num_keypoints,
         num_dims_per_keypoint=num_dims_per_keypoint,
         embedding_arch="openai/clip-vit-base-patch32",
-        num_latent_dims=32,      # 低维 latent
+        num_latent_dims=32,   
         ff_size=64,
         num_layers=2,
         num_heads=2,
         dropout=0.0,
         cond_mask_prob=0
     ).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-2)  # 学习率大一点
+    optimizer = optim.Adam(model.parameters(), lr=5e-2)  
     loss_fn = torch.nn.MSELoss()
 
-    # 导师建议的两个样本（记得字符串和fluent-pose项目一致）
+    # all zero and all one sample
     sample_configs = [
         # zeros
-        #("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.0),
+        ("AS14c20S27106M518x529S14c20481x471S27106503x489", 0.0),
         # ones
         ("AS18701S1870aS2e734S20500M518x533S1870a489x515S18701482x490S20500508x496S2e734500x468", 1.0)
     ]
@@ -57,8 +56,8 @@ def main():
             num_dims=num_dims_per_keypoint)
         samples.append((x, timesteps, past_motion, sw_img, val))
 
-    # 训练
-    num_epochs = 300
+    # training
+    num_epochs = 1000
     losses = []
     model.train()
     for epoch in range(num_epochs):
@@ -75,8 +74,7 @@ def main():
         losses.append(avg_loss)
         if epoch % 10 == 0:
             print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
-
-    # Loss 曲线可视化
+          
     plt.figure()
     plt.plot(losses)
     plt.xlabel("Epoch")
