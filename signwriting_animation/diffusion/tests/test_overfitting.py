@@ -62,12 +62,15 @@ def main():
     for epoch in range(100):
         epoch_loss = 0
         for x, timesteps, past_motion, sw_img, val in samples:
-            # --- 每次送进模型前打印shape ---
-            print("\n[FORWARD] x.shape:", x.shape)
-            print("[FORWARD] past_motion.shape:", past_motion.shape)
+            # --- 这里加 permute ---
+            x_perm = x.permute(0, 1, 3, 2)  # [1, 10, 21, 3] -> [1, 10, 3, 21]
+            past_motion_perm = past_motion.permute(0, 2, 1, 3)  # [1, 21, 3, 10] -> [1, 3, 21, 10]
+            print("\n[FORWARD] x_perm.shape:", x_perm.shape)
+            print("[FORWARD] past_motion_perm.shape:", past_motion_perm.shape)
             print("[FORWARD] sw_img.shape:", sw_img.shape)
             optimizer.zero_grad()
-            output = model(x, timesteps, past_motion, sw_img)
+            # 注意这里传入 permute 后的新变量
+            output = model(x_perm, timesteps, past_motion_perm, sw_img)
             target = torch.full_like(output, val)
             loss = loss_fn(output, target)
             loss.backward()
@@ -79,11 +82,14 @@ def main():
     model.eval()
     with torch.no_grad():
         for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(samples):
+            # --- 同样加 permute ---
+            x_perm = x.permute(0, 1, 3, 2)
+            past_motion_perm = past_motion.permute(0, 2, 1, 3)
             print(f"\n[EVAL] Sample {idx + 1} (target={val})")
-            print("[EVAL] x.shape:", x.shape)
-            print("[EVAL] past_motion.shape:", past_motion.shape)
+            print("[EVAL] x_perm.shape:", x_perm.shape)
+            print("[EVAL] past_motion_perm.shape:", past_motion_perm.shape)
             print("[EVAL] sw_img.shape:", sw_img.shape)
-            output = model(x, timesteps, past_motion, sw_img)
+            output = model(x_perm, timesteps, past_motion_perm, sw_img)
             rounded = torch.round(output)
             print("Prediction after round:\n", rounded.cpu().numpy())
             print("Target:\n", torch.full_like(output, val).cpu().numpy())
