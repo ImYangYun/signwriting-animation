@@ -60,10 +60,7 @@ def main():
         epoch_loss = 0
         for sw_img, past_pose, future_pose in samples:
             optimizer.zero_grad()
-            output = model(
-                sw_img=sw_img, 
-                past_pose=past_pose
-            )
+            output = model(sw_img, past_pose)
             loss = loss_fn(output, future_pose)
             loss.backward()
             optimizer.step()
