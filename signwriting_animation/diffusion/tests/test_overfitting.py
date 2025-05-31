@@ -6,7 +6,7 @@ from transformers import CLIPProcessor
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
-# Set random seed for reproducibility
+# Set seed for reproducibility
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
