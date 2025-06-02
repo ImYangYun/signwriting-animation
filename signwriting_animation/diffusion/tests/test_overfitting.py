@@ -49,7 +49,8 @@ class LightningOverfitModel(L.LightningModule):
         self.model = model
         self.loss_fn = nn.MSELoss()
         self.lr = lr
-
+    
+    print("x.shape:", x.shape)
     def forward(self, x, timesteps, past_motion, sw_img):
         return self.model(x, timesteps, past_motion, sw_img)
 
