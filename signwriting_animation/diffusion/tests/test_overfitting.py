@@ -80,7 +80,7 @@ lightning_model = LightningOverfitModel(model)
 
 # ==== Lightning训练器 ====
 trainer = pl.Trainer(
-    max_epochs=1000,
+    max_epochs=800,
     log_every_n_steps=1,
     accelerator="gpu" if torch.cuda.is_available() else "cpu",
     devices=1,
