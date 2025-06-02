@@ -8,22 +8,19 @@ from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
 # Set reproducibility seed
 pl.seed_everything(42)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 def make_sample(signwriting_str, pose_val, past_motion_val, device, clip_processor,
-                batch_size=1, num_past_frames=10, num_keypoints=21, num_dims=3):
-    """
-    Create a dummy sample with different pose and past_motion values, with SignWriting image embedding.
-    """
-    x = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), pose_val, device=device)
-    timesteps = torch.zeros(batch_size, dtype=torch.long, device=device)
-    past_motion = torch.full((batch_size, num_keypoints, num_dims, num_past_frames), past_motion_val, device=device)
+                num_past_frames=10, num_keypoints=21, num_dims=3):
+    x = torch.full((num_keypoints, num_dims, num_past_frames), pose_val, device=device)
+    timesteps = torch.tensor(0, dtype=torch.long, device=device)
+    past_motion = torch.full((num_keypoints, num_dims, num_past_frames), past_motion_val, device=device)
     pil_img = signwriting_to_clip_image(signwriting_str)
-    sw_img = clip_processor(images=pil_img, return_tensors="pt").pixel_values.to(device)
-    return x, timesteps, past_motion, sw_img, pose_val
+    sw_img = clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0).to(device)
+    pose_val_tensor = torch.tensor(pose_val, dtype=torch.float32, device=device)
+    return x, timesteps, past_motion, sw_img, pose_val_tensor
 
-# ==== 构造4个不同的样本（2个0, 2个1，可自定义SW字符串）====
 sample_configs = [
     ("M518x529S14c20481x471S27106503x489", 0, -1),
     ("M518x529S14c20481x471S27106503x489", 1, 1),
