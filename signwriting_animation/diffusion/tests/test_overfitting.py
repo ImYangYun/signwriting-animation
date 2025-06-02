@@ -30,8 +30,8 @@ sample_configs = [
 
 
 samples = [
-    make_sample(sw, val, device, clip_processor)
-    for sw, val in sample_configs
+    make_sample(sw, pose_val, past_motion_val, device, clip_processor)
+    for sw, pose_val, past_motion_val in sample_configs
 ]
 
 dataloader = DataLoader(samples, batch_size=4, shuffle=True)
