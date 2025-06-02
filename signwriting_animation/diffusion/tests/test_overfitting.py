@@ -13,9 +13,10 @@ clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 def make_sample(signwriting_str, pose_val, past_motion_val, device, clip_processor,
                 num_past_frames=10, num_keypoints=21, num_dims=3):
-    x = torch.full((num_keypoints, num_dims, num_past_frames), pose_val, device=device)
+    # 指定 float32
+    x = torch.full((num_keypoints, num_dims, num_past_frames), pose_val, device=device, dtype=torch.float32)
     timesteps = torch.tensor(0, dtype=torch.long, device=device)
-    past_motion = torch.full((num_keypoints, num_dims, num_past_frames), past_motion_val, device=device)
+    past_motion = torch.full((num_keypoints, num_dims, num_past_frames), past_motion_val, device=device, dtype=torch.float32)
     pil_img = signwriting_to_clip_image(signwriting_str)
     sw_img = clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0).to(device)
     pose_val_tensor = torch.tensor(pose_val, dtype=torch.float32, device=device)
@@ -27,7 +28,6 @@ sample_configs = [
     ("M518x533S1870a489x515S18701482x490", 0, 0),
     ("M518x533S1870a489x515S18701482x490", 1, 2),
 ]
-
 
 samples = [
     make_sample(sw, pose_val, past_motion_val, device, clip_processor)
