@@ -54,7 +54,7 @@ class LightningOverfitModel(pl.LightningModule):
         x, timesteps, past_motion, sw_img, val = batch
         # x: [B, 21, 3, 10] ...
         output = self(x, timesteps, past_motion, sw_img)
-        target = torch.full_like(output, val.view(-1, 1, 1, 1))
+        target = val.view(-1, 1, 1, 1).expand_as(output)
         loss = self.loss_fn(output, target)
         if batch_idx == 0 and self.current_epoch % 200 == 0:
             self.print(f"Output min/max: {output.min().item()}, {output.max().item()}")
