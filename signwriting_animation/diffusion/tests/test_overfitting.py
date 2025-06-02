@@ -5,11 +5,6 @@ from transformers import CLIPProcessor
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 
-# Set reproducibility seed
-pl.seed_everything(42)
-device = torch.device("cpu")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
 def make_sample(signwriting_str, pose_val, past_motion_val, device, clip_processor,
                 num_past_frames=10, num_keypoints=21, num_dims=3):
     """
@@ -50,6 +45,7 @@ class LightningOverfitModel(pl.LightningModule):
         return torch.optim.Adam(self.model.parameters(), lr=1e-4)
 
 def main():
+    # Set reproducibility seed
     pl.seed_everything(42)
     device = torch.device("cpu")
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
