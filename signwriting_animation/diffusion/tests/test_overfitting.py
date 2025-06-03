@@ -15,7 +15,7 @@ def make_sample(signwriting_str, pose_val, past_motion_val, clip_processor,
     pose and past_motion are all set to the given value, signwriting is rendered to image.
     Returns (pose, timestep, past_motion, sw_img, target_val_tensor).
     """
-    x = torch.full((num_keypoints, num_dims, num_past_frames), pose_val, device=device, dtype=torch.float32)
+    x = torch.full((num_keypoints, num_dims, num_past_frames), pose_val, dtype=torch.float32)
     timesteps = torch.tensor(0, dtype=torch.long)
     past_motion = torch.full((num_keypoints, num_dims, num_past_frames), past_motion_val, dtype=torch.float32)
     pil_img = signwriting_to_clip_image(signwriting_str)
