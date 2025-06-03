@@ -79,7 +79,7 @@ class TestOverfitSanity(unittest.TestCase):
         )
         lightning_model = LightningOverfitModel(model)
         trainer = pl.Trainer(
-            max_epochs=80,
+            max_epochs=70,
             log_every_n_steps=1,
             accelerator="cpu",
             devices=1,
