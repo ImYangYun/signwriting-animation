@@ -78,6 +78,14 @@ class SignWritingToPoseDiffusion(nn.Module):
                                               activation=activation)
 
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
+        hidden_dim = 512 
+        self.length_head = nn.Sequential(
+            nn.Linear(num_latent_dims, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
 
     def forward(self,
                 x: torch.Tensor,
@@ -126,7 +134,9 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)[-num_frames:]
         output = self.pose_projection(output)
-        return output
+        global_latent = output.mean(dim=0)  # [batch_size, latent_dim]
+        length_pred = self.length_head(global_latent)
+        return output, length_pred
 
     def interface(self,
                   x: torch.Tensor,

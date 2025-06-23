@@ -76,6 +76,8 @@ class DynamicPosePredictionDataset(Dataset):
         input_data = input_pose.data.zero_filled()
         target_data = target_pose.data.zero_filled()
 
+        target_length = target_data.shape[0] 
+
         input_mask = input_pose.data.mask
         if input_mask.sum() == 0:
             print("Input contains no valid frames.")
@@ -96,6 +98,7 @@ class DynamicPosePredictionDataset(Dataset):
                 "sign_image": sign_img,
             },
             "id": rec.get("id", os.path.basename(rec["pose"])),
+            "length_target": torch.tensor([target_length], dtype=torch.float32),
         }
 
         if self.with_metadata:
