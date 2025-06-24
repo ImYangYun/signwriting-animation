@@ -134,7 +134,11 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)[-num_frames:]
         output = self.pose_projection(output)
-        global_latent = output.mean(dim=0)  # [batch_size, latent_dim]
+        global_latent = xseq.mean(0) 
+        
+        print(f"global_latent shape: {global_latent.shape}")
+        print(f"length_head expected input dim: {self.length_head[0].in_features}")
+
         length_pred = self.length_head(global_latent)
         return output, length_pred
 

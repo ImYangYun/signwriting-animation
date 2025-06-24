@@ -37,12 +37,27 @@ class LightningOverfitModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, timesteps, past_motion, sw_img, val = batch
-        output = self(x, timesteps, past_motion, sw_img)
-        target = val.view(-1, 1, 1, 1).expand_as(output)
-        loss = self.loss_fn(output, target)
+        motion_output, length_pred = self.model(x, timesteps, past_motion, sw_img)
+
+        # Motion loss
+        target_motion = val.view(-1, 1, 1, 1).expand_as(motion_output)
+        loss_motion = self.loss_fn(motion_output, target_motion)
+
+        # Length loss
+        target_length = val.view_as(length_pred).float()
+        loss_length = self.loss_fn(length_pred, target_length)
+
+        # Combine
+        loss = loss_motion + loss_length
+
+        self.log("train_loss", loss)
+
         if batch_idx == 0 and self.current_epoch % 10 == 0:
-            self.print(f"Output min/max: {output.min().item()}, {output.max().item()}")
+            self.print(f"Motion output min/max: {motion_output.min().item()}, {motion_output.max().item()}")
+            self.print(f"Length pred: {length_pred.detach().cpu().numpy()} | Target length: {target_length.detach().cpu().numpy()}")
+
         return loss
+
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.model.parameters(), lr=1e-4)
@@ -90,15 +105,17 @@ class TestOverfitSanity(unittest.TestCase):
         test_dataloader = DataLoader(self.samples, batch_size=1, shuffle=False)
         with torch.no_grad():
             for idx, (x, timesteps, past_motion, sw_img, val) in enumerate(test_dataloader):
-                output = lightning_model(x, timesteps, past_motion, sw_img)
-                rounded = torch.round(output)
-                target = val.view(-1, 1, 1, 1).expand_as(output)
+                motion_output, length_pred = lightning_model(x, timesteps, past_motion, sw_img)
+                rounded = torch.round(motion_output)
+                target = val.view(-1, 1, 1, 1).expand_as(motion_output)
                 print(f"[EVAL] Sample {idx+1} (target={val.item()})")
-                print("Output min/max:", output.min().item(), output.max().item())
+                print("Motion output min/max:", motion_output.min().item(), motion_output.max().item())
                 print("Rounded unique:", rounded.unique())
                 print("Prediction after round:\n", rounded.cpu().numpy())
                 print("Target:\n", target.cpu().numpy())
+                print("Length pred:", length_pred.cpu().numpy())
                 assert torch.allclose(rounded, target, atol=1e-1), f"Sample {idx+1} did not overfit!"
+
         print("All overfit sanity checks passed!")
 
 if __name__ == "__main__":
