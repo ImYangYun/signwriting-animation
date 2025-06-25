@@ -73,7 +73,11 @@ def test_length_prediction_on_real_data(batch_size):
     with torch.no_grad():
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
 
-    pred_lengths = length_pred_dist.mean.squeeze(-1)
+    print("Type of mean:", type(length_pred_dist.mean))
+    try:
+        pred_lengths = length_pred_dist.mean.squeeze(-1)
+    except Exception as e:
+        print("Error squeezing mean:", e)
     abs_diff = (pred_lengths - target_lengths).abs()
     nll = length_pred_dist.nll(target_lengths)
 
@@ -90,6 +94,12 @@ def test_length_prediction_on_real_data(batch_size):
     print("Sampled lengths:     ", [round(float(x), 2) for x in samples])
     print("Absolute differences:", [round(float(x), 2) for x in abs_diff])
     print("Mean NLL:            ", round(float(nll.mean()), 4))
+
+    print("\n=== Length Prediction Test ===")
+    print("Target lengths:     ", [round(float(x), 2) for x in target_lengths])
+    print("Predicted means:    ", [round(float(x), 2) for x in pred_lengths])
+    print("Absolute differences:", [round(float(x), 2) for x in abs_diff])
+    print("Mean NLL:           ", round(float(nll.mean()), 4))
 
     # === Main assertion ===
     max_allowed_diff = 10.0
