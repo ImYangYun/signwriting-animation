@@ -74,6 +74,7 @@ def test_length_prediction_on_real_data(batch_size):
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
 
     pred_lengths = length_pred_dist.mean.squeeze(-1)
+    target_lengths = target_lengths.squeeze(-1)
     abs_diff = (pred_lengths - target_lengths).abs()
     nll = length_pred_dist.nll(target_lengths)
 
