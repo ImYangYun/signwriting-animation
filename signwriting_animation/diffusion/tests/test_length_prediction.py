@@ -51,8 +51,8 @@ def test_length_prediction_on_real_data(batch_size):
     timesteps = torch.randint(0, 1000, (input_pose.shape[0],)).to(device)
 
     # Check and reshape noisy_x
-    if noisy_x.dim() == 5 and noisy_x.shape[1] == 1:
-        noisy_x = noisy_x.squeeze(1)
+    if noisy_x.dim() == 5 and noisy_x.shape[2] == 1:
+        noisy_x = noisy_x.squeeze(2)
     elif noisy_x.dim() != 4:
         raise ValueError(f"Unexpected shape for noisy_x: {noisy_x.shape}")
 
