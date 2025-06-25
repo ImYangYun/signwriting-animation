@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset, get_num_workers
-from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
+from signwriting_animation.diffusion.core.distribution import SignWritingToPoseDiffusion
 from pose_format.torch.masked.collator import zero_pad_collator
 
 
