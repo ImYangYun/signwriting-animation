@@ -78,10 +78,14 @@ def test_length_prediction_on_real_data(batch_size):
     nll = length_pred_dist.nll(target_lengths)
 
     # === Additional distribution checks ===
-    samples = length_pred_dist.sample()
+    samples = length_pred_dist.sample().squeeze(-1) 
     assert samples.shape == pred_lengths.shape
     assert pred_lengths.shape == target_lengths.shape
     assert torch.all(nll >= 0), "Negative NLL encountered."
+
+    print("pred_lengths shape:", pred_lengths.shape)
+    print("samples shape:", samples.shape)
+    print("target_lengths shape:", target_lengths.shape)
 
     # === Logging ===
     print("\n=== Length Prediction Test ===")
