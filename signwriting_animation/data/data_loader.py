@@ -106,7 +106,7 @@ class DynamicPosePredictionDataset(Dataset):
                 "sign_image": sign_img,
             },
             "id": rec.get("id", os.path.basename(rec["pose"])),
-            "length_target": torch.tensor([target_length], dtype=torch.float32),
+            "length_target": target_length,
         }
 
         if self.with_metadata:
