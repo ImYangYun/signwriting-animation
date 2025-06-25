@@ -48,10 +48,10 @@ def test_length_prediction_on_real_data(batch_size):
 
     # Prepare batch
     batch = next(iter(dataloader))
-    input_pose = batch["conditions"]["input_pose"].to(device)
-    sign_image = batch["conditions"]["sign_image"].to(device)
-    noisy_x = batch["data"].to(device)
-    target_lengths = batch["length_target"].to(device)
+    input_pose = batch["conditions"]["input_pose"].to(device).to(torch.float32)
+    sign_image = batch["conditions"]["sign_image"].to(device).to(torch.float32)
+    noisy_x = batch["data"].to(device).to(torch.float32)
+    target_lengths = batch["length_target"].to(device).to(torch.float32)
 
     # Expected input_pose: [B, T, 1, K, D]
     if input_pose.dim() == 5:
