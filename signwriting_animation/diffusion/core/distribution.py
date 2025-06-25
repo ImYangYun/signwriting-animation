@@ -19,8 +19,9 @@ class DiagonalGaussianDistribution:
 class DistributionPredictionModel(nn.Module):
     def __init__(self, input_size: int):
         super().__init__()
-        self.fc_mu = nn.Linear(input_size, 1)
-        self.fc_var = nn.Linear(input_size, 1)
+        # distribution.py
+        self.fc_mu = nn.Sequential(nn.Linear(input_size, 1), nn.Softplus())
+        self.fc_var = nn.Sequential(nn.Linear(input_size, 1), nn.Softplus())
 
     def forward(self, x: torch.Tensor):
         mu = self.fc_mu(x)

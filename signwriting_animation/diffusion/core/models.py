@@ -79,6 +79,7 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
         self.length_predictor = DistributionPredictionModel(num_latent_dims)
+        self.global_norm = nn.LayerNorm(num_latent_dims)
 
     def forward(self,
                 x: torch.Tensor,
@@ -127,7 +128,8 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)[-num_frames:]
         output = self.pose_projection(output)
-        global_latent = xseq.mean(0) 
+        global_latent = self.global_norm(xseq.mean(0))
+        print("Global latent stats: min", global_latent.min().item(), "max", global_latent.max().item()) 
 
         length_dist = self.length_predictor(global_latent)
         return output, length_dist
