@@ -72,6 +72,17 @@ def test_length_prediction_on_real_data(batch_size):
 
     with torch.no_grad():
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
+        global_latent = model.global_norm(model.sequence_pos_encoder(
+            torch.cat([
+                model.embed_timestep(timesteps),
+                model.embed_signwriting(sign_image),
+                model.past_motion_process(input_pose),
+                model.future_motion_process(noisy_x)
+            ], dim=0)
+        ).mean(0))  # shape: [batch_size, latent_dim]
+
+    print("Global latent stats: min", global_latent.min().item(), "max", global_latent.max().item())
+    print("Sample mean (length):", length_pred_dist.mean.mean().item())
 
     pred_lengths = length_pred_dist.mean.squeeze(-1)
     target_lengths = target_lengths.squeeze(-1)
@@ -97,8 +108,10 @@ def test_length_prediction_on_real_data(batch_size):
     print("Mean NLL:            ", round(float(nll.mean()), 4))
 
     # === Main assertion ===
-    max_allowed_diff = 100.0
-    assert torch.all(abs_diff < max_allowed_diff), "Length prediction error too large."
+    relative_error = abs_diff / target_lengths.clamp(min=1.0) 
+    max_relative_error = 0.3  
+    assert torch.all(relative_error < max_relative_error), "Relative length prediction error too large."
+
 
 
 
