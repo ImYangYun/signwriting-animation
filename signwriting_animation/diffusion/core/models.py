@@ -80,8 +80,6 @@ class SignWritingToPoseDiffusion(nn.Module):
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
         self.length_predictor = DistributionPredictionModel(num_latent_dims)
 
-
-
     def forward(self,
                 x: torch.Tensor,
                 timesteps: torch.Tensor,
