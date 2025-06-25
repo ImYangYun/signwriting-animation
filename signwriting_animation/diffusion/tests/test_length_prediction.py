@@ -58,9 +58,7 @@ def test_length_prediction_on_real_data(batch_size):
         optimizer.zero_grad()
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
         nll = length_pred_dist.nll(target_lengths)
-        mean = length_pred_dist.mean.squeeze(-1)
-        mae_loss = torch.nn.functional.l1_loss(mean, target_lengths)
-        loss = nll.mean() + mae_loss  
+        loss = nll.mean()  
 
         loss.backward()
         optimizer.step()
