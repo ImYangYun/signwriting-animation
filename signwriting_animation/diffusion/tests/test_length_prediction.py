@@ -53,17 +53,19 @@ def test_length_prediction_on_real_data(batch_size):
     noisy_x = batch["data"].to(device)
     target_lengths = batch["length_target"].to(device)
 
-    # Permute input_pose to [B, K, D, T]
-    if input_pose.dim() == 4 and input_pose.shape[1] == 1:
-        input_pose = input_pose.permute(1, 0, 2, 3).contiguous()
-    elif input_pose.dim() != 4:
+    # Expected input_pose: [B, T, 1, K, D]
+    if input_pose.dim() == 5:
+        input_pose = input_pose.squeeze(2)                # [B, T, K, D]
+        input_pose = input_pose.permute(0, 2, 3, 1)       # -> [B, K, D, T]
+    else:
         raise ValueError(f"Unexpected input_pose shape: {input_pose.shape}")
-    input_pose = input_pose.permute(0, 2, 3, 1).contiguous()
+
 
     # Fix noisy_x to [B, K, D, T]
-    if noisy_x.dim() == 5 and noisy_x.shape[2] == 1:
-        noisy_x = noisy_x.squeeze(2)
-    elif noisy_x.dim() != 4:
+    # noisy_x: [B, T, 1, K, D]?
+    if noisy_x.dim() == 5:
+        noisy_x = noisy_x.squeeze(2).permute(0, 2, 3, 1).contiguous()  # -> [B, K, D, T]
+    else:
         raise ValueError(f"Unexpected noisy_x shape: {noisy_x.shape}")
 
     timesteps = torch.randint(0, 1000, (input_pose.shape[0],), device=device)
