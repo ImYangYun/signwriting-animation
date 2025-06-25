@@ -5,7 +5,6 @@ from transformers import CLIPModel
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess, seq_encoder_factory
 from signwriting_animation.diffusion.core.distribution import DiagonalGaussianDistribution
 
-
 class SignWritingToPoseDiffusion(nn.Module):
     def __init__(self,
                  num_keypoints: int,
