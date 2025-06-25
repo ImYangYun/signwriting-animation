@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import CLIPModel
 
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess, seq_encoder_factory
-from signwriting_animation.core.distribution import DiagonalGaussianDistribution
+from signwriting_animation.diffusion.core.distribution import DiagonalGaussianDistribution
 
 
 class SignWritingToPoseDiffusion(nn.Module):
