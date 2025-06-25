@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import CLIPModel
 
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess, seq_encoder_factory
-from signwriting_animation.diffusion.core.distribution import DiagonalGaussianDistribution
+from signwriting_animation.diffusion.core.distribution import DistributionPredictionModel
 
 class SignWritingToPoseDiffusion(nn.Module):
     def __init__(self,
@@ -78,9 +78,8 @@ class SignWritingToPoseDiffusion(nn.Module):
                                               activation=activation)
 
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
+        self.length_predictor = DistributionPredictionModel(num_latent_dims)
 
-        self.length_mean_head = nn.Linear(num_latent_dims, 1)
-        self.length_logvar_head = nn.Linear(num_latent_dims, 1)
 
 
     def forward(self,
@@ -132,10 +131,9 @@ class SignWritingToPoseDiffusion(nn.Module):
         output = self.pose_projection(output)
         global_latent = xseq.mean(0) 
 
-        length_mean = self.length_mean_head(global_latent)     # [B, 1]
-        length_logvar = self.length_logvar_head(global_latent) # [B, 1]
-        length_dist = DiagonalGaussianDistribution(length_mean, length_logvar)
+        length_dist = self.length_predictor(global_latent)
         return output, length_dist
+
 
     def interface(self,
                   x: torch.Tensor,
