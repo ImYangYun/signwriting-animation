@@ -26,7 +26,7 @@ class DistributionPredictionModel(nn.Module):
         super().__init__()
         # distribution.py
         self.fc_mu = nn.Sequential(nn.Linear(input_size, 1), nn.Softplus())
-        self.fc_var = nn.Sequential(nn.Linear(input_size, 1), nn.Softplus())
+        self.fc_var = nn.Sequential(nn.Linear(input_size, 1), nn.Softplus(), nn.Hardtanh(min_val=1e-4, max_val=1.0))
 
     def forward(self, x: torch.Tensor):
         mu = self.fc_mu(x)

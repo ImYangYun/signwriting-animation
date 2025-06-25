@@ -64,7 +64,8 @@ def test_length_prediction_on_real_data(batch_size):
         mse_loss = torch.nn.functional.mse_loss(mean, target_lengths)
         mae_loss = torch.nn.functional.l1_loss(mean, target_lengths)
 
-        loss = nll.mean() + 0.5 * mse_loss + 0.3 * mae_loss  
+        std_penalty = (length_pred_dist.stddev ** 2).mean()
+        loss = nll.mean() + 0.5 * mse_loss + 0.3 * mae_loss + 0.001 * std_penalty
 
         loss.backward()
         optimizer.step()
