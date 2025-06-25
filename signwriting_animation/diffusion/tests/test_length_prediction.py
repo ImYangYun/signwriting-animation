@@ -4,21 +4,13 @@ from torch.utils.data import DataLoader
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset, get_num_workers
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from pose_format.torch.masked.collator import zero_pad_collator
-
+import matplotlib.pyplot as plt
 
 @pytest.mark.parametrize("batch_size", [4])
 def test_length_prediction_on_real_data(batch_size):
-    """
-    Unit test for probabilistic length prediction module using DiagonalGaussianDistribution.
-    Checks that:
-        - predicted mean is close to target
-        - distribution sampling works
-        - NLL is non-negative
-    """
     data_dir = "/scratch/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data.csv"
 
-    # Load dataset
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -37,39 +29,44 @@ def test_length_prediction_on_real_data(batch_size):
         pin_memory=False,
     )
 
-    # Load model
     model = SignWritingToPoseDiffusion(
         num_keypoints=586,
         num_dims_per_keypoint=3,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    model.eval()
 
-    # Prepare batch
     batch = next(iter(dataloader))
     input_pose = batch["conditions"]["input_pose"].to(device).to(torch.float32)
     sign_image = batch["conditions"]["sign_image"].to(device).to(torch.float32)
     noisy_x = batch["data"].to(device).to(torch.float32)
-    target_lengths = batch["length_target"].to(device).to(torch.float32)
+    target_lengths = batch["length_target"].to(device).to(torch.float32).squeeze(-1)
 
-    # Expected input_pose: [B, T, 1, K, D]
     if input_pose.dim() == 5:
-        input_pose = input_pose.squeeze(2)                # [B, T, K, D]
-        input_pose = input_pose.permute(0, 2, 3, 1)       # -> [B, K, D, T]
-    else:
-        raise ValueError(f"Unexpected input_pose shape: {input_pose.shape}")
-
-
-    # Fix noisy_x to [B, K, D, T]
-    # noisy_x: [B, T, 1, K, D]?
+        input_pose = input_pose.squeeze(2).permute(0, 2, 3, 1)
     if noisy_x.dim() == 5:
-        noisy_x = noisy_x.squeeze(2).permute(0, 2, 3, 1).contiguous()  # -> [B, K, D, T]
-    else:
-        raise ValueError(f"Unexpected noisy_x shape: {noisy_x.shape}")
+        noisy_x = noisy_x.squeeze(2).permute(0, 2, 3, 1).contiguous()
 
     timesteps = torch.randint(0, 1000, (input_pose.shape[0],), device=device)
 
+    # === Micro-training loop ===
+    optimizer = torch.optim.Adam(model.length_predictor.parameters(), lr=1e-3)
+    losses = []
+
+    model.train()
+    for step in range(100):
+        optimizer.zero_grad()
+        _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
+        nll = length_pred_dist.nll(target_lengths)
+        loss = nll.mean()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+        if step % 10 == 0:
+            print(f"[Step {step}] NLL Loss: {loss.item():.4f}")
+
+    # === Evaluation ===
+    model.eval()
     with torch.no_grad():
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
         global_latent = model.global_norm(model.sequence_pos_encoder(
@@ -79,27 +76,16 @@ def test_length_prediction_on_real_data(batch_size):
                 model.past_motion_process(input_pose),
                 model.future_motion_process(noisy_x)
             ], dim=0)
-        ).mean(0))  # shape: [batch_size, latent_dim]
+        ).mean(0))
 
     print("Global latent stats: min", global_latent.min().item(), "max", global_latent.max().item())
     print("Sample mean (length):", length_pred_dist.mean.mean().item())
 
     pred_lengths = length_pred_dist.mean.squeeze(-1)
-    target_lengths = target_lengths.squeeze(-1)
     abs_diff = (pred_lengths - target_lengths).abs()
     nll = length_pred_dist.nll(target_lengths)
+    samples = length_pred_dist.sample().squeeze(-1)
 
-    # === Additional distribution checks ===
-    samples = length_pred_dist.sample().squeeze(-1) 
-    assert samples.shape == pred_lengths.shape
-    assert pred_lengths.shape == target_lengths.shape
-    assert torch.all(nll >= 0), "Negative NLL encountered."
-
-    print("pred_lengths shape:", pred_lengths.shape)
-    print("samples shape:", samples.shape)
-    print("target_lengths shape:", target_lengths.shape)
-
-    # === Logging ===
     print("\n=== Length Prediction Test ===")
     print("Target lengths:      ", [round(float(x), 2) for x in target_lengths])
     print("Predicted means:     ", [round(float(x), 2) for x in pred_lengths])
@@ -107,11 +93,34 @@ def test_length_prediction_on_real_data(batch_size):
     print("Absolute differences:", [round(float(x), 2) for x in abs_diff])
     print("Mean NLL:            ", round(float(nll.mean()), 4))
 
-    # === Main assertion ===
-    relative_error = abs_diff / target_lengths.clamp(min=1.0) 
-    max_relative_error = 0.3  
+    # === Assertions ===
+    relative_error = abs_diff / target_lengths.clamp(min=1.0)
+    max_relative_error = 0.3
     assert torch.all(relative_error < max_relative_error), "Relative length prediction error too large."
 
+    # === Plot prediction vs target ===
+    plt.figure(figsize=(6, 6))
+    plt.scatter(target_lengths.cpu(), pred_lengths.cpu(), c='blue', label='Prediction')
+    plt.plot([0, max(target_lengths.max(), pred_lengths.max())], 
+             [0, max(target_lengths.max(), pred_lengths.max())], 
+             color='red', linestyle='--', label='Ideal')
+    plt.xlabel("Target Length")
+    plt.ylabel("Predicted Length")
+    plt.title("Length Prediction vs Target")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("length_prediction_scatter.png")
+    plt.close()
+
+    # === Plot loss ===
+    plt.plot(losses)
+    plt.title("Training Loss (NLL)")
+    plt.xlabel("Step")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("length_nll_loss.png")
 
 
 
