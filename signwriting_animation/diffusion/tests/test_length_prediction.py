@@ -5,7 +5,6 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset,
 from signwriting_animation.diffusion.core.distribution import SignWritingToPoseDiffusion
 from pose_format.torch.masked.collator import zero_pad_collator
 
-
 @pytest.mark.parametrize("batch_size", [4])
 def test_length_prediction_on_real_data(batch_size):
     """
