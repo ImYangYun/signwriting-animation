@@ -78,6 +78,7 @@ class DynamicPosePredictionDataset(Dataset):
 
         input_data = input_pose.data.zero_filled()
         target_data = target_pose.data.zero_filled()
+        print("target_data shape:", target_data.shape)
 
         target_length = torch.tensor([target_data.shape[0]], dtype=torch.float32) 
 
@@ -91,6 +92,10 @@ class DynamicPosePredictionDataset(Dataset):
 
         pil_img = signwriting_to_clip_image(rec.get("text", ""))
         sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
+        print(f"[DEBUG] Sample ID: {rec.get('id', os.path.basename(rec['pose']))}")
+        print(f"[DEBUG] input_pose.shape: {input_data.shape}")   # shape like (T_past, 1, 586, 3)
+        print(f"[DEBUG] target_data.shape: {target_data.shape}") # shape like (T_future, 1, 586, 3)
+
 
         sample = {
             "data": target_data,
@@ -150,6 +155,8 @@ def main():
     )
 
     batch = next(iter(loader))
+    print("[MAIN] target data shape:", batch["data"].shape)
+    print("[MAIN] input_pose shape:", batch["conditions"]["input_pose"].shape)
     print("Batch:", batch["data"].shape)
     print("Input pose:", batch["conditions"]["input_pose"].shape)
     print("Input mask:", batch["conditions"]["input_mask"].shape)
