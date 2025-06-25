@@ -4,6 +4,7 @@ from torch import nn
 class DiagonalGaussianDistribution:
     def __init__(self, mean: torch.Tensor, logvar: torch.Tensor):
         self.mean = mean
+        self.logvar = logvar
         self.std = torch.exp(0.5 * logvar)
         self.distribution = torch.distributions.Normal(self.mean, self.std)
 
@@ -15,6 +16,10 @@ class DiagonalGaussianDistribution:
 
     def nll(self, value):
         return -self.log_prob(value).mean()
+    
+    @property
+    def stddev(self):
+        return self.std 
 
 class DistributionPredictionModel(nn.Module):
     def __init__(self, input_size: int):

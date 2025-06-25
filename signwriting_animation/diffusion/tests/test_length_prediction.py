@@ -5,6 +5,7 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset,
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from pose_format.torch.masked.collator import zero_pad_collator
 import matplotlib.pyplot as plt
+import os
 
 @pytest.mark.parametrize("batch_size", [4])
 def test_length_prediction_on_real_data(batch_size):
@@ -57,17 +58,25 @@ def test_length_prediction_on_real_data(batch_size):
     for step in range(500):
         optimizer.zero_grad()
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
+
+        mean = length_pred_dist.mean.squeeze(-1)
         nll = length_pred_dist.nll(target_lengths)
-        loss = nll.mean()  
+        mse_loss = torch.nn.functional.mse_loss(mean, target_lengths)
+        mae_loss = torch.nn.functional.l1_loss(mean, target_lengths)
+
+        loss = nll.mean() + 0.5 * mse_loss + 0.3 * mae_loss  
 
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
-        if step % 10 == 0:
-            print(f"[Step {step}] NLL Loss: {loss.item():.4f}")
-            print(f"Pred std: {length_pred_dist.scale.mean().item():.4f}")
 
-    # === Evaluation ===
+        if step % 10 == 0:
+            print(f"[Step {step}] Total Loss: {loss.item():.4f}")
+            print(f" - NLL Loss:  {nll.mean().item():.4f}")
+            print(f" - MSE Loss:  {mse_loss.item():.4f}")
+            print(f" - MAE Loss:  {mae_loss.item():.4f}")
+            print(f" - Pred stddev: {length_pred_dist.stddev.mean().item():.4f}")
+
     model.eval()
     with torch.no_grad():
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
@@ -95,10 +104,11 @@ def test_length_prediction_on_real_data(batch_size):
     print("Absolute differences:", [round(float(x), 2) for x in abs_diff])
     print("Mean NLL:            ", round(float(nll.mean()), 4))
 
-    # === Assertions ===
     relative_error = abs_diff / target_lengths.clamp(min=1.0)
     max_relative_error = 0.7
     assert torch.all(relative_error < max_relative_error), "Relative length prediction error too large."
+
+    os.makedirs("outputs", exist_ok=True)
 
     # === Plot prediction vs target ===
     plt.figure(figsize=(6, 6))
@@ -116,12 +126,9 @@ def test_length_prediction_on_real_data(batch_size):
 
     # === Plot loss ===
     plt.plot(losses)
-    plt.title("Training Loss (NLL)")
+    plt.title("Training Loss")
     plt.xlabel("Step")
     plt.ylabel("Loss")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("length_nll_loss.png")
-
-
-
+    plt.savefig("outputs/length_nll_loss.png")
