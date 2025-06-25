@@ -46,6 +46,13 @@ def test_length_prediction_on_real_data(batch_size):
     # Load batch
     batch = next(iter(dataloader))
     input_pose = batch["conditions"]["input_pose"].to(device)
+
+    # Fix input_pose from [T, 1, K, D] to [1, T, K, D]
+    if input_pose.dim() == 4 and input_pose.shape[1] == 1:
+        input_pose = input_pose.permute(1, 0, 2, 3).contiguous()
+    elif input_pose.dim() != 4:
+        raise ValueError(f"Unexpected shape for input_pose: {input_pose.shape}")
+
     sign_image = batch["conditions"]["sign_image"].to(device)
     noisy_x = batch["data"].to(device)
     timesteps = torch.randint(0, 1000, (input_pose.shape[0],)).to(device)
@@ -56,9 +63,6 @@ def test_length_prediction_on_real_data(batch_size):
     elif noisy_x.dim() != 4:
         raise ValueError(f"Unexpected shape for noisy_x: {noisy_x.shape}")
 
-    # Permute input_pose to match expected shape
-    input_pose = input_pose.permute(0, 2, 3, 1).contiguous()
-
     with torch.no_grad():
         _, length_pred_dist = model(noisy_x, timesteps, input_pose, sign_image)
 
@@ -67,7 +71,6 @@ def test_length_prediction_on_real_data(batch_size):
     # Use predicted mean as the estimate
     pred_lengths = length_pred_dist.mean.squeeze(-1)
     abs_diff = (pred_lengths - target_lengths).abs()
-
     nll = length_pred_dist.nll(target_lengths)
 
     print("\n=== Length Prediction Test ===")
