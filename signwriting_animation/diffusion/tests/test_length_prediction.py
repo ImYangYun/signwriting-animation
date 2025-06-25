@@ -65,7 +65,7 @@ def test_length_prediction_on_real_data(batch_size):
         losses.append(loss.item())
         if step % 10 == 0:
             print(f"[Step {step}] NLL Loss: {loss.item():.4f}")
-            print(f"Pred std: {length_pred_dist.stddev.mean().item():.4f}")
+            print(f"Pred std: {length_pred_dist.scale.mean().item():.4f}")
 
     # === Evaluation ===
     model.eval()
@@ -103,16 +103,15 @@ def test_length_prediction_on_real_data(batch_size):
     # === Plot prediction vs target ===
     plt.figure(figsize=(6, 6))
     plt.scatter(target_lengths.cpu(), pred_lengths.cpu(), c='blue', label='Prediction')
-    plt.plot([0, max(target_lengths.max(), pred_lengths.max())], 
-             [0, max(target_lengths.max(), pred_lengths.max())], 
-             color='red', linestyle='--', label='Ideal')
+    max_len = max(target_lengths.max(), pred_lengths.max()).item()
+    plt.plot([0, max_len], [0, max_len], color='red', linestyle='--', label='Ideal')
     plt.xlabel("Target Length")
     plt.ylabel("Predicted Length")
     plt.title("Length Prediction vs Target")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("length_prediction_scatter.png")
+    plt.savefig("outputs/length_prediction_scatter.png")
     plt.close()
 
     # === Plot loss ===
