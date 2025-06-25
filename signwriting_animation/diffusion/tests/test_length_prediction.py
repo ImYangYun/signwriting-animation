@@ -39,7 +39,7 @@ def test_length_prediction_on_real_data(batch_size):
 
     # Load model
     model = SignWritingToPoseDiffusion(
-        num_keypoints=21,
+        num_keypoints=586,
         num_dims_per_keypoint=3,
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
