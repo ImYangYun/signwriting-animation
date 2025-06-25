@@ -48,9 +48,13 @@ def test_length_prediction_on_real_data(batch_size):
     noisy_x = batch["data"].to(device)
     timesteps = torch.randint(0, 1000, (input_pose.shape[0],)).to(device)
 
-    noisy_x = noisy_x.permute(0, 2, 3, 1).contiguous()
+    if noisy_x.dim() == 5 and noisy_x.shape[1] == 1:
+        noisy_x = noisy_x.squeeze(1)  
+    elif noisy_x.dim() != 4:
+        raise ValueError(f"Unexpected shape for noisy_x: {noisy_x.shape}")
+
     input_pose = input_pose.permute(0, 2, 3, 1).contiguous()
-    
+
     model.eval()
     with torch.no_grad():
         pose_out, length_pred = model(noisy_x, timesteps, input_pose, sign_image)
