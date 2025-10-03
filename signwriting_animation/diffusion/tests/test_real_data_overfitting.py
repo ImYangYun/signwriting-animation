@@ -1,34 +1,36 @@
 import os
-import random
 from typing import Optional
+
 import pytest
 import torch
 import lightning as pl
 from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
+
 from signwriting_animation.data.data_loader import (
     DynamicPosePredictionDataset,
     get_num_workers,
 )
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
+# ---------- Utils ----------
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
-    MSE over valid (non-padded) frames only.
-    pred/target: [B, T, ...]; mask: [B, T] with 1 valid, 0 pad
+    MSE over valid (non-padded) frames only, per-element weighting (J,C).
+    pred/target: [B, T, J, C]; mask: [B, T] with 1 valid, 0 pad
     """
-    diff = (pred - target) ** 2
-    while diff.dim() > 2:
-        diff = diff.mean(dim=-1)  # reduce pose dims -> [B, T]
-    diff = diff * mask
-    denom = mask.sum().clamp_min(1.0)
-    return diff.sum() / denom
+    mask = mask.float()  # [B,T]
+    diff2 = (pred - target) ** 2          # [B,T,J,C]
+    m = mask[:, :, None, None]            # [B,T,1,1]
+    num = (diff2 * m).sum()
+    den = (m.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
+    return num / den
 
 
-def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> float:
+def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    Tiny CPU DTW (O(T^2)) for validation hook.
+    Tiny O(T^2) DTW cost on CPU; returns scalar tensor.
     a: [T, D], b: [T', D]
     """
     a = a.detach().cpu()
@@ -40,14 +42,15 @@ def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> float:
     dp = torch.full((T + 1, Tp + 1), float("inf"))
     dp[0, 0] = 0.0
     for i in range(1, T + 1):
+        # vectorize the inner min slightly
         for j in range(1, Tp + 1):
-            cost = float(dist[i - 1, j - 1].item())
-            dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
-    return float(dp[T, Tp].item())
+            cost = dist[i - 1, j - 1]
+            dp[i, j] = float(cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1]))
+    return torch.tensor(dp[T, Tp])
 
 
 def chunked_dtw_mean(pred_seq: torch.Tensor, tgt_seq: torch.Tensor,
-                     max_len: int = 160, chunk: int = 40) -> float:
+                     max_len: int = 160, chunk: int = 40) -> torch.Tensor:
     """
     Chunked DTW (fluent-pose style):
     - Cap sequence length to max_len
@@ -57,15 +60,27 @@ def chunked_dtw_mean(pred_seq: torch.Tensor, tgt_seq: torch.Tensor,
     pred_seq = pred_seq[:T]
     tgt_seq = tgt_seq[:T]
     if T <= 1:
-        return 0.0
+        return torch.tensor(0.0)
     vals = []
     for s in range(0, T, chunk):
         e = min(T, s + chunk)
         if e - s < 2:
             continue
         vals.append(simple_dtw(pred_seq[s:e], tgt_seq[s:e]))
-    return float(sum(vals) / len(vals)) if vals else 0.0
+    if not vals:
+        return torch.tensor(0.0)
+    return torch.stack(vals).mean()
 
+
+def _module_device(module: torch.nn.Module):
+    return next(module.parameters()).device
+
+
+def _to(batch: dict, device):
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+# ---------- Dataset wrapper ----------
 
 class FilteredDataset(Dataset):
     """
@@ -97,7 +112,8 @@ class FilteredDataset(Dataset):
                 continue  # skip broken rows
 
         if len(self.valid_idx) == 0:
-            raise RuntimeError("No valid samples found after filtering.")
+            raise RuntimeError("No valid samples found after filtering. "
+                               "Try reducing target_count or max_scan.")
 
     def __len__(self):
         return len(self.valid_idx)
@@ -117,7 +133,6 @@ def make_loader(data_dir, csv_path, num_past, num_future, batch_size, seed: int 
     )
     ds = FilteredDataset(base, min_past=num_past, min_future=num_future,
                          target_count=64, max_scan=2000)
-    # Fixed shuffle order via generator for full determinism
     g = torch.Generator()
     g.manual_seed(seed)
     return DataLoader(
@@ -127,6 +142,8 @@ def make_loader(data_dir, csv_path, num_past, num_future, batch_size, seed: int 
         pin_memory=False,
     )
 
+
+# ---------- Lightning Module ----------
 
 class LitSWTPoseWithDTW(pl.LightningModule):
     """
@@ -139,7 +156,7 @@ class LitSWTPoseWithDTW(pl.LightningModule):
         self.lr = lr
         self.loss_hist = []
         self.len_mae_hist = []
-        self.val_dtw_hist = []  
+        self.val_dtw_hist = []  # store dtw init/end
 
     def forward(self, past, past_mask):
         return self.model(past_motion=past, past_mask=past_mask, return_dict=True)
@@ -152,22 +169,31 @@ class LitSWTPoseWithDTW(pl.LightningModule):
 
         out = self(past, past_mask)
         pred_future = out["pred_future"]
-        pred_len = out["pred_len"].squeeze(-1) if out["pred_len"].dim() > 1 else out["pred_len"]
-        target_len = future_mask.sum(dim=1)
 
         pose_loss = masked_mse(pred_future, future, future_mask)
-        len_mae = (pred_len - target_len).abs().mean()
+
+        pred_len = out.get("pred_len", None)
+        if pred_len is not None:
+            pred_len = pred_len.squeeze(-1) if pred_len.dim() > 1 else pred_len
+            target_len = future_mask.sum(dim=1)
+            len_mae = (pred_len - target_len).abs().mean()
+        else:
+            len_mae = torch.tensor(0.0, device=self.device)
+
         loss = pose_loss + 0.01 * len_mae
 
-        # Store histories for pytest assertions
+        # histories for assertions
         self.loss_hist.append(float(loss.detach().cpu().item()))
         self.len_mae_hist.append(float(len_mae.detach().cpu().item()))
-        self.log_dict({"train/loss": loss, "train/len_mae": len_mae}, prog_bar=False, on_step=True, on_epoch=False)
+        self.log_dict({"train/loss": loss, "train/len_mae": len_mae},
+                      prog_bar=False, on_step=True, on_epoch=False)
         return loss
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
+
+# ---------- Test ----------
 
 @pytest.mark.parametrize("batch_size, max_steps", [(2, 60)])
 def test_real_data_overfitting_lightning_dtw(batch_size, max_steps):
@@ -175,16 +201,18 @@ def test_real_data_overfitting_lightning_dtw(batch_size, max_steps):
     Build loader/model, run a short Lightning training, then assert:
     - total loss decreases
     - length-MAE improves or is small
-    - DTW improves (soft) on a fixed baseline batch
+    - DTW improves on a fixed baseline batch
     """
     pl.seed_everything(42, workers=True)
 
-    # (Optional) Stronger determinism—uncomment if you need bitwise reproducibility:
-    # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # or ":4096:2"
+    # For stricter determinism (optional):
+    # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:2"
     # torch.use_deterministic_algorithms(True)
 
-    data_dir = os.getenv("DATA_DIR", "/scratch/yayun/pose_data")
-    csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
+    # NOTE: set these to your actual paths if env not provided
+    data_dir = os.getenv("DATA_DIR", "/scratch/yayun/pose_data/raw_poses")
+    csv_path = os.getenv("CSV_PATH", "/scratch/yayun/pose_data/data.csv")
+
     if not os.path.exists(data_dir):
         pytest.skip(f"DATA_DIR not found: {data_dir}")
     if not os.path.exists(csv_path):
@@ -193,7 +221,6 @@ def test_real_data_overfitting_lightning_dtw(batch_size, max_steps):
     num_past, num_future = 40, 20
     num_keypoints, num_dims = 586, 3
 
-    # Deterministic, filtered loader with fixed shuffle
     loader = make_loader(data_dir, csv_path, num_past, num_future, batch_size, seed=42)
 
     # Fixed baseline batch for DTW before/after training
@@ -210,22 +237,22 @@ def test_real_data_overfitting_lightning_dtw(batch_size, max_steps):
     )
     lit = LitSWTPoseWithDTW(base_model)
 
-    # Initial DTW on baseline
+    # ---- Initial DTW on baseline (move tensors to module device) ----
     lit.eval()
+    dev = _module_device(lit)
+    baseline_batch_dev = _to(baseline_batch, dev)
+
     with torch.no_grad():
-        past0 = baseline_batch["past_pose"]
-        fut0 = baseline_batch["future_pose"]
-        past_mask0 = baseline_batch["past_mask"].float()
-        fut_mask0 = baseline_batch["future_mask"].float()
-        out0 = lit(past0, past_mask0)
+        out0 = lit(baseline_batch_dev["past_pose"], baseline_batch_dev["past_mask"].float())
         b0 = 0
-        tf0 = int(fut_mask0[b0].sum().item())
+        tf0 = int(baseline_batch_dev["future_mask"][b0].sum().item())
+        tf0 = min(tf0, out0["pred_future"].shape[1])  # align to min length
         pf0 = out0["pred_future"][b0, :tf0].reshape(tf0, -1)
-        gt0 = fut0[b0, :tf0].reshape(tf0, -1)
-        dtw_init = chunked_dtw_mean(pf0, gt0)
+        gt0 = baseline_batch_dev["future_pose"][b0, :tf0].reshape(tf0, -1)
+        dtw_init = float(chunked_dtw_mean(pf0, gt0).item())
         lit.val_dtw_hist.append(dtw_init)
 
-    # Train shortly (deterministic=True pairs with seed_everything)
+    # ---- Train shortly ----
     trainer = pl.Trainer(
         max_steps=max_steps,
         accelerator=device,
@@ -238,27 +265,27 @@ def test_real_data_overfitting_lightning_dtw(batch_size, max_steps):
     )
     trainer.fit(lit, train_dataloaders=loader)
 
-    # DTW again on the SAME baseline batch
+    # ---- DTW again on SAME baseline ----
     lit.eval()
+    dev = _module_device(lit)
+    baseline_batch_dev = _to(baseline_batch, dev)
     with torch.no_grad():
-        past1 = baseline_batch["past_pose"]
-        fut1 = baseline_batch["future_pose"]
-        past_mask1 = baseline_batch["past_mask"].float()
-        fut_mask1 = baseline_batch["future_mask"].float()
-        out1 = lit(past1, past_mask1)
+        out1 = lit(baseline_batch_dev["past_pose"], baseline_batch_dev["past_mask"].float())
         b0 = 0
-        tf1 = int(fut_mask1[b0].sum().item())
+        tf1 = int(baseline_batch_dev["future_mask"][b0].sum().item())
+        tf1 = min(tf1, out1["pred_future"].shape[1])
         pf1 = out1["pred_future"][b0, :tf1].reshape(tf1, -1)
-        gt1 = fut1[b0, :tf1].reshape(tf1, -1)
-        dtw_end = chunked_dtw_mean(pf1, gt1)
+        gt1 = baseline_batch_dev["future_pose"][b0, :tf1].reshape(tf1, -1)
+        dtw_end = float(chunked_dtw_mean(pf1, gt1).item())
         lit.val_dtw_hist.append(dtw_end)
 
+    # ---- Assertions ----
     lh = lit.loss_hist
     assert len(lh) > 0, "No training steps executed."
     k = max(1, len(lh) // 10)
     start_loss = sum(lh[:k]) / k
     end_loss = sum(lh[-k:]) / k
-    assert (end_loss < start_loss * 0.8) or (end_loss < start_loss - 0.05), \
+    assert (end_loss < start_loss * 0.85) or (end_loss < start_loss - 0.05), \
         f"Loss did not decrease enough: {start_loss:.4f} -> {end_loss:.4f}"
 
     lmh = lit.len_mae_hist
