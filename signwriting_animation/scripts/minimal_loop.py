@@ -7,7 +7,6 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import (
     DynamicPosePredictionDataset,
-    get_num_workers,
 )
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
@@ -58,11 +57,11 @@ def chunked_dtw_mean(pred_seq, tgt_seq, max_len=160, chunk=40):
 
 class FilteredDataset(Dataset):
     """
-    Wrap a base dataset; only keep up to `target_count` valid samples,
-    scanning at most `max_scan` items. This prevents huge memory usage.
+    仅保留最多 target_count 条“有效”样本（长度足够），最多扫描 max_scan 行，
+    避免一次性加载全数据导致 OOM。
     """
     def __init__(self, base: Dataset, min_past: int, min_future: int,
-                 target_count: int = 64, max_scan: Optional[int] = 2000):
+                 target_count: int = 1, max_scan: Optional[int] = 200):
         self.base = base
         self.idx = []
         N = len(base)
@@ -71,36 +70,31 @@ class FilteredDataset(Dataset):
             try:
                 it = base[i]
                 pm, fm = it.get("past_mask"), it.get("future_mask")
-                if int(pm.sum().item()) < min_past:
-                    continue
-                if int(fm.sum().item()) < min_future:
-                    continue
+                if int(pm.sum().item()) < min_past:  continue
+                if int(fm.sum().item()) < min_future: continue
                 self.idx.append(i)
                 if target_count is not None and len(self.idx) >= target_count:
                     break
             except Exception:
-                # skip broken items
                 continue
         if not self.idx:
             raise RuntimeError("FilteredDataset got 0 valid samples; "
                                "try lowering thresholds or increasing max_scan.")
 
-    def __len__(self):
-        return len(self.idx)
-
-    def __getitem__(self, i):
-        return self.base[self.idx[i]]
+    def __len__(self): return len(self.idx)
+    def __getitem__(self, i): return self.base[self.idx[i]]
 
 
 # ------------------------ lightning module ------------------------
 
 class LitMinimal(pl.LightningModule):
-    def __init__(self, num_keypoints: int, num_dims: int, lr=1e-3):
+    def __init__(self, num_keypoints: int, num_dims: int, lr=1e-3, weight_decay=0.0):
         super().__init__()
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints, num_dims_per_keypoint=num_dims
         )
         self.lr = lr
+        self.weight_decay = weight_decay
 
     def forward(self, past, past_mask, **kwargs):
         return self.model(past_motion=past, past_mask=past_mask, return_dict=True)
@@ -116,7 +110,7 @@ class LitMinimal(pl.LightningModule):
         pred = out["pred_future"]
         loss = masked_mse(pred, batch["future_pose"], batch["future_mask"])
 
-        # cheap DTW on first sample
+        # DTW on first (and only) sample
         b0 = 0
         tf = int(batch["future_mask"][b0].sum().item())
         tf = min(tf, pred.shape[1])
@@ -124,17 +118,16 @@ class LitMinimal(pl.LightningModule):
         gt = batch["future_pose"][b0, :tf].reshape(tf, -1)
         dtw = chunked_dtw_mean(pf, gt)
 
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/dtw", dtw, prog_bar=True)
+        self.log("val/loss",  loss, prog_bar=True)
+        self.log("val/dtw",   dtw,  prog_bar=True)
 
-        # length prediction (if model provides it)
         if "pred_len" in out:
             pred_len = out["pred_len"].squeeze(-1) if out["pred_len"].dim() > 1 else out["pred_len"]
             len_mae = (pred_len - batch["future_mask"].sum(dim=1)).abs().mean()
             self.log("val/len_mae", len_mae, prog_bar=True)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
 # ------------------------ dataloader builder ------------------------
@@ -147,8 +140,8 @@ def make_loader(
     num_workers,
     num_past=40,
     num_future=20,
-    target_count=64,
-    max_scan=2000,
+    target_count=1,
+    max_scan=200,
 ):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir,
@@ -169,8 +162,8 @@ def make_loader(
     return DataLoader(
         ds,
         batch_size=bs,
-        shuffle=(split == "train"),
-        num_workers=0,              # force 0 to reduce memory pressure
+        shuffle=False,              # 单样本过拟合，不需要 shuffle
+        num_workers=0,              # 省内存
         pin_memory=False,
         persistent_workers=False,
         collate_fn=zero_pad_collator,
@@ -182,31 +175,27 @@ def make_loader(
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
 
-    # default to your current layout; can be overridden by env vars
-    data_dir = os.getenv("DATA_DIR", "/data/yayun/signwriting-animation/raw_poses")
+    # 指向你的数据
+    data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
 
-    # small, safe defaults
-    batch_size = 2
+    # 过拟合设置（尽量保守，先跑通）
+    batch_size = 1
     num_workers = 0
     num_keypoints, num_dims = 586, 3
     num_past, num_future = 40, 20
-    target_count, max_scan = 64, 2000
+    target_count, max_scan = 1, 200
 
+    # 构建 loader（train/val 用同一条样本）
     train_loader = make_loader(
         data_dir, csv_path, "train",
         bs=batch_size, num_workers=num_workers,
         num_past=num_past, num_future=num_future,
         target_count=target_count, max_scan=max_scan
     )
-    val_loader = make_loader(
-        data_dir, csv_path, "dev",
-        bs=batch_size, num_workers=num_workers,
-        num_past=num_past, num_future=num_future,
-        target_count=target_count, max_scan=max_scan
-    )
+    val_loader = train_loader
 
-    # sanity grab one batch to ensure we won't OOM at first iteration
+    # 预取一个 batch，确保不会在这里 OOM
     try:
         first_batch = next(iter(train_loader))
         shapes = {k: (v.shape if hasattr(v, "shape") else type(v)) for k, v in first_batch.items()}
@@ -215,13 +204,15 @@ if __name__ == "__main__":
         print("[DEBUG] failed to get first batch:", repr(e))
         raise
 
-    model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, lr=1e-3)
+    model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, lr=1e-3, weight_decay=0.0)
     trainer = pl.Trainer(
-        max_epochs=3,
+        max_steps=600,           
         accelerator="auto",
         devices=1,
         log_every_n_steps=5,
         enable_checkpointing=False,
         deterministic=True,
+        # gradient_clip_val=1.0,    
     )
     trainer.fit(model, train_loader, val_loader)
+
