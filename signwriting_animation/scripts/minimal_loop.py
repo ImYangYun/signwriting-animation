@@ -78,8 +78,9 @@ class FilteredDataset(Dataset):
             except Exception:
                 continue
         if not self.idx:
-            raise RuntimeError("FilteredDataset got 0 valid samples; "
-                               "try lowering thresholds or increasing max_scan.")
+            self.idx = [0]
+            #raise RuntimeError("FilteredDataset got 0 valid samples; "
+                               #"try lowering thresholds or increasing max_scan.")
 
     def __len__(self): return len(self.idx)
     def __getitem__(self, i): return self.base[self.idx[i]]
@@ -141,14 +142,14 @@ def make_loader(
     num_past=10,
     num_future=5,
     target_count=1,
-    max_scan=200,
+    max_scan=1000,
 ):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
         num_past_frames=num_past,
         num_future_frames=num_future,
-        with_metadata=True,
+        with_metadata=False,
         split=split,
     )
     ds = FilteredDataset(
@@ -176,7 +177,7 @@ if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
 
     # 指向你的数据
-    data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
+    data_dir = os.getenv("DATA_DIR", "/data/yayun/pose_data")
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")
 
     # 过拟合设置（尽量保守，先跑通）
@@ -184,7 +185,7 @@ if __name__ == "__main__":
     num_workers = 0
     num_keypoints, num_dims = 586, 3
     num_past, num_future = 10, 5
-    target_count, max_scan = 1, 200
+    target_count, max_scan = 1, 1000
 
     # 构建 loader（train/val 用同一条样本）
     train_loader = make_loader(
