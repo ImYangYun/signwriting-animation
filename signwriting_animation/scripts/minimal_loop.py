@@ -138,8 +138,8 @@ def make_loader(
     split,
     bs,
     num_workers,
-    num_past=40,
-    num_future=20,
+    num_past=10,
+    num_future=5,
     target_count=1,
     max_scan=200,
 ):
