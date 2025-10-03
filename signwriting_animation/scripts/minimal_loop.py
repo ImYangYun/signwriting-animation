@@ -1,18 +1,27 @@
 import os
 import lightning as pl
 import torch
-from torch.utils.data import DataLoader
+from typing import Optional
+from torch.utils.data import DataLoader, Dataset
 from pose_format.torch.masked.collator import zero_pad_collator
-from signwriting_animation.data.data_loader import DynamicPosePredictionDataset, get_num_workers
+
+from signwriting_animation.data.data_loader import (
+    DynamicPosePredictionDataset,
+    get_num_workers,
+)
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
+
+# ------------------------ losses & metrics ------------------------
+
 def masked_mse(pred, target, mask):
-    mask = mask.float()
-    diff2 = (pred - target) ** 2          # [B,T,J,C]
-    m = mask[:, :, None, None]            # [B,T,1,1]
+    mask = mask.float()                    # [B,T]
+    diff2 = (pred - target) ** 2           # [B,T,J,C]
+    m = mask[:, :, None, None]             # [B,T,1,1]
     num = (diff2 * m).sum()
     den = (m.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
     return num / den
+
 
 def simple_dtw(a, b):
     a = a.detach().cpu()
@@ -45,6 +54,46 @@ def chunked_dtw_mean(pred_seq, tgt_seq, max_len=160, chunk=40):
     return torch.stack(vals).mean() if vals else torch.tensor(0.0)
 
 
+# ------------------------ small filtered dataset ------------------------
+
+class FilteredDataset(Dataset):
+    """
+    Wrap a base dataset; only keep up to `target_count` valid samples,
+    scanning at most `max_scan` items. This prevents huge memory usage.
+    """
+    def __init__(self, base: Dataset, min_past: int, min_future: int,
+                 target_count: int = 64, max_scan: Optional[int] = 2000):
+        self.base = base
+        self.idx = []
+        N = len(base)
+        scan_limit = N if max_scan is None else min(N, max_scan)
+        for i in range(scan_limit):
+            try:
+                it = base[i]
+                pm, fm = it.get("past_mask"), it.get("future_mask")
+                if int(pm.sum().item()) < min_past:
+                    continue
+                if int(fm.sum().item()) < min_future:
+                    continue
+                self.idx.append(i)
+                if target_count is not None and len(self.idx) >= target_count:
+                    break
+            except Exception:
+                # skip broken items
+                continue
+        if not self.idx:
+            raise RuntimeError("FilteredDataset got 0 valid samples; "
+                               "try lowering thresholds or increasing max_scan.")
+
+    def __len__(self):
+        return len(self.idx)
+
+    def __getitem__(self, i):
+        return self.base[self.idx[i]]
+
+
+# ------------------------ lightning module ------------------------
+
 class LitMinimal(pl.LightningModule):
     def __init__(self, num_keypoints: int, num_dims: int, lr=1e-3):
         super().__init__()
@@ -67,7 +116,7 @@ class LitMinimal(pl.LightningModule):
         pred = out["pred_future"]
         loss = masked_mse(pred, batch["future_pose"], batch["future_mask"])
 
-        # DTW on first sample to keep it cheap
+        # cheap DTW on first sample
         b0 = 0
         tf = int(batch["future_mask"][b0].sum().item())
         tf = min(tf, pred.shape[1])
@@ -78,7 +127,7 @@ class LitMinimal(pl.LightningModule):
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/dtw", dtw, prog_bar=True)
 
-        # length prediction (if available)
+        # length prediction (if model provides it)
         if "pred_len" in out:
             pred_len = out["pred_len"].squeeze(-1) if out["pred_len"].dim() > 1 else out["pred_len"]
             len_mae = (pred_len - batch["future_mask"].sum(dim=1)).abs().mean()
@@ -88,8 +137,20 @@ class LitMinimal(pl.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
 
-def make_loader(data_dir, csv_path, split, bs, num_workers, num_past=40, num_future=20):
-    ds = DynamicPosePredictionDataset(
+# ------------------------ dataloader builder ------------------------
+
+def make_loader(
+    data_dir,
+    csv_path,
+    split,
+    bs,
+    num_workers,
+    num_past=40,
+    num_future=20,
+    target_count=64,
+    max_scan=2000,
+):
+    base = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
         num_past_frames=num_past,
@@ -97,24 +158,62 @@ def make_loader(data_dir, csv_path, split, bs, num_workers, num_past=40, num_fut
         with_metadata=True,
         split=split,
     )
-    return DataLoader(
-        ds, batch_size=bs, shuffle=(split == "train"),
-        num_workers=num_workers, collate_fn=zero_pad_collator
+    ds = FilteredDataset(
+        base, min_past=num_past, min_future=num_future,
+        target_count=target_count, max_scan=max_scan
     )
 
+    print(f"[DEBUG] split={split} | batch_size={bs} | num_workers=0 "
+          f"| target_count={target_count} | max_scan={max_scan} | len(ds)={len(ds)}")
+
+    return DataLoader(
+        ds,
+        batch_size=bs,
+        shuffle=(split == "train"),
+        num_workers=0,              # force 0 to reduce memory pressure
+        pin_memory=False,
+        persistent_workers=False,
+        collate_fn=zero_pad_collator,
+    )
+
+
+# ------------------------ main ------------------------
 
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
 
-    data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
+    # default to your current layout; can be overridden by env vars
+    data_dir = os.getenv("DATA_DIR", "/data/yayun/signwriting-animation/raw_poses")
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
+
+    # small, safe defaults
+    batch_size = 2
     num_workers = 0
-    #min(2, get_num_workers())
-
     num_keypoints, num_dims = 586, 3
+    num_past, num_future = 40, 20
+    target_count, max_scan = 64, 2000
 
-    train_loader = make_loader(data_dir, csv_path, "train", bs=2, num_workers=num_workers)
-    val_loader   = make_loader(data_dir, csv_path, "dev",   bs=2, num_workers=num_workers)
+    train_loader = make_loader(
+        data_dir, csv_path, "train",
+        bs=batch_size, num_workers=num_workers,
+        num_past=num_past, num_future=num_future,
+        target_count=target_count, max_scan=max_scan
+    )
+    val_loader = make_loader(
+        data_dir, csv_path, "dev",
+        bs=batch_size, num_workers=num_workers,
+        num_past=num_past, num_future=num_future,
+        target_count=target_count, max_scan=max_scan
+    )
+
+    # sanity grab one batch to ensure we won't OOM at first iteration
+    try:
+        first_batch = next(iter(train_loader))
+        shapes = {k: (v.shape if hasattr(v, "shape") else type(v)) for k, v in first_batch.items()}
+        print("[DEBUG] first train batch keys:", shapes)
+    except Exception as e:
+        print("[DEBUG] failed to get first batch:", repr(e))
+        raise
 
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, lr=1e-3)
     trainer = pl.Trainer(
