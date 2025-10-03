@@ -177,7 +177,7 @@ if __name__ == "__main__":
 
     # 指向你的数据
     data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
-    csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
+    csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")
 
     # 过拟合设置（尽量保守，先跑通）
     batch_size = 1
