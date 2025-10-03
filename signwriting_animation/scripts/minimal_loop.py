@@ -106,8 +106,8 @@ def make_loader(data_dir, csv_path, split, bs, num_workers, num_past=40, num_fut
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
 
-    data_dir = os.getenv("DATA_DIR", "/scratch/yayun/pose_data/raw_poses")
-    csv_path = os.getenv("CSV_PATH", "/scratch/yayun/pose_data/data.csv")
+    data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
+    csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
     num_workers = min(2, get_num_workers())
 
     num_keypoints, num_dims = 586, 3
