@@ -183,7 +183,7 @@ if __name__ == "__main__":
     batch_size = 1
     num_workers = 0
     num_keypoints, num_dims = 586, 3
-    num_past, num_future = 40, 20
+    num_past, num_future = 10, 5
     target_count, max_scan = 1, 200
 
     # 构建 loader（train/val 用同一条样本）
