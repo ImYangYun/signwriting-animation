@@ -108,12 +108,13 @@ if __name__ == "__main__":
 
     data_dir = os.getenv("DATA_DIR", "/data/yayun/raw_poses")
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
-    num_workers = min(2, get_num_workers())
+    num_workers = 0
+    #min(2, get_num_workers())
 
     num_keypoints, num_dims = 586, 3
 
-    train_loader = make_loader(data_dir, csv_path, "train", bs=8, num_workers=num_workers)
-    val_loader   = make_loader(data_dir, csv_path, "dev",   bs=8, num_workers=num_workers)
+    train_loader = make_loader(data_dir, csv_path, "train", bs=2, num_workers=num_workers)
+    val_loader   = make_loader(data_dir, csv_path, "dev",   bs=2, num_workers=num_workers)
 
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, lr=1e-3)
     trainer = pl.Trainer(
