@@ -149,7 +149,7 @@ def make_loader(
         csv_path=csv_path,
         num_past_frames=num_past,
         num_future_frames=num_future,
-        with_metadata=False,
+        with_metadata=True,
         split=split,
     )
     ds = FilteredDataset(
