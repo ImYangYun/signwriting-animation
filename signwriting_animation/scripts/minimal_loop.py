@@ -111,10 +111,10 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         cond = batch["conditions"]
-        fut = _to_dense_btjc(batch["data"])  # [B, T_f, J, C]
-        past = _to_dense_btjc(cond["input_pose"])  # [B, T_p, J, C]
+        fut = _to_dense_btjc(batch["data"]).float() # [B, T_f, J, C]
+        past = _to_dense_btjc(cond["input_pose"]).float()  # [B, T_p, J, C]
         tgt_mask = cond["target_mask"].float()  # [B, T_f]
-        sign_img = cond["sign_image"]  # [B, 3, 224, 224]
+        sign_img = cond["sign_image"].float()  # [B, 3, 224, 224]
 
         # 转换为 [B, J, C, T]
         x = fut.permute(0, 2, 3, 1).contiguous()
@@ -130,10 +130,10 @@ class LitMinimal(pl.LightningModule):
 
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-        fut = _to_dense_btjc(batch["data"])
-        past = _to_dense_btjc(cond["input_pose"])
+        fut = _to_dense_btjc(batch["data"]).float()
+        past = _to_dense_btjc(cond["input_pose"]).float()
         tgt_mask = cond["target_mask"].float()
-        sign_img = cond["sign_image"]
+        sign_img = cond["sign_image"].float()
 
         x = fut.permute(0, 2, 3, 1).contiguous()
         past_motion = past.permute(0, 2, 3, 1).contiguous()
@@ -176,6 +176,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers, target_count=1, max_
 # ------------------------ main ------------------------
 
 if __name__ == "__main__":
+    torch.set_default_dtype(torch.float32)
     pl.seed_everything(42, workers=True)
 
     data_dir = os.getenv("DATA_DIR", "/data/yayun/pose_data")
@@ -204,6 +205,7 @@ if __name__ == "__main__":
         max_steps=600,
         accelerator="auto",
         devices=1,
+        precision="32-true",
         log_every_n_steps=1, 
         enable_checkpointing=False,
         deterministic=True,
