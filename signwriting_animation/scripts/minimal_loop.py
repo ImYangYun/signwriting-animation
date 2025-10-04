@@ -1,20 +1,23 @@
+# signwriting_animation/scripts/minimal_loop.py
 import os
+from typing import Optional
 import lightning as pl
 import torch
-from typing import Optional
 from torch.utils.data import DataLoader, Dataset
 from pose_format.torch.masked.collator import zero_pad_collator
 
-from signwriting_animation.data.data_loader import (
-    DynamicPosePredictionDataset,
-)
+from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
 
 # ------------------------ losses & metrics ------------------------
 
 def masked_mse(pred, target, mask):
-    mask = mask.float()                    # [B,T]
+    """
+    pred/target: [B, T, J, C]
+    mask:       [B, T] (1=valid, 0=pad)
+    """
+    mask = mask.float()
     diff2 = (pred - target) ** 2           # [B,T,J,C]
     m = mask[:, :, None, None]             # [B,T,1,1]
     num = (diff2 * m).sum()
@@ -23,6 +26,9 @@ def masked_mse(pred, target, mask):
 
 
 def simple_dtw(a, b):
+    """
+    a,b: [T, D]
+    """
     a = a.detach().cpu()
     b = b.detach().cpu()
     T, D = a.shape
@@ -39,6 +45,9 @@ def simple_dtw(a, b):
 
 
 def chunked_dtw_mean(pred_seq, tgt_seq, max_len=160, chunk=40):
+    """
+    pred_seq/tgt_seq: [T, D]
+    """
     T = min(pred_seq.shape[0], max_len)
     pred_seq = pred_seq[:T]
     tgt_seq = tgt_seq[:T]
@@ -57,8 +66,8 @@ def chunked_dtw_mean(pred_seq, tgt_seq, max_len=160, chunk=40):
 
 class FilteredDataset(Dataset):
     """
-    仅保留最多 target_count 条“有效”样本（长度足够），最多扫描 max_scan 行，
-    避免一次性加载全数据导致 OOM。
+    从基础 dataset 里预扫描，最多保留 target_count 条“有效”样本（输入/目标长度满足阈值）。
+    这样可以避免一次性遍历全数据。
     """
     def __init__(self, base: Dataset, min_past: int, min_future: int,
                  target_count: int = 1, max_scan: Optional[int] = 200):
@@ -68,19 +77,29 @@ class FilteredDataset(Dataset):
         scan_limit = N if max_scan is None else min(N, max_scan)
         for i in range(scan_limit):
             try:
-                it = base[i]
-                pm, fm = it.get("past_mask"), it.get("future_mask")
-                if int(pm.sum().item()) < min_past:  continue
-                if int(fm.sum().item()) < min_future: continue
+                item = base[i]
+                cond = item.get("conditions", {})
+                past_mask = cond.get("input_mask", None)
+                fut_mask  = cond.get("target_mask", None)
+
+                # 这两个 mask 在你的 dataloader 里是 1D (T)，通过 collator 后会变成 [T] 或 [B,T]。
+                def _sum(x):
+                    return int(torch.as_tensor(x).sum().item())
+
+                if past_mask is not None and _sum(past_mask) < min_past:
+                    continue
+                if fut_mask is not None and _sum(fut_mask) < min_future:
+                    continue
+
                 self.idx.append(i)
                 if target_count is not None and len(self.idx) >= target_count:
                     break
             except Exception:
                 continue
+
         if not self.idx:
+            # 兜底：至少保留第一条，保证 loop 能跑起来
             self.idx = [0]
-            #raise RuntimeError("FilteredDataset got 0 valid samples; "
-                               #"try lowering thresholds or increasing max_scan.")
 
     def __len__(self): return len(self.idx)
     def __getitem__(self, i): return self.base[self.idx[i]]
@@ -97,35 +116,53 @@ class LitMinimal(pl.LightningModule):
         self.lr = lr
         self.weight_decay = weight_decay
 
-    def forward(self, past, past_mask, **kwargs):
-        return self.model(past_motion=past, past_mask=past_mask, return_dict=True)
-
     def training_step(self, batch, _):
-        out = self(batch["past_pose"], batch["past_mask"])
-        loss = masked_mse(out["pred_future"], batch["future_pose"], batch["future_mask"])
+        # --- unpack from your dataset format ---
+        fut      = batch["data"]                      # [B, T_f, J, C]
+        cond     = batch["conditions"]
+        past     = cond["input_pose"]                 # [B, T_p, J, C]
+        tgt_mask = cond["target_mask"].float()        # [B, T_f]
+        sign_img = cond["sign_image"]                 # [B, 3, 224, 224]
+
+        # --- permute to model's expected layout [B, J, C, T] ---
+        x           = fut.permute(0, 2, 3, 1).contiguous()   # [B, J, C, T_f]
+        past_motion = past.permute(0, 2, 3, 1).contiguous()  # [B, J, C, T_p]
+        timesteps   = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # --- model forward (returns [B, J, C, T_f]) ---
+        out_bjct = self.model.forward(x, timesteps, past_motion, sign_img)
+        pred     = out_bjct.permute(0, 3, 1, 2).contiguous()  # -> [B, T_f, J, C]
+
+        loss = masked_mse(pred, fut, tgt_mask)
         self.log("train/loss", loss, prog_bar=True, on_step=True)
         return loss
 
     def validation_step(self, batch, _):
-        out = self(batch["past_pose"], batch["past_mask"])
-        pred = out["pred_future"]
-        loss = masked_mse(pred, batch["future_pose"], batch["future_mask"])
+        fut      = batch["data"]
+        cond     = batch["conditions"]
+        past     = cond["input_pose"]
+        tgt_mask = cond["target_mask"].float()
+        sign_img = cond["sign_image"]
 
-        # DTW on first (and only) sample
+        x           = fut.permute(0, 2, 3, 1).contiguous()
+        past_motion = past.permute(0, 2, 3, 1).contiguous()
+        timesteps   = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        out_bjct = self.model.forward(x, timesteps, past_motion, sign_img)
+        pred     = out_bjct.permute(0, 3, 1, 2).contiguous()
+
+        loss = masked_mse(pred, fut, tgt_mask)
+
+        # DTW on first sample
         b0 = 0
-        tf = int(batch["future_mask"][b0].sum().item())
+        tf = int(tgt_mask[b0].sum().item())
         tf = min(tf, pred.shape[1])
         pf = pred[b0, :tf].reshape(tf, -1)
-        gt = batch["future_pose"][b0, :tf].reshape(tf, -1)
+        gt = fut[b0,  :tf].reshape(tf, -1)
         dtw = chunked_dtw_mean(pf, gt)
 
-        self.log("val/loss",  loss, prog_bar=True)
-        self.log("val/dtw",   dtw,  prog_bar=True)
-
-        if "pred_len" in out:
-            pred_len = out["pred_len"].squeeze(-1) if out["pred_len"].dim() > 1 else out["pred_len"]
-            len_mae = (pred_len - batch["future_mask"].sum(dim=1)).abs().mean()
-            self.log("val/len_mae", len_mae, prog_bar=True)
+        self.log("val/loss", loss, prog_bar=True)
+        self.log("val/dtw",  dtw,  prog_bar=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -149,7 +186,7 @@ def make_loader(
         csv_path=csv_path,
         num_past_frames=num_past,
         num_future_frames=num_future,
-        with_metadata=True,
+        with_metadata=True,    # 保留即可，不影响训练
         split=split,
     )
     ds = FilteredDataset(
@@ -157,13 +194,12 @@ def make_loader(
         target_count=target_count, max_scan=max_scan
     )
 
-    print(f"[DEBUG] split={split} | batch_size={bs} | num_workers=0 "
-          f"| target_count={target_count} | max_scan={max_scan} | len(ds)={len(ds)}")
+    print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
 
     return DataLoader(
         ds,
         batch_size=bs,
-        shuffle=False,              # 单样本过拟合，不需要 shuffle
+        shuffle=False,              # 单样本过拟合不需要 shuffle
         num_workers=0,              # 省内存
         pin_memory=False,
         persistent_workers=False,
@@ -176,7 +212,6 @@ def make_loader(
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
 
-    # 指向你的数据
     data_dir = os.getenv("DATA_DIR", "/data/yayun/pose_data")
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")
 
@@ -196,24 +231,26 @@ if __name__ == "__main__":
     )
     val_loader = train_loader
 
-    # 预取一个 batch，确保不会在这里 OOM
-    try:
-        first_batch = next(iter(train_loader))
-        shapes = {k: (v.shape if hasattr(v, "shape") else type(v)) for k, v in first_batch.items()}
-        print("[DEBUG] first train batch keys:", shapes)
-    except Exception as e:
-        print("[DEBUG] failed to get first batch:", repr(e))
-        raise
+    # 预取一个 batch，打印结构
+    first = next(iter(train_loader))
+    print("[DEBUG] top-level keys:", list(first.keys()))
+    if "conditions" in first:
+        print("[DEBUG] condition keys:", list(first["conditions"].keys()))
+        print("[DEBUG] shapes -> data:", tuple(first["data"].shape),
+              "input_pose:", tuple(first["conditions"]["input_pose"].shape),
+              "target_mask:", tuple(first["conditions"]["target_mask"].shape),
+              "sign_image:", tuple(first["conditions"]["sign_image"].shape))
 
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, lr=1e-3, weight_decay=0.0)
     trainer = pl.Trainer(
-        max_steps=600,           
+        max_steps=600,
         accelerator="auto",
         devices=1,
         log_every_n_steps=5,
         enable_checkpointing=False,
         deterministic=True,
-        # gradient_clip_val=1.0,    
+        num_sanity_val_steps=0,   # 先关 sanity check，加快起跑
     )
     trainer.fit(model, train_loader, val_loader)
+
 
