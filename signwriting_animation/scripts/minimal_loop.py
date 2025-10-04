@@ -1,6 +1,8 @@
 # signwriting_animation/scripts/minimal_loop.py
 import os
-from typing import Dict
+import math
+from pathlib import Path
+from typing import Dict, Tuple
 
 import torch
 import lightning as pl
@@ -10,83 +12,103 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
-# --- 可视化与日志 ---
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
+
+# =====================
+# dtype & utils
+# =====================
+def set_global_float32():
+    torch.set_default_dtype(torch.float32)
+    # 让所有新建张量默认 float32（避免 numpy -> double 带来的混用）
+    torch.set_default_tensor_type(torch.FloatTensor)
 
 
-# ------------------------ losses & metrics ------------------------
-
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def btjc_to_bjct(x: torch.Tensor) -> torch.Tensor:
     """
-    pred/target: [B, T, J, C]; mask: [B, T]  (1 有效, 0 pad)
+    dataset 输出: [B, T, J, C]  -> 模型期望: [B, J, C, T]
+    并统一成 float32 连续内存。
     """
-    mask = mask.float()                      # [B,T]
-    diff2 = (pred - target) ** 2             # [B,T,J,C]
-    m = mask[:, :, None, None]               # [B,T,1,1]
+    if x.ndim != 4:
+        raise ValueError(f"Expected 4D tensor [B,T,J,C], got {x.shape} (ndim={x.ndim})")
+    return x.permute(0, 2, 3, 1).contiguous().float()
+
+
+def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
+    """确保是 dense float32 连续内存（有些场景会返回稀疏/非连续 Tensor）"""
+    if x.is_sparse:
+        x = x.to_dense()
+    if x.dtype != torch.float32:
+        x = x.float()
+    if not x.is_contiguous():
+        x = x.contiguous()
+    return x
+
+
+def masked_mse_btjc(pred_btjc: torch.Tensor, tgt_btjc: torch.Tensor, mask_bt: torch.Tensor) -> torch.Tensor:
+    """
+    pred/tgt: [B, T, J, C], mask: [B, T]  -> 有效帧上的 MSE
+    """
+    pred_btjc = sanitize_btjc(pred_btjc)
+    tgt_btjc = sanitize_btjc(tgt_btjc)
+    mask_bt = mask_bt.float()
+
+    diff2 = (pred_btjc - tgt_btjc) ** 2  # [B,T,J,C]
+    m = mask_bt[:, :, None, None]        # [B,T,1,1]
     num = (diff2 * m).sum()
-    den = (m.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
+    den = (m.sum() * pred_btjc.size(2) * pred_btjc.size(3)).clamp_min(1.0)
     return num / den
 
 
-def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def simple_dtw(a_td: torch.Tensor, b_td: torch.Tensor) -> torch.Tensor:
     """
-    朴素 DTW，CPU，O(T^2)
-    a: [T, D], b: [T', D]  -> 返回标量 tensor
+    朴素 DTW（CPU，上小样本 & 片段即可）
+    a/b: [T, D]
     """
-    a = a.detach().cpu()
-    b = b.detach().cpu()
+    a = a_td.detach().cpu().float()
+    b = b_td.detach().cpu().float()
     T, D = a.shape
     Tp, Dp = b.shape
-    assert D == Dp, "DTW dims mismatch"
+    if D != Dp:
+        raise ValueError(f"DTW feature dims mismatch: {D} vs {Dp}")
+
     dist = torch.cdist(a, b)  # [T, Tp]
     dp = torch.full((T + 1, Tp + 1), float("inf"))
     dp[0, 0] = 0.0
     for i in range(1, T + 1):
         for j in range(1, Tp + 1):
-            cost = dist[i - 1, j - 1]
-            dp[i, j] = float(cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1]))
-    return dp[T, Tp]  # 直接返回 tensor，避免警告
+            cost = float(dist[i - 1, j - 1])
+            dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+    return torch.tensor(dp[T, Tp], dtype=torch.float32)
 
 
-def chunked_dtw_mean(pred_seq: torch.Tensor, tgt_seq: torch.Tensor, max_len: int = 160, chunk: int = 40) -> torch.Tensor:
+def chunked_dtw_mean(btjc_pred: torch.Tensor, btjc_gt: torch.Tensor, mask_bt: torch.Tensor,
+                     max_len: int = 160, chunk: int = 40) -> torch.Tensor:
     """
-    分片 DTW，限制长度后分段求 DTW 再平均；pred_seq/tgt_seq: [T, D]
+    把 [B,T,J,C] 的第一个样本拉直成 [T,D]，做分片 DTW 并平均。
     """
-    T = min(pred_seq.shape[0], max_len)
-    pred_seq = pred_seq[:T]
-    tgt_seq = tgt_seq[:T]
+    b0 = 0
+    T = int(mask_bt[b0].sum().item())
+    T = min(T, btjc_pred.shape[1], max_len)
     if T <= 1:
         return torch.tensor(0.0)
+
+    # [T, D] 其中 D = J*C
+    pf_td = btjc_pred[b0, :T].reshape(T, -1)
+    gt_td = btjc_gt[b0, :T].reshape(T, -1)
+
     vals = []
     for s in range(0, T, chunk):
         e = min(T, s + chunk)
         if e - s < 2:
             continue
-        vals.append(simple_dtw(pred_seq[s:e], tgt_seq[s:e]))
+        vals.append(simple_dtw(pf_td[s:e], gt_td[s:e]))
     return torch.stack(vals).mean() if vals else torch.tensor(0.0)
 
 
-# ------------------------ dataloader builder ------------------------
-
-def make_loader(
-    data_dir: str,
-    csv_path: str,
-    split: str,
-    batch_size: int,
-    num_workers: int,
-    num_past: int = 40,
-    num_future: int = 20,
-    target_count=None,
-    max_scan=None,
-):
-    """
-    注意：这里直接使用你 Dataset 的输出，不再额外变换。
-    """
+# =====================
+# Data
+# =====================
+def make_loader(data_dir: str, csv_path: str, split: str,
+                bs: int, num_past: int, num_future: int) -> DataLoader:
     ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -95,229 +117,168 @@ def make_loader(
         with_metadata=True,
         split=split,
     )
-
-    # 如果你想小样本快速实验，可裁剪：
-    if target_count is not None:
-        from torch.utils.data import Subset
-        N = len(ds)
-        keep = min(N, int(target_count))
-        ds = Subset(ds, list(range(keep)))
-
-    print(f"[DEBUG] split={split} | len(ds)={len(ds)} | bs={batch_size} | workers={num_workers}")
-
     return DataLoader(
         ds,
-        batch_size=batch_size,
+        batch_size=bs,
         shuffle=(split == "train"),
-        num_workers=num_workers,
+        num_workers=0,                 # 小批量 + 省内存
         pin_memory=False,
         persistent_workers=False,
         collate_fn=zero_pad_collator,
     )
 
 
-# ------------------------ small viz utils ------------------------
-
-def _btjc_to_np_xy(seq_btjc: torch.Tensor) -> Dict[str, np.ndarray]:
-    """
-    seq_btjc: [B, T, J, C]  只取 batch=0，返回若干关节的 (x,y) 序列。
-    你可以根据真实关键点映射调整 pick_joints 的索引。
-    """
-    x = seq_btjc[0]  # [T, J, C]
-    x = x.detach().cpu().float().numpy()
-    pick_joints = {
-        "wrist_L": 0,
-        "wrist_R": 1,
-    }
-    curves = {}
-    for name, j in pick_joints.items():
-        if j < x.shape[1]:
-            curves[name] = x[:, j, :2]  # (T, 2)
-    return curves
-
-
-class PlotPredictions(Callback):
-    """
-    每隔 every_n_epochs 在 val 上画一张 pred vs GT 的 2D 轨迹图
-    """
-    def __init__(self, log_dir: str, every_n_epochs: int = 5):
+# =====================
+# Lightning Module
+# =====================
+class LitSWTDiffusion(pl.LightningModule):
+    def __init__(self, num_keypoints: int, num_dims: int, lr: float = 1e-3):
         super().__init__()
-        self.log_dir = log_dir
-        os.makedirs(os.path.join(log_dir, "figs"), exist_ok=True)
-        self.every = every_n_epochs
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if (trainer.current_epoch + 1) % self.every != 0:
-            return
-        val_loader = trainer.val_dataloaders[0]
-        batch = next(iter(val_loader))
-        cond = batch["conditions"]
-
-        # 统一 float32
-        fut      = batch["data"].float()               # [B,T,J,C]
-        past     = cond["input_pose"].float()          # [B,Tp,J,C]
-        sign_img = cond["sign_image"].float()          # [B,3,224,224]
-
-        # 模型需要 [B,J,C,T]
-        x_bjct    = fut.permute(0, 2, 3, 1).contiguous()
-        past_bjct = past.permute(0, 2, 3, 1).contiguous()
-        t         = torch.zeros(x_bjct.size(0), dtype=torch.long, device=x_bjct.device)
-
-        pl_module.eval()
-        with torch.no_grad():
-            out_bjct = pl_module.model.forward(x_bjct, t, past_bjct, sign_img)  # [B,J,C,Tf]
-            pred     = out_bjct.permute(0, 3, 1, 2).contiguous()               # [B,Tf,J,C]
-
-        gt_curves   = _btjc_to_np_xy(fut)
-        pred_curves = _btjc_to_np_xy(pred)
-
-        fig = plt.figure(figsize=(8, 4))
-        ax = fig.add_subplot(111)
-        for name, arr in gt_curves.items():
-            ax.plot(arr[:, 0], arr[:, 1], linestyle='--', label=f'{name} GT')
-        for name, arr in pred_curves.items():
-            ax.plot(arr[:, 0], arr[:, 1], label=f'{name} Pred')
-        ax.set_title(f"Epoch {trainer.current_epoch+1} – 2D Trajectories (sample 0)")
-        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.invert_yaxis()
-        ax.legend(loc='best')
-        fig.tight_layout()
-
-        png_path = os.path.join(self.log_dir, "figs", f"traj_epoch_{trainer.current_epoch+1:04d}.png")
-        fig.savefig(png_path, dpi=150)
-        plt.close(fig)
-
-        # 同步到 TensorBoard
-        if isinstance(trainer.logger, TensorBoardLogger):
-            from PIL import Image
-            img = np.array(Image.open(png_path)).transpose(2, 0, 1)  # [C,H,W]
-            trainer.logger.experiment.add_image("viz/trajectory", img, global_step=trainer.global_step)
-
-
-# ------------------------ lightning module ------------------------
-
-class LitMinimal(pl.LightningModule):
-    def __init__(self, num_keypoints: int, num_dims: int, lr=2e-4, weight_decay=0.0):
-        super().__init__()
+        # 你的自定义模型
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims
         )
         self.lr = lr
-        self.weight_decay = weight_decay
 
-    def forward(self, fut_btjc, past_btjc, sign_img):
-        # 模型 forward 期望: x=[B,J,C,T], past=[B,J,C,Tp], images=[B,3,224,224]
-        x_bjct    = fut_btjc.permute(0, 2, 3, 1).contiguous()
-        past_bjct = past_btjc.permute(0, 2, 3, 1).contiguous()
-        t         = torch.zeros(x_bjct.size(0), dtype=torch.long, device=x_bjct.device)
-        out_bjct  = self.model.forward(x_bjct, t, past_bjct, sign_img)     # [B,J,C,Tf]
-        pred      = out_bjct.permute(0, 3, 1, 2).contiguous()              # -> [B,Tf,J,C]
-        return pred
-
-    def training_step(self, batch, _):
-        cond = batch["conditions"]
-        fut      = batch["data"].float()
-        past     = cond["input_pose"].float()
-        tgt_mask = cond["target_mask"].float()
-        sign_img = cond["sign_image"].float()
-
-        pred = self(fut, past, sign_img)
-        loss = masked_mse(pred, fut, tgt_mask)
-
-        B = fut.size(0)
-        self.log("train/loss", loss, prog_bar=True, on_step=True, batch_size=B)
-        return loss
-
-    def validation_step(self, batch, _):
-        cond = batch["conditions"]
-        fut      = batch["data"].float()
-        past     = cond["input_pose"].float()
-        tgt_mask = cond["target_mask"].float()
-        sign_img = cond["sign_image"].float()
-
-        pred = self(fut, past, sign_img)
-        loss = masked_mse(pred, fut, tgt_mask)
-
-        # 计算 DTW（batch 里第 0 条）
-        b0  = 0
-        Tf  = min(pred.shape[1], fut.shape[1])
-        pf  = pred[b0, :Tf].reshape(Tf, -1)
-        gt  = fut[b0, :Tf].reshape(Tf, -1)
-        dtw = chunked_dtw_mean(pf, gt)
-
-        B = fut.size(0)
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True, batch_size=B)
-        self.log("val/dtw",  dtw,  prog_bar=True, on_epoch=True, batch_size=B)
+        # 运行中曲线缓存（同时我们也会写 CSV）
+        self.train_loss_hist = []
+        self.val_loss_hist = []
+        self.val_dtw_hist = []
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+
+    def _forward_pose(self, fut_btjc: torch.Tensor, past_bjct: torch.Tensor, sign_b3hw: torch.Tensor) -> torch.Tensor:
+        """
+        用你模型的 interface：输入:
+          - x: 未来段（噪声/占位，最简我们直接用 GT 形状的 0 张量）
+          - timesteps: 这里先给 0（最小可运行版本）
+          - y: dict 里放 sign_image / input_pose（注意形状）
+        输出:
+          - 预测的未来段（[B,J,C,Tf]）
+        """
+        B, T, J, C = fut_btjc.shape
+
+        # 模型期望: x: [B,J,C,Tf]，past: [B,J,C,Tp]，image: [B,3,224,224]
+        x_bjct = btjc_to_bjct(torch.zeros_like(fut_btjc))     # 这里用 0 噪声做占位
+        past_bjct = sanitize_btjc(past_bjct)
+        sign_b3hw = sign_b3hw.float()
+
+        timesteps = torch.zeros((B,), dtype=torch.long, device=x_bjct.device)
+        y = {
+            "sign_image": sign_b3hw,
+            "input_pose": past_bjct,
+        }
+        pred_bjct = self.model.interface(x_bjct, timesteps, y)  # [B,J,C,Tf]
+        # 回到 [B,T,J,C]
+        return pred_bjct.permute(0, 3, 1, 2).contiguous()
+
+    def training_step(self, batch: Dict, _):
+        # 取出 batch
+        fut_btjc = sanitize_btjc(batch["data"])  # [B,Tf,J,C]
+        cond = batch["conditions"]
+        past_btjc = sanitize_btjc(cond["input_pose"])  # [B,Tp,J,C]
+        # 变换 past -> [B,J,C,Tp]
+        past_bjct = btjc_to_bjct(past_btjc)
+        sign_b3hw = cond["sign_image"].float()  # [B,3,224,224]
+        fut_mask_bt = cond["target_mask"].float()  # [B,Tf]
+
+        # 前向
+        pred_btjc = self._forward_pose(fut_btjc, past_bjct, sign_b3hw)
+        loss = masked_mse_btjc(pred_btjc, fut_btjc, fut_mask_bt)
+
+        self.train_loss_hist.append(float(loss.detach().cpu()))
+        self.log("train/loss", loss, prog_bar=True, on_step=True)
+        return loss
+
+    def validation_step(self, batch: Dict, _):
+        fut_btjc = sanitize_btjc(batch["data"])
+        cond = batch["conditions"]
+        past_bjct = btjc_to_bjct(sanitize_btjc(cond["input_pose"]))
+        sign_b3hw = cond["sign_image"].float()
+        fut_mask_bt = cond["target_mask"].float()
+
+        pred_btjc = self._forward_pose(fut_btjc, past_bjct, sign_b3hw)
+        loss = masked_mse_btjc(pred_btjc, fut_btjc, fut_mask_bt)
+        dtw = chunked_dtw_mean(pred_btjc, fut_btjc, fut_mask_bt, max_len=160, chunk=40)
+
+        self.val_loss_hist.append(float(loss.detach().cpu()))
+        self.val_dtw_hist.append(float(dtw.detach().cpu()))
+        self.log("val/loss", loss, prog_bar=True)
+        self.log("val/dtw", dtw, prog_bar=True)
 
 
-# ------------------------ main ------------------------
+# =====================
+# CSV logger (简单易取)
+# =====================
+class SimpleCSVLogger(pl.Callback):
+    def __init__(self, csv_path: str):
+        super().__init__()
+        self.csv_path = Path(csv_path)
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        # header
+        if not self.csv_path.exists():
+            self.csv_path.write_text("step,split,loss,dtw\n")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        loss = float(pl_module.train_loss_hist[-1]) if pl_module.train_loss_hist else float("nan")
+        with self.csv_path.open("a") as f:
+            f.write(f"{step},train,{loss},\n")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        step = trainer.global_step
+        loss = pl_module.val_loss_hist[-1] if pl_module.val_loss_hist else float("nan")
+        dtw = pl_module.val_dtw_hist[-1] if pl_module.val_dtw_hist else float("nan")
+        with self.csv_path.open("a") as f:
+            f.write(f"{step},val,{loss},{dtw}\n")
+
 
 if __name__ == "__main__":
-    # 统一 float32，避免 Double/Float 冲突
-    torch.set_default_dtype(torch.float32)
+    set_global_float32()
     pl.seed_everything(42, workers=True)
 
-    # 指向你的数据（mini/全量二选一）
-    DATA_DIR = os.getenv("DATA_DIR", "/data/yayun/pose_data")
-    #CSV_PATH = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/data.csv")
-    # 若想快速 sanity：改成 mini_data.csv
-    CSV_PATH = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")
+    # --- 路径：可用环境变量覆盖 ---
+    DATA_DIR = os.getenv("DATA_DIR", "/data/yayun/pose_data")  # 你的原始 pose 根目录
+    CSV_PATH = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")  # 也可切 data.csv
 
-    # 训练规模（可以先小，再放开）
-    BATCH_SIZE   = int(os.getenv("BATCH_SIZE", "4"))
-    NUM_WORKERS  = int(os.getenv("NUM_WORKERS", "2"))
-    NUM_PAST     = int(os.getenv("NUM_PAST", "40"))
-    NUM_FUTURE   = int(os.getenv("NUM_FUTURE", "20"))
+    # --- 形状参数（与你的数据保持一致）---
     NUM_KEYPOINTS, NUM_DIMS = 586, 3
+    NUM_PAST, NUM_FUTURE = 10, 5   # mini 版本先小窗口
+    BATCH_SIZE = 1
 
-    # 小样本快速测试可设置：TARGET_COUNT=64；全量则为 None
-    TARGET_COUNT = None
-    MAX_SCAN     = None
+    # --- dataloaders ---
+    train_loader = make_loader(DATA_DIR, CSV_PATH, "train", BATCH_SIZE, NUM_PAST, NUM_FUTURE)
+    # 用 train 里的同一条做 sanity-val：如果你有 dev split，建议切成 dev
+    val_loader = make_loader(DATA_DIR, CSV_PATH, "dev",   BATCH_SIZE, NUM_PAST, NUM_FUTURE)
 
-    # DataLoader
-    train_loader = make_loader(
-        DATA_DIR, CSV_PATH, "train",
-        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
-        num_past=NUM_PAST, num_future=NUM_FUTURE,
-        target_count=TARGET_COUNT, max_scan=MAX_SCAN
-    )
-    val_loader = make_loader(
-        DATA_DIR, CSV_PATH, "dev",
-        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
-        num_past=NUM_PAST, num_future=NUM_FUTURE,
-        target_count=TARGET_COUNT, max_scan=MAX_SCAN
-    )
+    # --- 模型 & 记录 ---
+    model = LitSWTDiffusion(num_keypoints=NUM_KEYPOINTS, num_dims=NUM_DIMS, lr=1e-3)
+    csv_logger = SimpleCSVLogger(csv_path="logs/minimal_metrics.csv")
 
-    # 日志与回调
-    tb_logger  = TensorBoardLogger(save_dir="outputs", name="runs")
-    csv_logger = CSVLogger(save_dir="outputs", name="csv")
-    ckpt_cb = ModelCheckpoint(
-        dirpath="outputs/checkpoints",
-        filename="ep{epoch:03d}-valloss{val/loss:.5f}",
-        save_top_k=2, monitor="val/loss", mode="min"
-    )
-    lr_cb  = LearningRateMonitor(logging_interval="step")
-    viz_cb = PlotPredictions(log_dir="outputs", every_n_epochs=5)
-
-    # 模型 & Trainer
-    model = LitMinimal(num_keypoints=NUM_KEYPOINTS, num_dims=NUM_DIMS, lr=2e-4, weight_decay=0.0)
-
+    # --- Trainer ---
     trainer = pl.Trainer(
-        max_epochs=5,                 # 先跑几轮看趋势；也可改 max_steps
+        max_steps=int(os.getenv("MAX_STEPS", "600")),   # 你之前用 600，先保持
         accelerator="auto",
         devices=1,
-        precision="32-true",
-        log_every_n_steps=10,
-        enable_checkpointing=True,
+        precision="32-true",    # 👈 强制全程 float32（更稳）
+        log_every_n_steps=5,
+        enable_checkpointing=False,
         deterministic=True,
-        num_sanity_val_steps=1,
-        logger=[tb_logger, csv_logger],
-        callbacks=[ckpt_cb, lr_cb, viz_cb],
-        gradient_clip_val=1.0,
+        callbacks=[csv_logger],
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    # --- 先拿一批做形状检查（快速 fail fast）---
+    try:
+        bt = next(iter(train_loader))
+        _ = bt["data"].shape
+    except Exception as e:
+        raise RuntimeError(f"First batch failed: {repr(e)}")
+
+    # --- Train ---
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+    print("\n[Done] Metrics CSV saved to: logs/minimal_metrics.csv")
+    print("     Columns: step,split,loss,dtw")
 
