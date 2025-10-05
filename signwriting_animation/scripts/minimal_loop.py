@@ -1,7 +1,6 @@
 # signwriting_animation/scripts/minimal_loop.py
 import os
 import csv
-import math
 from typing import Optional, Dict, Any, Tuple
 
 import torch
@@ -42,19 +41,15 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     Return dense [B,T,J,C].
     """
     x = _to_dense(x)
-
     if x.dim() == 5:  # [B,T,P,J,C]
-        # 取第一个人（P>=1）
-        x = x[:, :, 0, ...]
+        x = x[:, :, 0, ...]  # 取第一个人
     if x.dim() != 4:
         raise ValueError(f"Expected 4D tensor [B,T,J,C], got {tuple(x.shape)} (ndim={x.dim()})")
     return x.contiguous()
 
 
 def ensure_non_empty_time(x_btjc: torch.Tensor) -> torch.Tensor:
-    """
-    If T==0 -> pad a single zero frame. Keep [B,T,J,C].
-    """
+    """If T==0 -> pad a single zero frame. Keep [B,T,J,C]."""
     B, T, J, C = x_btjc.shape
     if T > 0:
         return x_btjc
@@ -63,16 +58,12 @@ def ensure_non_empty_time(x_btjc: torch.Tensor) -> torch.Tensor:
 
 
 def infer_mask_from_btjc(x_btjc: torch.Tensor) -> torch.Tensor:
-    """
-    推断 [B,T] 的有效帧：只要该帧有任意关节/通道非零，就视为有效。
-    """
+    """推断 [B,T] 的有效帧：只要该帧有任意关节/通道非零，就视为有效。"""
     B, T, J, C = x_btjc.shape
     if T == 0:
-        # 如果上游还没补，补一帧零并返回 [B,1] 全零
         x_btjc = ensure_non_empty_time(x_btjc)
         B, T, J, C = x_btjc.shape
-    # [B,T,J,C] -> [B,T]
-    valid = (x_btjc.abs().sum(dim=(2, 3)) > 0).float()
+    valid = (x_btjc.abs().sum(dim=(2, 3)) > 0).float()  # [B,T]
     return valid
 
 
@@ -80,11 +71,9 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
     """
     期望把任何 mask 变成严格的 [B,T]。
     支持输入：
-      - [B,T]
-      - [B,1,T] / [B,T,1]
-      - [B,T,J,C]（会降维到 [B,T]）
-      - [B,T,K]（K>1，按最后一维求“是否存在非零”）
-    如果 target_T 给定，会在末尾/截断到该长度。
+      - [B,T] / [B,1,T] / [B,T,1]
+      - [B,T,K]（K>1，按最后一维聚合）
+      - [B,T,J,C]（姿态）或 [B,T,P,J,C]（多人姿态） → 推断 [B,T]
     """
     if not isinstance(x, torch.Tensor):
         raise TypeError("mask must be a tensor")
@@ -95,30 +84,31 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
     if x.dtype != torch.float32:
         x = x.float()
 
-    if x.dim() == 4:
-        # 直接当做姿态，推断 [B,T]
+    if x.dim() == 5:
+        # [B, T, P, J, C] → 取第一个人再推断
+        x4 = x[:, :, 0, ...] if x.size(2) >= 1 else x.mean(dim=2)
+        m = infer_mask_from_btjc(x4)  # [B,T]
+
+    elif x.dim() == 4:
+        # [B, T, J, C]（姿态）
         m = infer_mask_from_btjc(x)
 
     elif x.dim() == 3:
-        # 常见三种： [B,1,T] / [B,T,1] / [B,T,K]
+        # [B,1,T] / [B,T,1] / [B,T,K]
         B, A, T = x.shape
-        if A == 1 and T >= 1:               # [B,1,T]
+        if A == 1 and T >= 1:            # [B,1,T]
             m = x.squeeze(1)
-        elif T == 1 and A >= 1:             # [B,T,1] 其实是 [B,?,1]，但约定第二维是 T
+        elif T == 1 and A >= 1:          # [B,T,1]
             m = x.squeeze(2)
             if m.dim() != 2:
-                # 万一不是 [B,T,1] 这种规范的，就当成最后一维聚合
                 m = (x.abs().sum(dim=2) > 0).float()
-        else:
-            # [B,T,K]（K>1） → 对最后一维聚合成 [B,T]
+        else:                             # [B,T,K]
             m = (x.abs().sum(dim=2) > 0).float()
 
     elif x.dim() == 2:
-        # 已经是 [B,T]
         m = x
 
     elif x.dim() == 1:
-        # [T] → 补 B 维
         m = x.unsqueeze(0)
 
     else:
@@ -126,8 +116,7 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
 
     # 对齐长度
     if target_T is not None and m.size(1) != target_T:
-        B = m.size(0)
-        T = m.size(1)
+        B, T = m.size(0), m.size(1)
         if T > target_T:
             m = m[:, :target_T]
         else:
@@ -140,15 +129,13 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
 # ============================== losses & metrics ==============================
 
 def masked_mse(pred_btjc: torch.Tensor, tgt_btjc: torch.Tensor, mask_bt: torch.Tensor) -> torch.Tensor:
-    """
-    pred/tgt: [B,T,J,C], mask: [B,T] (1 有效, 0 padding)
-    """
+    """pred/tgt: [B,T,J,C], mask: [B,T] (1 有效, 0 padding)"""
     pred = sanitize_btjc(pred_btjc)
     tgt = sanitize_btjc(tgt_btjc)
 
     # 对齐时间长度
-    B, T, J, C = pred.shape
-    B2, T2, J2, C2 = tgt.shape
+    _, T, J, C = pred.shape
+    _, T2, _, _ = tgt.shape
     Tm = min(T, T2)
     pred = pred[:, :Tm]
     tgt = tgt[:, :Tm]
@@ -162,9 +149,7 @@ def masked_mse(pred_btjc: torch.Tensor, tgt_btjc: torch.Tensor, mask_bt: torch.T
 
 
 def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    简单 DTW（O(T^2)），CPU 上跑；a,b: [T, D]
-    """
+    """简单 DTW（O(T^2)），CPU 上跑；a,b: [T, D]"""
     a = a.detach().cpu()
     b = b.detach().cpu()
     T, D = a.shape
@@ -182,33 +167,26 @@ def simple_dtw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def chunked_dtw_mean(pred_seq_btjc: torch.Tensor, tgt_seq_btjc: torch.Tensor,
                      max_len: int = 160, chunk: int = 40) -> torch.Tensor:
-    """
-    把 [B,T,J,C] 里的第一个样本拉平做 DTW（分块求平均），只做一个样本以省时
-    """
+    """把 [B,T,J,C] 里的第一个样本拉平做 DTW（分块求平均），只做一个样本以省时"""
     pred = sanitize_btjc(pred_seq_btjc)[0]  # [T,J,C]
     tgt = sanitize_btjc(tgt_seq_btjc)[0]
-
     T = min(pred.shape[0], tgt.shape[0], max_len)
-    pred = pred[:T].reshape(T, -1)
-    tgt = tgt[:T].reshape(T, -1)
     if T <= 1:
         return torch.tensor(0.0)
-
+    pred = pred[:T].reshape(T, -1)
+    tgt = tgt[:T].reshape(T, -1)
     vals = []
     for s in range(0, T, chunk):
         e = min(T, s + chunk)
-        if e - s < 2:
-            continue
-        vals.append(simple_dtw(pred[s:e], tgt[s:e]))
+        if e - s >= 2:
+            vals.append(simple_dtw(pred[s:e], tgt[s:e]))
     return torch.stack(vals).mean() if vals else torch.tensor(0.0)
 
 
 # ============================== filtered dataset ==============================
 
 class FilteredDataset(Dataset):
-    """
-    只保留最多 target_count 条“拿得到 data 和 conditions”的样本，最多扫描 max_scan 行。
-    """
+    """只保留最多 target_count 条“拿得到 data 和 conditions”的样本，最多扫描 max_scan 行。"""
     def __init__(self, base: Dataset, target_count: int = 1, max_scan: Optional[int] = 200):
         self.base = base
         self.idx = []
@@ -258,7 +236,7 @@ class LitMinimal(pl.LightningModule):
           past_btjc:[B,Tp,J,C]
           tgt_mask_bt: [B,T]
           sign_img: [B,3,224,224] (float32)
-        均已经过兜底，不会出现 T==0 或 mask 非 2D。
+        均已兜底，不会出现 T==0 或 mask 非 2D。
         """
         cond = batch["conditions"]
         fut = sanitize_btjc(batch["data"])
@@ -268,9 +246,12 @@ class LitMinimal(pl.LightningModule):
         fut = ensure_non_empty_time(fut)
         past = ensure_non_empty_time(past)
 
-        # mask（可能来自数据，也可能缺失/形状不对）
+        # mask：尝试规范化，否则回退到从目标推断
         if "target_mask" in cond and isinstance(cond["target_mask"], torch.Tensor):
-            tgt_mask = to_bt_mask_strict(cond["target_mask"], target_T=fut.size(1))
+            try:
+                tgt_mask = to_bt_mask_strict(cond["target_mask"], target_T=fut.size(1))
+            except Exception:
+                tgt_mask = infer_mask_from_btjc(fut)
         else:
             tgt_mask = infer_mask_from_btjc(fut)
 
@@ -280,6 +261,13 @@ class LitMinimal(pl.LightningModule):
             raise ValueError("conditions['sign_image'] must be a tensor [B,3,224,224]")
         sign_img = sign_img.float().contiguous()
 
+        # 统一设备
+        device = next(self.parameters()).device
+        fut = fut.to(device)
+        past = past.to(device)
+        tgt_mask = tgt_mask.to(device)
+        sign_img = sign_img.to(device)
+
         return fut, past, tgt_mask, sign_img
 
     # -------- Lightning steps --------
@@ -288,8 +276,6 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         fut, past, tgt_mask, sign_img = self._prepare_batch(batch)
-
-        # CAMDM 接口: [B,J,C,T]
         x_bjct = btjc_to_bjct(fut)
         past_bjct = btjc_to_bjct(past)
         timesteps = torch.zeros(x_bjct.size(0), dtype=torch.long, device=x_bjct.device)
@@ -304,7 +290,6 @@ class LitMinimal(pl.LightningModule):
 
     def validation_step(self, batch, _):
         fut, past, tgt_mask, sign_img = self._prepare_batch(batch)
-
         x_bjct = btjc_to_bjct(fut)
         past_bjct = btjc_to_bjct(past)
         timesteps = torch.zeros(x_bjct.size(0), dtype=torch.long, device=x_bjct.device)
@@ -335,7 +320,7 @@ class LitMinimal(pl.LightningModule):
                 vd = self.val_dtws[i] if i < len(self.val_dtws) else ""
                 w.writerow([i + 1, tr, vl, vd])
 
-        # 画图
+        # 画图（可选）
         try:
             import matplotlib.pyplot as plt
             plt.figure()
@@ -387,7 +372,7 @@ if __name__ == "__main__":
     # 可换回大 CSV：/data/yayun/signwriting-animation/data.csv
     csv_path = os.getenv("CSV_PATH", "/data/yayun/signwriting-animation/mini_data.csv")
 
-    # 过拟合设置（稳定）
+    # 过拟合设置（稳定/快）
     batch_size = 1
     num_workers = 0
     num_keypoints, num_dims = 586, 3
@@ -398,7 +383,7 @@ if __name__ == "__main__":
                                target_count=target_count, max_scan=max_scan)
     val_loader = train_loader  # 过拟合同一条
 
-    # 先看一眼第一批，确保维度稳定
+    # 查看第一批，确认维度
     fb = next(iter(train_loader))
     print("[DEBUG] keys:", list(fb.keys()))
     print("[DEBUG] cond keys:", list(fb["conditions"].keys()))
@@ -411,15 +396,15 @@ if __name__ == "__main__":
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, log_dir="logs")
 
     trainer = pl.Trainer(
-        max_steps=5,
+        max_steps=5,                 # 快速跑通
         limit_train_batches=1,       # 每轮只跑 1 个 batch
         limit_val_batches=1,         # 验证也只跑 1 个 batch
-        val_check_interval=1.0, 
+        val_check_interval=1.0,
         accelerator="auto",
         devices=1,
-        log_every_n_steps=1,       # 每步都记
+        log_every_n_steps=1,
         enable_checkpointing=False,
         deterministic=True,
-        num_sanity_val_steps=0,    # 避免额外 sanity 验证再次触发随机取样
+        num_sanity_val_steps=0,      # 避免额外 sanity 验证再次触发随机取样
     )
     trainer.fit(model, train_loader, val_loader)
