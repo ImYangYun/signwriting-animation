@@ -396,13 +396,13 @@ if __name__ == "__main__":
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, log_dir="logs")
 
     trainer = pl.Trainer(
-        max_steps=5,                 # 快速跑通
+        max_steps=500,                 # 快速跑通
         limit_train_batches=1,       # 每轮只跑 1 个 batch
         limit_val_batches=1,         # 验证也只跑 1 个 batch
-        val_check_interval=1.0,
-        accelerator="auto",
+        val_check_interval=100,
+        accelerator="gpu",
         devices=1,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         enable_checkpointing=False,
         deterministic=True,
         num_sanity_val_steps=0,      # 避免额外 sanity 验证再次触发随机取样
