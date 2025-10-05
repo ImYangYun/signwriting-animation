@@ -3,7 +3,7 @@ import os
 import csv
 import math
 from typing import Optional, Dict, Any, Tuple
-import matplotlib.pyplot as plt
+
 import torch
 import lightning as pl
 from torch.utils.data import DataLoader, Dataset
@@ -83,35 +83,49 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
       - [B,T]
       - [B,1,T] / [B,T,1]
       - [B,T,J,C]（会降维到 [B,T]）
+      - [B,T,K]（K>1，按最后一维求“是否存在非零”）
     如果 target_T 给定，会在末尾/截断到该长度。
     """
     if not isinstance(x, torch.Tensor):
         raise TypeError("mask must be a tensor")
 
-    # 如果本身就是 4 维姿态（有些数据可能把 mask 搞成姿态），直接回退到推断逻辑
+    # 稀疏/精度统一
+    if x.is_sparse:
+        x = x.to_dense()
+    if x.dtype != torch.float32:
+        x = x.float()
+
     if x.dim() == 4:
-        # treat as pose
+        # 直接当做姿态，推断 [B,T]
         m = infer_mask_from_btjc(x)
-    else:
-        # squeeze 掉多余维度
-        while x.dim() > 2:
-            x = x.squeeze(-1)
-            if x.dim() == 2:
-                break
-        if x.dim() < 2:
-            # 形如 [T] 或 [1]，补 B 维
-            x = x.unsqueeze(0)
 
-        if x.dim() != 2:
-            raise ValueError(f"to_bt_mask(): still not 2D after squeeze, got shape={tuple(x.shape)}")
+    elif x.dim() == 3:
+        # 常见三种： [B,1,T] / [B,T,1] / [B,T,K]
+        B, A, T = x.shape
+        if A == 1 and T >= 1:               # [B,1,T]
+            m = x.squeeze(1)
+        elif T == 1 and A >= 1:             # [B,T,1] 其实是 [B,?,1]，但约定第二维是 T
+            m = x.squeeze(2)
+            if m.dim() != 2:
+                # 万一不是 [B,T,1] 这种规范的，就当成最后一维聚合
+                m = (x.abs().sum(dim=2) > 0).float()
+        else:
+            # [B,T,K]（K>1） → 对最后一维聚合成 [B,T]
+            m = (x.abs().sum(dim=2) > 0).float()
 
-        # 统一 float
-        if x.dtype != torch.float32:
-            x = x.float()
+    elif x.dim() == 2:
+        # 已经是 [B,T]
         m = x
 
+    elif x.dim() == 1:
+        # [T] → 补 B 维
+        m = x.unsqueeze(0)
+
+    else:
+        raise ValueError(f"to_bt_mask_strict(): unsupported ndim={x.dim()}, shape={tuple(x.shape)}")
+
+    # 对齐长度
     if target_T is not None and m.size(1) != target_T:
-        # 对齐到目标长度：截断或右侧补零
         B = m.size(0)
         T = m.size(1)
         if T > target_T:
@@ -119,6 +133,7 @@ def to_bt_mask_strict(x: torch.Tensor, target_T: Optional[int] = None) -> torch.
         else:
             pad = torch.zeros((B, target_T - T), dtype=m.dtype, device=m.device)
             m = torch.cat([m, pad], dim=1)
+
     return m.contiguous()
 
 
@@ -322,6 +337,7 @@ class LitMinimal(pl.LightningModule):
 
         # 画图
         try:
+            import matplotlib.pyplot as plt
             plt.figure()
             if self.train_losses:
                 plt.plot(self.train_losses, label="train_loss")
@@ -395,7 +411,10 @@ if __name__ == "__main__":
     model = LitMinimal(num_keypoints=num_keypoints, num_dims=num_dims, log_dir="logs")
 
     trainer = pl.Trainer(
-        max_steps=600,
+        max_steps=5,
+        limit_train_batches=1,       # 每轮只跑 1 个 batch
+        limit_val_batches=1,         # 验证也只跑 1 个 batch
+        val_check_interval=1.0, 
         accelerator="auto",
         devices=1,
         log_every_n_steps=1,       # 每步都记
