@@ -38,28 +38,24 @@ def bjct_to_btjc(x):
     return x.permute(0, 3, 1, 2).contiguous()
 
 
-def masked_mse(pred, tgt, mask):
+def masked_mse(pred, tgt, mask_bt):
     """
     pred/tgt: [B,T,J,C], mask: [B,T] (1 有效, 0 padding)
     自动对齐时间长度，避免维度不匹配。
     """
     pred, tgt = sanitize_btjc(pred), sanitize_btjc(tgt)
 
-    # 对齐时间长度
-    B, T1, J, C = pred.shape
-    B2, T2, J2, C2 = tgt.shape
-    assert B == B2 and J == J2 and C == C2, "shape mismatch"
-    Tm = min(T1, T2, mask.size(1))
-
+    Tm = min(pred.size(1), tgt.size(1), mask_bt.size(1))
     pred = pred[:, :Tm]
-    tgt = tgt[:, :Tm]
-    mask = mask[:, :Tm].float()[:, :, None, None]
+    tgt  = tgt[:,  :Tm]
 
-    diff2 = (pred - tgt) ** 2
-    num = (diff2 * mask).sum()
-    den = (mask.sum() * J * C).clamp_min(1.0)
+    # 2D -> 4D
+    m4 = mask_bt[:, :Tm].float()[:, :, None, None]   # [B,T,1,1]
+
+    diff2 = (pred - tgt) ** 2                        # [B,T,J,C]
+    num = (diff2 * m4).sum()
+    den = (m4.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
     return num / den
-
 
 
 # ============================== filtered dataset ==============================
@@ -108,7 +104,14 @@ class LitMinimal(pl.LightningModule):
         cond = batch["conditions"]
         fut = sanitize_btjc(batch["data"])
         past = sanitize_btjc(cond["input_pose"])
-        mask = cond["target_mask"].float().mean(dim=(2, 3), keepdim=False)  # [B,T]
+        raw_mask = cond["target_mask"]
+        mask = raw_mask.float()
+        if mask.dim() == 5:
+            mask = (mask.abs().sum(dim=(2, 3, 4)) > 0).float()
+        elif mask.dim() == 4:
+            mask = (mask.abs().sum(dim=(2, 3)) > 0).float()
+        elif mask.dim() == 3:
+            mask = (mask.abs().sum(dim=2) > 0).float()
         sign_img = cond["sign_image"].float()
 
         x_bjct = btjc_to_bjct(fut)
@@ -126,7 +129,14 @@ class LitMinimal(pl.LightningModule):
         cond = batch["conditions"]
         fut = sanitize_btjc(batch["data"])
         past = sanitize_btjc(cond["input_pose"])
-        mask = cond["target_mask"].float().mean(dim=(2, 3), keepdim=False)
+        raw_mask = cond["target_mask"]
+        mask = raw_mask.float()
+        if mask.dim() == 5:
+            mask = (mask.abs().sum(dim=(2, 3, 4)) > 0).float()
+        elif mask.dim() == 4:
+            mask = (mask.abs().sum(dim=(2, 3)) > 0).float()
+        elif mask.dim() == 3:
+            mask = (mask.abs().sum(dim=2) > 0).float()
         sign_img = cond["sign_image"].float()
 
         x_bjct = btjc_to_bjct(fut)
@@ -205,4 +215,3 @@ if __name__ == "__main__":
         num_sanity_val_steps=0,
     )
     trainer.fit(model, train_loader, val_loader)
-
