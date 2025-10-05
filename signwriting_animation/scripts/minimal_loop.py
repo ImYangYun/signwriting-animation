@@ -180,7 +180,7 @@ class LitMinimal(pl.LightningModule):
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split)
-    ds = FilteredDataset(base, target_count=200, max_scan=5000)
+    ds = FilteredDataset(base, target_count=200, max_scan=3000)
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
     return DataLoader(ds, batch_size=bs, shuffle=False, num_workers=num_workers, collate_fn=zero_pad_collator)
 
