@@ -39,14 +39,27 @@ def bjct_to_btjc(x):
 
 
 def masked_mse(pred, tgt, mask):
-    """Masked MSE loss."""
+    """
+    pred/tgt: [B,T,J,C], mask: [B,T] (1 有效, 0 padding)
+    自动对齐时间长度，避免维度不匹配。
+    """
     pred, tgt = sanitize_btjc(pred), sanitize_btjc(tgt)
-    B, T, J, C = pred.shape
-    mask = mask.float()[:, :, None, None]
+
+    # 对齐时间长度
+    B, T1, J, C = pred.shape
+    B2, T2, J2, C2 = tgt.shape
+    assert B == B2 and J == J2 and C == C2, "shape mismatch"
+    Tm = min(T1, T2, mask.size(1))
+
+    pred = pred[:, :Tm]
+    tgt = tgt[:, :Tm]
+    mask = mask[:, :Tm].float()[:, :, None, None]
+
     diff2 = (pred - tgt) ** 2
     num = (diff2 * mask).sum()
     den = (mask.sum() * J * C).clamp_min(1.0)
     return num / den
+
 
 
 # ============================== filtered dataset ==============================
