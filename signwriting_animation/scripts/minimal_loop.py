@@ -400,7 +400,7 @@ if __name__ == "__main__":
         limit_train_batches=1,       # 每轮只跑 1 个 batch
         limit_val_batches=1,         # 验证也只跑 1 个 batch
         val_check_interval=100,
-        accelerator="gpu",
+        accelerator="auto",
         devices=1,
         log_every_n_steps=10,
         enable_checkpointing=False,
