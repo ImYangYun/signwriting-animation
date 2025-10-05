@@ -1,18 +1,20 @@
-# signwriting_animation/scripts/minimal_loop.py
 import os
 import csv
 import torch
 import lightning as pl
 from torch.utils.data import DataLoader, Dataset
 from pose_format.torch.masked.collator import zero_pad_collator
-
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
 
-# ============================== helper functions ==============================
-
 def _to_dense(x):
+    """
+    Safely convert a batch tensor to dense float32:
+    - If it's a pose-format MaskedTensor, call .zero_filled() to obtain a dense tensor.
+    - If it's a sparse tensor, densify it.
+    - Cast to float32 and make memory contiguous.
+    """
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     if getattr(x, "is_sparse", False):
@@ -32,10 +34,12 @@ def sanitize_btjc(x):
 
 
 def btjc_to_bjct(x):
+    """Convert [B, T, J, C] → [B, J, C, T] (model forward format)."""
     return x.permute(0, 2, 3, 1).contiguous()
 
 
 def bjct_to_btjc(x):
+    """Convert [B, J, C, T] → [B, T, J, C] (loss/metrics format)."""
     return x.permute(0, 3, 1, 2).contiguous()
 
 
@@ -46,7 +50,6 @@ def masked_mse(pred, tgt, mask_bt):
     pred = pred[:, :Tm]
     tgt  = tgt[:,  :Tm]
 
-    # 2D -> 4D
     m4 = mask_bt[:, :Tm].float()[:, :, None, None]   # [B,T,1,1]
 
     diff2 = (pred - tgt) ** 2                        # [B,T,J,C]
@@ -61,7 +64,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     vals = []
 
     for b in range(B):
-        # 取有效长度，并与实际张量长度对齐，防止越界
         t = min(int(mask_bt[b].sum().item()), pred.size(1), tgt.size(1))
         if t <= 1:
             continue
@@ -69,11 +71,9 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
         x = pred[b, :t].reshape(t, -1).to(dtype=torch.float32)  # [t, J*C]
         y = tgt[b,  :t].reshape(t, -1).to(dtype=torch.float32)
 
-        # 全程保持同一 device
         device = x.device
         D = torch.cdist(x, y)                      # [t, t]
-        Cmat = torch.empty((t, t), device=device)  # 累积代价
-
+        Cmat = torch.empty((t, t), device=device)
         Cmat[0, 0] = D[0, 0]
         for i in range(1, t):
             Cmat[i, 0] = D[i, 0] + Cmat[i-1, 0]
@@ -88,13 +88,12 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
                     )
                 Cmat[i, j] = D[i, j] + m
 
-        vals.append(Cmat[t-1, t-1] / (2 * t))  # 简单归一
+        vals.append(Cmat[t-1, t-1] / (2 * t))
 
     if not vals:
         return torch.tensor(0.0, device=pred.device)
     return torch.stack(vals).mean()
 
-# ============================== filtered dataset ==============================
 
 class FilteredDataset(Dataset):
     """Only keep valid samples."""
@@ -120,10 +119,13 @@ class FilteredDataset(Dataset):
     def __getitem__(self, i):
         return self.base[self.idx[i]]
 
-
-# ============================== Lightning module ==============================
-
 class LitMinimal(pl.LightningModule):
+    """
+    Minimal Lightning module:
+    - Forward: SignWritingToPoseDiffusion (expects BJCT)
+    - Loss: masked MSE; plus DTW in validation as a sanity metric
+    - No checkpointing; meant for quick end-to-end checks.
+    """
     def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs"):
         super().__init__()
         self.model = SignWritingToPoseDiffusion(
@@ -182,7 +184,7 @@ class LitMinimal(pl.LightningModule):
         pred = bjct_to_btjc(out)
         loss = masked_mse(pred, fut, mask)
         
-        dtw_val = masked_dtw(pred, fut, mask).to(loss.device)
+        dtw_val = masked_dtw(pred, fut, mask)
         self.log("val/dtw", dtw_val, prog_bar=False)
         self.val_dtws.append(dtw_val.item())
         self.val_losses.append(loss.item())
@@ -220,12 +222,17 @@ class LitMinimal(pl.LightningModule):
 
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
+    """
+    Build a DataLoader with:
+    - Dataset returning MaskedTensor.
+    - zero_pad_collator to align sequences along time dimension.
+    - FilteredDataset to pick a small, valid subset for a minimal run.
+    """
     base = DynamicPosePredictionDataset(data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split)
     ds = FilteredDataset(base, target_count=200, max_scan=3000)
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
     return DataLoader(ds, batch_size=bs, shuffle=False, num_workers=num_workers, collate_fn=zero_pad_collator)
 
-# main
 
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
