@@ -13,7 +13,9 @@ from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusi
 # ============================== helper functions ==============================
 
 def _to_dense(x):
-    if x.is_sparse:
+    if hasattr(x, "zero_filled"):     # 关键：MaskedTensor -> dense zero-filled
+        x = x.zero_filled()
+    if getattr(x, "is_sparse", False):
         x = x.to_dense()
     if x.dtype != torch.float32:
         x = x.float()
