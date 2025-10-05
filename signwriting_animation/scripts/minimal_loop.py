@@ -193,11 +193,13 @@ class LitMinimal(pl.LightningModule):
         csv_path = os.path.join(self.log_dir, "minimal_metrics.csv")
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["step", "train_loss", "val_loss"])
-            for i in range(max(len(self.train_losses), len(self.val_losses))):
-                tr = self.train_losses[i] if i < len(self.train_losses) else ""
-                vl = self.val_losses[i] if i < len(self.val_losses) else ""
-                w.writerow([i + 1, tr, vl])
+            w.writerow(["step", "train_loss", "val_loss", "val_dtw"])
+            max_len = max(len(self.train_losses), len(self.val_losses), len(self.val_dtws))
+            for i in range(max_len):
+                tr  = self.train_losses[i] if i < len(self.train_losses) else ""
+                vl  = self.val_losses[i]  if i < len(self.val_losses)  else ""
+                dtw = self.val_dtws[i]    if i < len(self.val_dtws)    else ""
+                w.writerow([i + 1, tr, vl, dtw])
 
         import matplotlib.pyplot as plt
         plt.figure()
@@ -205,6 +207,8 @@ class LitMinimal(pl.LightningModule):
             plt.plot(self.train_losses, label="train_loss")
         if self.val_losses:
             plt.plot(self.val_losses, label="val_loss")
+        if self.val_dtws:
+            plt.plot(self.val_dtws, label="val_dtw")
         plt.xlabel("steps")
         plt.legend()
         plt.tight_layout()
