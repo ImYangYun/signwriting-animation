@@ -61,21 +61,34 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     vals = []
 
     for b in range(B):
-        t = int(mask_bt[b].sum().item())
+        # 取有效长度，并与实际张量长度对齐，防止越界
+        t = min(int(mask_bt[b].sum().item()), pred.size(1), tgt.size(1))
         if t <= 1:
             continue
-        x = pred[b, :t].reshape(t, -1)  # [t, J*C]
-        y = tgt[b,  :t].reshape(t, -1)  # [t, J*C]
 
-        D = torch.cdist(x, y)  # [t, t]
-        C = torch.empty_like(D)
-        C[0, 0] = D[0, 0]
-        for i in range(1, t): C[i, 0] = D[i, 0] + C[i-1, 0]
-        for j in range(1, t): C[0, j] = D[0, j] + C[0, j-1]
+        x = pred[b, :t].reshape(t, -1).to(dtype=torch.float32)  # [t, J*C]
+        y = tgt[b,  :t].reshape(t, -1).to(dtype=torch.float32)
+
+        # 全程保持同一 device
+        device = x.device
+        D = torch.cdist(x, y)                      # [t, t]
+        Cmat = torch.empty((t, t), device=device)  # 累积代价
+
+        Cmat[0, 0] = D[0, 0]
+        for i in range(1, t):
+            Cmat[i, 0] = D[i, 0] + Cmat[i-1, 0]
+        for j in range(1, t):
+            Cmat[0, j] = D[0, j] + Cmat[0, j-1]
+
         for i in range(1, t):
             for j in range(1, t):
-                C[i, j] = D[i, j] + torch.min(C[i-1, j], C[i, j-1], C[i-1, j-1])
-        vals.append(C[t-1, t-1] / (2 * t))
+                m = torch.minimum(
+                        torch.minimum(Cmat[i-1, j], Cmat[i, j-1]),
+                        Cmat[i-1, j-1]
+                    )
+                Cmat[i, j] = D[i, j] + m
+
+        vals.append(Cmat[t-1, t-1] / (2 * t))  # 简单归一
 
     if not vals:
         return torch.tensor(0.0, device=pred.device)
