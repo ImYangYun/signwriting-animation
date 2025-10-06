@@ -1,5 +1,4 @@
 # signwriting_animation/diffusion/tests/test_smoke.py
-# Smoke test that avoids heavy deps during import.
 
 from pathlib import Path
 import sys, types, importlib
