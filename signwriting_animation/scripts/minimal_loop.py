@@ -167,6 +167,7 @@ class LitMinimal(pl.LightningModule):
         cond = batch["conditions"]
         fut = sanitize_btjc(batch["data"])
         past = sanitize_btjc(cond["input_pose"])
+        
         raw_mask = cond["target_mask"]
         mask = raw_mask.float()
         if mask.dim() == 5:
