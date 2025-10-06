@@ -1,34 +1,26 @@
-# signwriting_animation/diffusion/tests/test_smoke.py
-# Smoke test that avoids heavy deps during import.
-
 from pathlib import Path
 import sys, types, importlib
 import torch
 import pytest
 
-# --- Put repo root on sys.path so "signwriting_animation" is importable ---
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# --- Stub heavy modules BEFORE importing minimal_loop -----------------------
-# 1) Dummy diffusion model to replace the real one (avoids CLIP/etc.)
 class DummyModel:
     def __init__(self, *args, **kwargs):
         pass
     def forward(self, x_bjct, timesteps, past_bjct, sign_img):
         return x_bjct  # identity, correct BJCT shape
 
-# 2) Provide a stub for the module path that minimal_loop imports
 stub_core_models = types.ModuleType("signwriting_animation.diffusion.core.models")
 stub_core_models.SignWritingToPoseDiffusion = DummyModel
 sys.modules["signwriting_animation.diffusion.core.models"] = stub_core_models
 
-# 3) (Optional) Stub matplotlib to avoid binary compatibility errors if imported
 stub_mpl = types.ModuleType("matplotlib")
 stub_plt = types.ModuleType("matplotlib.pyplot")
 def _noop(*a, **k): pass
-# minimal set of functions used in on_fit_end (not called in this smoke test, but safe)
+# minimal set of functions used in on_fit_end
 stub_plt.figure = _noop
 stub_plt.plot = _noop
 stub_plt.xlabel = _noop
@@ -39,9 +31,7 @@ stub_plt.close = _noop
 sys.modules.setdefault("matplotlib", stub_mpl)
 sys.modules["matplotlib.pyplot"] = stub_plt
 
-# --- Now import the module under test (won't pull heavy deps) --------------
 ml = importlib.import_module("signwriting_animation.scripts.minimal_loop")
-
 
 @pytest.fixture
 def dummy_batch():
