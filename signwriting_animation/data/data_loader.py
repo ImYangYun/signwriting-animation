@@ -1,6 +1,6 @@
 import os
 import random
-from typing import Literal
+from typing import Literal, Optional
 
 import pandas as pd
 import torch
@@ -12,12 +12,30 @@ from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
 
+def _coalesce_maybe_nan(x) -> Optional[int]:
+    """Return None if value is NaN/None/empty; else return the value."""
+    try:
+        import math
+        if x is None:
+            return None
+        # pandas may pass float('nan')
+        if isinstance(x, float) and math.isnan(x):
+            return None
+    except Exception:
+        pass
+    return x
+
+
 class DynamicPosePredictionDataset(Dataset):
     """
     A PyTorch Dataset for dynamic sampling of normalized pose sequences,
     conditioned on SignWriting images and optional scalar metadata.
-    Each sample includes past and future pose segments, associated masks,
-    and a CLIP-ready rendering of the SignWriting annotation.
+
+    Changes:
+    - Optional `reduce_holistic`: reduce keypoints (for testing/CI speedups).
+      We apply reduction *before* normalization.
+    - Do NOT call `.zero_filled()` here; rely on `zero_pad_collator` to pad.
+    - Safe pivot in [1, total_frames-1] to ensure non-empty past/future.
     """
     def __init__(
         self,
@@ -27,67 +45,89 @@ class DynamicPosePredictionDataset(Dataset):
         num_future_frames: int = 20,
         with_metadata: bool = True,
         clip_model_name: str = "openai/clip-vit-base-patch32",
-        split: Literal['train', 'dev', 'test'] = 'train'
+        split: Literal["train", "dev", "test"] = "train",
+        reduce_holistic: bool = False,
     ):
         super().__init__()
-
-        assert split in ['train', 'test', 'dev']
+        assert split in ["train", "dev", "test"]
 
         self.data_dir = data_dir
         self.num_past_frames = num_past_frames
         self.num_future_frames = num_future_frames
         self.with_metadata = with_metadata
+        self.reduce_holistic = reduce_holistic
+
         df_records = pd.read_csv(csv_path)
-        df_records = df_records[df_records['split'] == split]
+        df_records = df_records[df_records["split"] == split].reset_index(drop=True)
         self.records = df_records.to_dict(orient="records")
+
         self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
 
+        # try import reduce_holistic lazily
+        self._reduce_holistic_fn = None
+        if self.reduce_holistic:
+            try:
+                from pose_format.utils.holistic import reduce_holistic as _rh
+                self._reduce_holistic_fn = _rh
+            except Exception:
+                # Not fatal; we simply skip reduction if missing
+                self._reduce_holistic_fn = None
+
     def __len__(self):
-        """
-        Return the number of samples in the dataset.
-        """
         return len(self.records)
 
     def __getitem__(self, idx):
-        """
-        Retrieve and process a single sample from the dataset.
-        Loads pose data and associated SignWriting text, extracts past and future segments,
-        and prepares masked tensors and CLIP-ready images.
-        """
         rec = self.records[idx]
 
         pose_path = os.path.join(self.data_dir, rec["pose"])
+        start = _coalesce_maybe_nan(rec.get("start"))
+        end   = _coalesce_maybe_nan(rec.get("end"))
+
         with open(pose_path, "rb") as f:
-            # Read only the relevant frames from the pose file (based on time, in milliseconds)
-            raw = Pose.read(f, start_time=rec["start"] or None, end_time=rec["end"] or None)
+            raw = Pose.read(f, start_time=start, end_time=end)
+
+        if self._reduce_holistic_fn is not None:
+            try:
+                raw = self._reduce_holistic_fn(raw)
+            except Exception:
+                pass
         pose = normalize_mean_std(raw)
 
-        # The model expects constant size "input" and "target" windows
+        # time length
         total_frames = len(pose.body.data)
-        min_pivot = 1
-        max_pivot = max(1, total_frames - 1)
-        pivot_frame = random.randint(min_pivot, max_pivot) # Choose a frame to separate the windows
 
-        # Crop pose around the pivot. Window might not be of "constant" size, but it will be padded.
-        input_start = max(0, pivot_frame - self.num_past_frames)
-        # TODO: consider reversing input_pose, since it will be right-padded
-        input_pose = pose.body[input_start:pivot_frame].torch()
-        target_end = min(total_frames, pivot_frame + self.num_future_frames)
-        target_pose = pose.body[pivot_frame:target_end].torch()
+        # guard extremely short sequences
+        if total_frames <= 1:
+            # Degenerate: make empty past and 1-frame future
+            pivot_frame = 0
+            input_pose = pose.body[0:0].torch()
+            target_pose = pose.body[0:1].torch()
+        else:
+            # safe pivot so both windows non-empty
+            min_pivot = 1
+            max_pivot = max(1, total_frames - 1)
+            pivot_frame = random.randint(min_pivot, max_pivot)
 
-        input_data = input_pose.data
+            input_start = max(0, pivot_frame - self.num_past_frames)
+            input_pose = pose.body[input_start:pivot_frame].torch()
+
+            target_end = min(total_frames, pivot_frame + self.num_future_frames)
+            target_pose = pose.body[pivot_frame:target_end].torch()
+
+        # Return masked tensors; padding is handled by zero_pad_collator
+        input_data  = input_pose.data
         target_data = target_pose.data
-
-        input_mask = input_pose.data.mask
+        input_mask  = input_pose.data.mask
         target_mask = target_pose.data.mask
 
+        # SignWriting -> CLIP image tensor [3,224,224]
         pil_img = signwriting_to_clip_image(rec.get("text", ""))
         sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
 
         sample = {
-            "data": target_data,
+            "data": target_data,  # future window
             "conditions": {
-                "input_pose": input_data,
+                "input_pose": input_data,   # past window
                 "input_mask": input_mask,
                 "target_mask": target_mask,
                 "sign_image": sign_img,
@@ -99,27 +139,22 @@ class DynamicPosePredictionDataset(Dataset):
             meta = {
                 "total_frames": total_frames,
                 "sample_start": pivot_frame,
-                "sample_end": target_end,
-                "orig_start": rec.get("start", 0),
-                "orig_end": rec.get("end", total_frames),
+                "sample_end": pivot_frame + len(target_data),  # approximate
+                "orig_start": start or 0,
+                "orig_end": end or total_frames,
             }
-            sample["metadata"] = {
-                k: torch.tensor([v], dtype=torch.long) for k, v in meta.items()
-            }
+            sample["metadata"] = {k: torch.tensor([int(v)], dtype=torch.long) for k, v in meta.items()}
 
         return sample
 
+
+# Optional: quick local sanity check
 def get_num_workers():
-    """
-    Determine appropriate number of workers based on CPU availability.
-    """
     cpu_count = os.cpu_count()
     return 0 if cpu_count is None or cpu_count <= 1 else cpu_count
 
+
 def main():
-    """
-    Run a test batch through the dataset and dataloader.
-    """
     data_dir = "/scratch/yayun/pose_data/raw_poses"
     csv_path = os.path.join(os.path.dirname(data_dir), "data.csv")
 
@@ -129,7 +164,8 @@ def main():
         num_past_frames=40,
         num_future_frames=20,
         with_metadata=True,
-        split='train'
+        split="train",
+        reduce_holistic=True,  # turn on to speed up testing
     )
     loader = DataLoader(
         dataset,
