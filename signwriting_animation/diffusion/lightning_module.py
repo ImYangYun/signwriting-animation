@@ -3,7 +3,7 @@ import csv
 import torch
 import lightning as pl
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
-from pose_evaluation.metrics.dtw_metric import DTWDTWTAIImplementationDistanceMeasure as PE_DTW
+from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 
 
 def _to_dense(x):
