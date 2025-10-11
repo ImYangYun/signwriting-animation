@@ -2,7 +2,6 @@ import os
 import csv
 import torch
 import lightning as pl
-
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from pose_evaluation.metrics.dtw_metric import dtw_mje as PE_DTW
 
