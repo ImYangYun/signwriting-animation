@@ -3,7 +3,7 @@ import csv
 import torch
 import lightning as pl
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
-from pose_evaluation.metrics.dtw_metric import dtw_mje as PE_DTW
+from pose_evaluation.metrics.dtw_metric import DTWDTWTAIImplementationDistanceMeasure as PE_DTW
 
 
 def _to_dense(x):
@@ -69,10 +69,12 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
     tgts  = _btjc_to_tjc_list(tgt_btjc,  mask_bt)
     vals = []
+    dtw_metric = PE_DTW() 
+
     for p, g in zip(preds, tgts):
         pv = p.detach().cpu().numpy().astype("float32")
         gv = g.detach().cpu().numpy().astype("float32")
-        vals.append(float(PE_DTW(pv, gv)))
+        vals.append(float(dtw_metric.score(pv, gv)))
     return torch.tensor(vals, device=pred_btjc.device).mean()
 
 
