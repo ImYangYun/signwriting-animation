@@ -74,6 +74,8 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     for p, g in zip(preds, tgts):
         pv = p.detach().cpu().numpy().astype("float32")
         gv = g.detach().cpu().numpy().astype("float32")
+        pv = pv[:, None, :, :]  # (T, 1, J, C)
+        gv = gv[:, None, :, :]  # (T, 1, J, C)
         vals.append(float(dtw_metric.get_distance(pv, gv)))
     return torch.tensor(vals, device=pred_btjc.device).mean()
 
