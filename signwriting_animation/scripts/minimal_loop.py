@@ -3,7 +3,10 @@ import os
 import csv
 import torch
 import lightning as pl
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import animation
 from torch.utils.data import DataLoader, Dataset
 from pose_format.torch.masked.collator import zero_pad_collator
 
@@ -63,6 +66,15 @@ class FilteredDataset(Dataset):
     def __getitem__(self, i):
         return self.base[self.idx[i]]
 
+def _as_dense_cpu_btjc(x):
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
+    if getattr(x, "is_sparse", False):
+        x = x.to_dense()
+    x = x.detach().float().cpu().contiguous()
+    if x.dim() == 5:
+        x = x[:, :, 0, ...]
+    return x
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
@@ -115,7 +127,7 @@ if __name__ == "__main__":
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
-        cond  = batch["conditions"]
+        cond = batch["conditions"]
 
         past_btjc = cond["input_pose"][:1].to(model.device)
         sign_img  = cond["sign_image"][:1].to(model.device)
@@ -128,23 +140,43 @@ if __name__ == "__main__":
             future_steps=fut_gt.size(1),
         )
 
-        # Compute DTW metric
         try:
             dtw_free = masked_dtw(gen_btjc, fut_gt, mask_bt).item()
             print(f"[Free-run] DTW: {dtw_free:.4f}")
         except Exception as e:
             print("[Free-run] DTW eval skipped:", e)
 
+        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)[0]  # [T,J,C]
+        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)[0]    # [T,J,C]
+
         os.makedirs("logs", exist_ok=True)
-        torch.save({
-            "gen": _to_plain_tensor(gen_btjc),
-            "gt":  _to_plain_tensor(fut_gt)
-        }, "logs/free_run.pt")
 
-        visualize_pose_sequence(gen_btjc, "logs/free_run_vis.png", step=5)
+        torch.save({"gen": gen_btjc_cpu, "gt": fut_gt_cpu}, "logs/free_run.pt")
+        print("Saved free-run sequences to logs/free_run.pt")
 
-        print("✅ Finished minimal overfit run")
-        print("→ Saved:")
-        print("   - logs/minimal_curves.png (loss curves)")
-        print("   - logs/free_run.pt (predicted & GT poses)")
-        print("   - logs/free_run_vis.png (pose visualization)")
+        fig, ax = plt.subplots(figsize=(5, 5))
+        sc_pred = ax.scatter([], [], s=15, c="red", label="Predicted")
+        sc_gt   = ax.scatter([], [], s=15, c="blue", alpha=0.35, label="GT")
+        ax.legend(loc="upper right", frameon=False)
+        ax.axis("equal")
+
+        xy = torch.cat([gen_btjc_cpu[..., :2].reshape(-1, 2),
+                        fut_gt_cpu[..., :2].reshape(-1, 2)], dim=0).numpy()
+        x_min, y_min = xy.min(axis=0)
+        x_max, y_max = xy.max(axis=0)
+        pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
+        ax.set_xlim(x_min - pad, x_max + pad)
+        ax.set_ylim(y_min - pad, y_max + pad)
+
+        def _update(frame):
+            ax.set_title(f"Free-run prediction  |  frame {frame+1}/{len(gen_btjc_cpu)}")
+            sc_pred.set_offsets(gen_btjc_cpu[frame, :, :2].numpy())
+            sc_gt.set_offsets(fut_gt_cpu[frame, :, :2].numpy())
+            return sc_pred, sc_gt
+
+        ani = animation.FuncAnimation(
+            fig, _update, frames=len(gen_btjc_cpu), interval=100, blit=True
+        )
+        ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
+        plt.close(fig)
+        print("Saved free-run animation to logs/free_run_anim.gif")
