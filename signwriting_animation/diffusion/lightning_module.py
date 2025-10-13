@@ -193,37 +193,33 @@ class LitMinimal(pl.LightningModule):
     # ---------------- inference: one-shot full sequence (recommended) ----------------
     @torch.no_grad()
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
-        """
-        Predict the entire future segment in one forward pass (per sample length).
-        - If `target_len` is None, infer per-sample Tf from `target_mask`.
-        - Supports dynamic window (different Tf per sample).
-        """
         self.eval()
         ctx  = sanitize_btjc(past_btjc).to(self.device)     # [B,Tp,J,C]
         sign = sign_img.to(self.device)
         B, _, J, C = ctx.shape
 
-        tf_list = None
         if target_len is not None:
             if isinstance(target_len, (int, float)):
                 tf_list = [int(target_len)] * B
             elif torch.is_tensor(target_len):
                 tf_list = target_len.view(-1).to(torch.long).cpu().tolist()
-            elif isinstance(target_len, (list, tuple)):
-                tf_list = [int(x) for x in target_len]
             else:
-                raise TypeError(f"Unsupported target_len type: {type(target_len)}")
+                tf_list = [int(x) for x in target_len]
         else:
-            assert target_mask is not None, "Need target_len or target_mask"
-            mask_bt = self._make_mask_bt(target_mask).to(self.device)  # [B,T]
-            tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()  # [B]
+            assert target_mask is not None
+            mask_bt = self._make_mask_bt(target_mask).to(self.device)      # [B,T]
+            tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()
 
         outs = []
         for b in range(B):
-            Tf = max(1, int(tf_list[b])) 
-            x_query = 0.01* torch.zeros((1, Tf, J, C), device=self.device)  # zeros query
+            Tf = max(1, int(tf_list[b]))
+            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device)
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
+
+            if Tf > 1:
+                dv = (pred[:, 1:, :, :2] - pred[:, :-1, :, :2]).abs().mean().item()
+                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred| BEFORE-CPU = {dv:.6f}")
             outs.append(pred)
         return torch.cat(outs, dim=0)  # [B,Tf,J,C]
 
