@@ -100,6 +100,13 @@ class LitMinimal(pl.LightningModule):
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints, num_dims_per_keypoint=num_dims
         )
+        import signwriting_animation.diffusion.core.models as M
+        print("[WHERE MODELS.PY] ", M.__file__, flush=True)
+        print("[HAS time_proj?] ", hasattr(self.model, "future_time_proj"), flush=True)
+        print("[FUTURE_PROJ PARAMS] ",
+            [n for n, _ in self.model.named_parameters() if "future_time_proj" in n],
+            flush=True)
+
         self.lr = lr
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
