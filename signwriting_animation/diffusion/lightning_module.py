@@ -132,7 +132,6 @@ class LitMinimal(pl.LightningModule):
         mask1   = mask[:, 1:]
 
         pred = self.forward(in_seq, ts, past, sign)
-        # 选一种损失：仅位置，或位置+速度
         loss_pos = masked_mse(pred, tgt_seq, mask1)
         loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], tgt_seq[:,1:]-tgt_seq[:,:-1], mask1[:,1:])
         loss = loss_pos + 0.5 * loss_vel
@@ -208,4 +207,3 @@ class LitMinimal(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
-
