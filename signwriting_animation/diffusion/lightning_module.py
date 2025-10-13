@@ -184,7 +184,6 @@ class LitMinimal(pl.LightningModule):
 
         dtw  = masked_dtw(pred, fut, mask)
 
-        # sanity：验证阶段也看一次
         if self.global_step == 0:
             with torch.no_grad():
                 mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
@@ -224,9 +223,8 @@ class LitMinimal(pl.LightningModule):
         outs = []
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
-            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device) \
-                    + 0.005 * self._time_ramp(Tf, self.device)
-
+            t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
+            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device) + 0.005 * t
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
 
