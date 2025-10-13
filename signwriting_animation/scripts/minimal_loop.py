@@ -138,9 +138,18 @@ if __name__ == "__main__":
         gen_btjc = model.generate_full_sequence(
             past_btjc=past_btjc,
             sign_img=sign_img,
-            target_mask=mask_bt,
+            target_mask=mask_bt, 
         )
 
+        Tf = gen_btjc.size(1)
+        def frame_disp(x):  # x: [1,T,J,C]
+            dx = x[:, 1:, :, :2] - x[:, :-1, :, :2]
+            return dx.abs().mean().item()
+        mv_pred = frame_disp(gen_btjc) if Tf > 1 else 0.0
+        mv_gt   = frame_disp(fut_gt)   if fut_gt.size(1) > 1 else 0.0
+        print(f"[GEN] Tf={Tf}, mean|Δpred|={mv_pred:.4f}, mean|Δgt|={mv_gt:.4f}")
+        if Tf < 2:
+            print("[WARN] predicted sequence length < 2; animation will look static.")
 
         try:
             dtw_free = masked_dtw(gen_btjc, fut_gt, mask_bt).item()
@@ -152,13 +161,12 @@ if __name__ == "__main__":
         fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)[0]    # [T,J,C]
 
         os.makedirs("logs", exist_ok=True)
-
         torch.save({"gen": gen_btjc_cpu, "gt": fut_gt_cpu}, "logs/free_run.pt")
         print("Saved free-run sequences to logs/free_run.pt")
 
         fig, ax = plt.subplots(figsize=(5, 5))
-        sc_pred = ax.scatter([], [], s=15, c="red", label="Predicted")
-        sc_gt   = ax.scatter([], [], s=15, c="blue", alpha=0.35, label="GT")
+        sc_pred = ax.scatter([], [], s=15, c="red", label="Predicted", animated=True)
+        sc_gt   = ax.scatter([], [], s=15, c="blue", alpha=0.35, label="GT", animated=True)
         ax.legend(loc="upper right", frameon=False)
         ax.axis("equal")
 
@@ -170,6 +178,10 @@ if __name__ == "__main__":
         ax.set_xlim(x_min - pad, x_max + pad)
         ax.set_ylim(y_min - pad, y_max + pad)
 
+        def _init():
+            sc_pred.set_offsets([]); sc_gt.set_offsets([])
+            return sc_pred, sc_gt
+
         def _update(frame):
             ax.set_title(f"Free-run prediction  |  frame {frame+1}/{len(gen_btjc_cpu)}")
             sc_pred.set_offsets(gen_btjc_cpu[frame, :, :2].numpy())
@@ -177,7 +189,8 @@ if __name__ == "__main__":
             return sc_pred, sc_gt
 
         ani = animation.FuncAnimation(
-            fig, _update, frames=len(gen_btjc_cpu), interval=100, blit=True
+            fig, _update, frames=len(gen_btjc_cpu),
+            init_func=_init, interval=100, blit=True
         )
         ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
         plt.close(fig)
