@@ -50,33 +50,35 @@ def masked_mse(pred_btjc, tgt_btjc, mask_bt):
     den = (m4.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
     return num / den
 
-
-# ---- 仅使用 pose-evaluation 的 DTW-MJE ----
-
 def _btjc_to_tjc_list(x_btjc, mask_bt):
-    """BTJC + [B,T] mask -> list[[t,J,C]]，按 mask 截去 padding。"""
     x_btjc = sanitize_btjc(x_btjc)
     B, T, J, C = x_btjc.shape
     seqs = []
+    mask_bt = (mask_bt > 0.5).float()
     for b in range(B):
         t = int(mask_bt[b].sum().item())
         t = max(0, min(t, T))
-        seqs.append(x_btjc[b, :t].contiguous())  # [t,J,C]
+        seqs.append(x_btjc[b, :t].contiguous())
     return seqs
 
 @torch.no_grad()
 def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
     tgts  = _btjc_to_tjc_list(tgt_btjc,  mask_bt)
-    vals = []
     dtw_metric = PE_DTW()
 
+    vals = []
     for p, g in zip(preds, tgts):
-        pv = p.detach().cpu().numpy().astype("float32")
-        gv = g.detach().cpu().numpy().astype("float32")
+        if p.size(0) < 2 or g.size(0) < 2:
+            continue
+        pv = p.detach().cpu().numpy().astype("float32")  # [T,J,C]
+        gv = g.detach().cpu().numpy().astype("float32")  # [T,J,C]
         pv = pv[:, None, :, :]  # (T, 1, J, C)
         gv = gv[:, None, :, :]  # (T, 1, J, C)
         vals.append(float(dtw_metric.get_distance(pv, gv)))
+
+    if not vals:
+        return torch.tensor(0.0, device=pred_btjc.device)
     return torch.tensor(vals, device=pred_btjc.device).mean()
 
 
@@ -100,7 +102,6 @@ class LitMinimal(pl.LightningModule):
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
 
-    # —— 关键：把布局转换“藏”在 forward 里（导师建议） ——
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
         x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
         past_bjct = btjc_to_bjct(sanitize_btjc(past_btjc))
@@ -166,7 +167,6 @@ class LitMinimal(pl.LightningModule):
 
     @torch.no_grad()
     def generate_autoregressive(self, past_btjc, sign_img, future_steps):
-        """给定 past（BTJC）与 sign 图像，逐帧生成 future_steps 帧，返回 [B,Tf,J,C]。"""
         self.eval()
         ctx  = sanitize_btjc(past_btjc).to(self.device)   # [B,Tp,J,C]
         sign = sign_img.to(self.device)
@@ -176,7 +176,7 @@ class LitMinimal(pl.LightningModule):
         for _ in range(future_steps):
             seed = ctx[:, -1:, ...]                       # [B,1,J,C]
             ts   = torch.zeros(B, dtype=torch.long, device=self.device)
-            nxt  = self.forward(seed, ts, ctx, sign)[:, :1, ...]  # 取 1 帧
+            nxt  = self.forward(seed, ts, ctx, sign)[:, :1, ...]
             preds.append(nxt)
             ctx = torch.cat([ctx, nxt], dim=1)
             if ctx.size(1) > Tp:
