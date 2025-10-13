@@ -134,11 +134,12 @@ if __name__ == "__main__":
         fut_gt    = batch["data"][:1].to(model.device)
         mask_bt   = cond["target_mask"][:1].to(model.device)
 
-        gen_btjc = model.generate_autoregressive(
-            past_btjc=past_btjc,
-            sign_img=sign_img,
-            future_steps=fut_gt.size(1),
-        )
+        gen_btjc = model.generate_full_sequence(
+        past_btjc=past_btjc,
+        sign_img=sign_img,
+        target_mask=mask_bt,
+    )
+
 
         try:
             dtw_free = masked_dtw(gen_btjc, fut_gt, mask_bt).item()
