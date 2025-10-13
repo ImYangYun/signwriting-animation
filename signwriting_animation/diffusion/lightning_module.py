@@ -182,9 +182,10 @@ class LitMinimal(pl.LightningModule):
 
         preds = []
         for _ in range(future_steps):
-            seed = ctx[:, -1:, ...]                       # [B,1,J,C]
+            context_len = min(5, ctx.size(1))
+            seed = ctx[:, -context_len:, ...]
             ts   = torch.zeros(B, dtype=torch.long, device=self.device)
-            nxt  = self.forward(seed, ts, ctx, sign)[:, :1, ...]
+            nxt  = self.forward(seed, ts, ctx, sign)[:, -1:, ...]
             preds.append(nxt)
             ctx = torch.cat([ctx, nxt], dim=1)
             if ctx.size(1) > Tp:
