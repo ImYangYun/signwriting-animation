@@ -79,6 +79,14 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
 
+        self.future_time_proj = nn.Sequential(
+            nn.Linear(1, num_latent_dims),
+            nn.SiLU(),
+            nn.Linear(num_latent_dims, num_latent_dims)
+        )
+
+        self.future_after_time_ln = nn.LayerNorm(num_latent_dims)
+
     def forward(self,
                 x: torch.Tensor,
                 timesteps: torch.Tensor,
@@ -118,6 +126,14 @@ class SignWritingToPoseDiffusion(nn.Module):
         past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
         future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
 
+        Tf = future_motion_emb.size(0)
+        B  = future_motion_emb.size(1)
+        t  = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)  # [Tf,1,1]
+        t_latent = self.future_time_proj(t)                  # [Tf,1,D]
+        t_latent = t_latent.expand(-1, B, -1)                # [Tf,B,D]
+        future_motion_emb = future_motion_emb + t_latent
+        future_motion_emb = self.future_after_time_ln(future_motion_emb)
+        
         xseq = torch.cat((time_emb,
                           signwriting_emb,
                           past_motion_emb,
