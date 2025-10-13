@@ -138,7 +138,7 @@ class LitMinimal(pl.LightningModule):
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
-        in_seq = torch.zeros_like(fut)
+        in_seq = 0.01 * torch.zeros_like(fut)
 
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
@@ -222,8 +222,8 @@ class LitMinimal(pl.LightningModule):
 
         outs = []
         for b in range(B):
-            Tf = max(1, int(tf_list[b]))  # 强制 int，避免 list/张量导致的 TypeError
-            x_query = torch.zeros((1, Tf, J, C), device=self.device)  # zeros query
+            Tf = max(1, int(tf_list[b])) 
+            x_query = 0.01* torch.zeros((1, Tf, J, C), device=self.device)  # zeros query
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
             outs.append(pred)
