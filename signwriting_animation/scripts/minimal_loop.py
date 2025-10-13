@@ -202,7 +202,9 @@ if __name__ == "__main__":
         ax.set_ylim(y_min - pad, y_max + pad)
 
         def _init():
-            sc_pred.set_offsets([]); sc_gt.set_offsets([])
+            import numpy as np
+            sc_pred.set_offsets(np.empty((0, 2)))
+            sc_gt.set_offsets(np.empty((0, 2)))
             return sc_pred, sc_gt
 
         def _update(f):
@@ -212,7 +214,7 @@ if __name__ == "__main__":
             return sc_pred, sc_gt
 
         ani = animation.FuncAnimation(
-            fig, _update, frames=len(gen_btjc_cpu),
+            fig, _update, frames=max(1, len(gen_btjc_cpu)),
             init_func=_init, interval=100, blit=True
         )
         ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
