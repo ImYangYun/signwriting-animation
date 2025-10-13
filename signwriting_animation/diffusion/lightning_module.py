@@ -226,6 +226,8 @@ class LitMinimal(pl.LightningModule):
             t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
             x_query = 0.10 * torch.randn((1, Tf, J, C), device=self.device) + 0.10 * t
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
+            print(f"[DBG] Tf={Tf}, t.min={float(t.min()):.3f}, t.max={float(t.max()):.3f}", flush=True)
+            print(f"[DBG] x_query.mean={float(x_query.mean()):.5f}, x_query.std={float(x_query.std()):.5f}", flush=True)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
 
             if Tf > 1:
