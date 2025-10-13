@@ -101,6 +101,7 @@ class LitMinimal(pl.LightningModule):
         self.lr = lr
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
+        print("[LitMinimal] next-frame training with vel loss enabled ✅")
 
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
         x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
@@ -120,6 +121,9 @@ class LitMinimal(pl.LightningModule):
         return mask
 
     def training_step(self, batch, _):
+        if self.global_step == 0:
+            import signwriting_animation.diffusion.lightning_module as lm
+            print(f"[USING FILE] {lm.__file__}")
         cond = batch["conditions"]
         fut  = sanitize_btjc(batch["data"])
         past = sanitize_btjc(cond["input_pose"])
@@ -135,6 +139,11 @@ class LitMinimal(pl.LightningModule):
         loss_pos = masked_mse(pred, tgt_seq, mask1)
         loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], tgt_seq[:,1:]-tgt_seq[:,:-1], mask1[:,1:])
         loss = loss_pos + 0.5 * loss_vel
+
+        if self.global_step == 0:
+            with torch.no_grad():
+                mv = (pred[:,1:,:,:] - pred[:,:-1,:,:]).abs().mean().item()
+                print(f"[Sanity] mean |Δpred| = {mv:.6f}")
 
         self.train_losses.append(loss.item())
         self.log("train/loss", loss, prog_bar=True, on_step=True)
