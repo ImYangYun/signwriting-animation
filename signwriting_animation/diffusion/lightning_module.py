@@ -139,10 +139,8 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
         in_seq = 0.01 * torch.zeros_like(fut)
-
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
-        # 位置 + 速度损失（速度掩码对齐到 t>=1）
         loss_pos = masked_mse(pred, fut, mask)
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
@@ -168,7 +166,7 @@ class LitMinimal(pl.LightningModule):
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
-        in_seq = torch.zeros_like(fut)
+        in_seq = 0.01* torch.zeros_like(fut)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
