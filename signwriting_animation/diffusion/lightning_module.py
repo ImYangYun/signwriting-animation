@@ -124,6 +124,9 @@ class LitMinimal(pl.LightningModule):
         elif mask.dim() == 3: # [B,T,C]   -> [B,T]
             mask = (mask.abs().sum(dim=2) > 0).float()
         return mask
+    def _time_ramp(self, T, device):
+        # shape: [1, T, 1, 1] ，用于给查询 token 一点微弱的时间特征
+        return torch.linspace(0, 1, steps=T, device=device).view(1, T, 1, 1)
 
     # ---------------- train/val: full-seq prediction ----------------
     def training_step(self, batch, _):
@@ -137,8 +140,9 @@ class LitMinimal(pl.LightningModule):
         mask = self._make_mask_bt(cond["target_mask"])   # [B,Tf]
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-
-        in_seq = 0.01 * torch.zeros_like(fut)
+        
+        T = fut.size(1)
+        in_seq = 0.01 * torch.randn_like(fut) + 0.005 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -165,8 +169,9 @@ class LitMinimal(pl.LightningModule):
         mask = self._make_mask_bt(cond["target_mask"])
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-
-        in_seq = 0.01* torch.zeros_like(fut)
+        
+        T = fut.size(1)
+        in_seq = 0.01 * torch.randn_like(fut) + 0.005 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -193,6 +198,12 @@ class LitMinimal(pl.LightningModule):
     # ---------------- inference: one-shot full sequence (recommended) ----------------
     @torch.no_grad()
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
+        """
+        Predict the entire future segment in one forward pass (per sample length).
+        - If `target_len` is None, infer per-sample Tf from `target_mask`.
+        - Supports dynamic window (different Tf per sample).
+        """
+        print("[GEN/full] ENTER generate_full_sequence", flush=True)
         self.eval()
         ctx  = sanitize_btjc(past_btjc).to(self.device)     # [B,Tp,J,C]
         sign = sign_img.to(self.device)
@@ -206,21 +217,25 @@ class LitMinimal(pl.LightningModule):
             else:
                 tf_list = [int(x) for x in target_len]
         else:
-            assert target_mask is not None
+            assert target_mask is not None, "Need target_len or target_mask"
             mask_bt = self._make_mask_bt(target_mask).to(self.device)      # [B,T]
             tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()
 
         outs = []
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
-            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device)
+            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device) \
+                    + 0.005 * self._time_ramp(Tf, self.device)
+
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
 
             if Tf > 1:
                 dv = (pred[:, 1:, :, :2] - pred[:, :-1, :, :2]).abs().mean().item()
-                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred| BEFORE-CPU = {dv:.6f}")
+                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred| BEFORE-CPU = {dv:.6f}", flush=True)
+
             outs.append(pred)
+
         return torch.cat(outs, dim=0)  # [B,Tf,J,C]
 
     # ---------------- bookkeeping ----------------
