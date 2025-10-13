@@ -178,7 +178,7 @@ if __name__ == "__main__":
         ax.legend(loc="upper right", frameon=False)
         ax.axis("equal")
 
-        xy = _t.cat([
+        xy = torch.cat([
             gen_btjc_cpu[..., :2].reshape(-1, 2),
             fut_gt_cpu[...,  :2].reshape(-1, 2)
         ], dim=0).numpy()
