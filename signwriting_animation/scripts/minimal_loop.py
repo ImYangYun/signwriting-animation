@@ -134,11 +134,12 @@ if __name__ == "__main__":
         fut_gt    = batch["data"][:1].to(model.device)
         mask_bt   = cond["target_mask"][:1].to(model.device)
 
+        print("[GEN] using generate_full_sequence")
         gen_btjc = model.generate_full_sequence(
-        past_btjc=past_btjc,
-        sign_img=sign_img,
-        target_mask=mask_bt,
-    )
+            past_btjc=past_btjc,
+            sign_img=sign_img,
+            target_mask=mask_bt,
+        )
 
 
         try:
