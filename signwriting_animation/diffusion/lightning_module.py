@@ -127,7 +127,6 @@ class LitMinimal(pl.LightningModule):
 
     # ---------------- train/val: full-seq prediction ----------------
     def training_step(self, batch, _):
-        # 打印一次导入路径，防止旧包遮蔽
         if self.global_step == 0:
             import signwriting_animation.diffusion.lightning_module as lm
             print(f"[USING FILE] {lm.__file__}")
@@ -139,8 +138,7 @@ class LitMinimal(pl.LightningModule):
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
-        # zeros-query：一次性预测整段 future
-        in_seq = torch.zeros_like(fut)                   # 也可换成 0.01*randn 提稳
+        in_seq = torch.zeros_like(fut)
 
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
@@ -153,7 +151,6 @@ class LitMinimal(pl.LightningModule):
         else:
             loss = loss_pos
 
-        # sanity：首步看一下预测内部帧间变化（应 > 0）
         if self.global_step == 0:
             with torch.no_grad():
                 mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
@@ -208,44 +205,29 @@ class LitMinimal(pl.LightningModule):
         sign = sign_img.to(self.device)
         B, _, J, C = ctx.shape
 
-        if target_len is None:
-            assert target_mask is not None, "Need target_len or target_mask"
-            tf_list = target_mask.sum(dim=1).long().tolist()
+        tf_list = None
+        if target_len is not None:
+            if isinstance(target_len, (int, float)):
+                tf_list = [int(target_len)] * B
+            elif torch.is_tensor(target_len):
+                tf_list = target_len.view(-1).to(torch.long).cpu().tolist()
+            elif isinstance(target_len, (list, tuple)):
+                tf_list = [int(x) for x in target_len]
+            else:
+                raise TypeError(f"Unsupported target_len type: {type(target_len)}")
         else:
-            tf_list = [int(target_len)] * B
+            assert target_mask is not None, "Need target_len or target_mask"
+            mask_bt = self._make_mask_bt(target_mask).to(self.device)  # [B,T]
+            tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()  # [B]
 
         outs = []
         for b in range(B):
-            Tf = max(1, tf_list[b])
-            x_query = torch.zeros((1, Tf, J, C), device=self.device)   # zeros query
+            Tf = max(1, int(tf_list[b]))  # 强制 int，避免 list/张量导致的 TypeError
+            x_query = torch.zeros((1, Tf, J, C), device=self.device)  # zeros query
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
             outs.append(pred)
         return torch.cat(outs, dim=0)  # [B,Tf,J,C]
-
-    # ---------------- inference: autoregressive baseline (kept) ----------------
-    @torch.no_grad()
-    def generate_autoregressive(self, past_btjc, sign_img, future_steps):
-        self.eval()
-        ctx  = sanitize_btjc(past_btjc).to(self.device)
-        sign = sign_img.to(self.device)
-        B, Tp, J, C = ctx.shape
-
-        preds = []
-        for _ in range(future_steps):
-            # 给一点时间上下文（非单帧）以产生动态
-            context_len = min(5, ctx.size(1))
-            seed = ctx[:, -context_len:, ...] 
-            ts   = torch.zeros(B, dtype=torch.long, device=self.device)
-            out  = self.forward(seed, ts, ctx, sign)
-            nxt  = out[:, -1:, ...]
-            preds.append(nxt)
-
-            ctx = torch.cat([ctx, nxt], dim=1)
-            if ctx.size(1) > Tp:
-                ctx = ctx[:, 1:, ...]
-
-        return torch.cat(preds, dim=1)  # [B,Tf,J,C]
 
     # ---------------- bookkeeping ----------------
     def on_fit_end(self):
