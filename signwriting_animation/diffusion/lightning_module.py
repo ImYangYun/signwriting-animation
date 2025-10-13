@@ -142,7 +142,7 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.01 * torch.randn_like(fut) + 0.005 * self._time_ramp(T, fut.device)
+        in_seq = 0.10 * torch.randn_like(fut) + 0.10 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -171,14 +171,14 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.01 * torch.randn_like(fut) + 0.005 * self._time_ramp(T, fut.device)
+        in_seq = 0.10 * torch.randn_like(fut) + 0.10 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 0.5 * loss_vel
+            loss = loss_pos + 1 * loss_vel
         else:
             loss = loss_pos
 
@@ -224,7 +224,7 @@ class LitMinimal(pl.LightningModule):
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
             t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
-            x_query = 0.01 * torch.randn((1, Tf, J, C), device=self.device) + 0.005 * t
+            x_query = 0.10 * torch.randn((1, Tf, J, C), device=self.device) + 0.10 * t
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
 
