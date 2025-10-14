@@ -8,10 +8,14 @@ from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeas
 
 def _to_dense(x):
     """
-    Safely convert a batch tensor to dense float32:
-    - If it's a pose-format MaskedTensor, call .zero_filled() to obtain a dense tensor.
-    - If it's a sparse tensor, densify it.
-    - Cast to float32 and make memory contiguous.
+    Convert a potentially sparse or masked tensor to a dense, contiguous float32 tensor.
+        - pose-format MaskedTensor (via .zero_filled())
+        - sparse tensors (.to_dense())
+        - dtype casting to float32
+    Args:
+        x (torch.Tensor or MaskedTensor): Input tensor of arbitrary type.
+    Returns:
+        torch.Tensor: Dense float32 tensor with contiguous memory layout.
     """
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
@@ -31,12 +35,23 @@ def sanitize_btjc(x):
     return x
 
 def btjc_to_bjct(x):  # [B,T,J,C] -> [B,J,C,T]
+    """Permute tensor from [B, T, J, C] → [B, J, C, T]."""
     return x.permute(0, 2, 3, 1).contiguous()
 
 def bjct_to_btjc(x):  # [B,J,C,T] -> [B,T,J,C]
+    """Permute tensor from [B, J, C, T] → [B, T, J, C]."""
     return x.permute(0, 3, 1, 2).contiguous()
 
 def masked_mse(pred_btjc, tgt_btjc, mask_bt):
+    """
+    Compute mean squared error over valid (masked) frames.
+    Args:
+        pred_btjc (torch.Tensor): Predicted poses [B, T, J, C].
+        tgt_btjc (torch.Tensor): Target poses [B, T, J, C].
+        mask_bt (torch.Tensor): Binary mask [B, T] where 1 indicates valid frames.
+    Returns:
+        torch.Tensor: Scalar loss value (float).
+    """
     pred = sanitize_btjc(pred_btjc)
     tgt  = sanitize_btjc(tgt_btjc)
 
@@ -51,6 +66,15 @@ def masked_mse(pred_btjc, tgt_btjc, mask_bt):
     return num / den
 
 def _btjc_to_tjc_list(x_btjc, mask_bt):
+    """
+    Convert batched [B,T,J,C] tensor into list of variable-length [T,J,C] sequences.
+    Uses mask to trim valid frames for each sample.
+    Args:
+        x_btjc (torch.Tensor): Pose tensor [B, T, J, C].
+        mask_bt (torch.Tensor): Frame validity mask [B, T].
+    Returns:
+        list[torch.Tensor]: List of [T, J, C] tensors (one per batch sample).
+    """
     x_btjc = sanitize_btjc(x_btjc)
     B, T, J, C = x_btjc.shape
     seqs = []
@@ -82,16 +106,19 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     return torch.tensor(vals, device=pred_btjc.device).mean()
 
 
-# ------------------ Lightning module ------------------
-
 class LitMinimal(pl.LightningModule):
     """
-    Minimal Lightning module (dynamic-window friendly):
-    - Train/Val: full-sequence prediction (zeros query -> predict entire future)
-    - Loss: position + 0.5 * velocity (masked)
-    - Generate:
-        * generate_full_sequence(): one-shot full Tf (recommended)
-        * generate_autoregressive(): stepwise baseline (kept for comparison)
+    Minimal PyTorch Lightning module for SignWriting-to-Pose training.
+    Features:
+        - Dynamic-window training (no fixed segment length)
+        - Masked MSE and velocity-based auxiliary loss
+        - One-shot full-sequence prediction during inference
+        - On-fit metric logging to CSV
+    Args:
+        num_keypoints (int): Number of body keypoints in pose representation.
+        num_dims (int): Number of spatial dimensions per keypoint (e.g. 3 for x,y,z).
+        lr (float): Learning rate for AdamW optimizer.
+        log_dir (str): Directory to save training metrics.
     """
     def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs"):
         super().__init__()
@@ -113,15 +140,14 @@ class LitMinimal(pl.LightningModule):
 
         print("[LitMinimal] full-sequence training (zeros query) + velocity loss ✅")
 
-    # ---------------- core forward (BJCT <-> BTJC) ----------------
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
+        """Forward pass through diffusion model (batch-first format)."""
         x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
         past_bjct = btjc_to_bjct(sanitize_btjc(past_btjc))
         out_bjct  = self.model.forward(x_bjct, timesteps, past_bjct, sign_img)
         pred_btjc = bjct_to_btjc(out_bjct)  # [B,T,J,C]
         return pred_btjc
 
-    # ---------------- utils ----------------
     def _make_mask_bt(self, raw_mask):
         mask = raw_mask.float()
         if mask.dim() == 5:   # [B,T,P,J,C] -> [B,T]
@@ -132,10 +158,8 @@ class LitMinimal(pl.LightningModule):
             mask = (mask.abs().sum(dim=2) > 0).float()
         return mask
     def _time_ramp(self, T, device):
-        # shape: [1, T, 1, 1] ，用于给查询 token 一点微弱的时间特征
         return torch.linspace(0, 1, steps=T, device=device).view(1, T, 1, 1)
 
-    # ---------------- train/val: full-seq prediction ----------------
     def training_step(self, batch, _):
         if self.global_step == 0:
             import signwriting_animation.diffusion.lightning_module as lm
@@ -201,7 +225,6 @@ class LitMinimal(pl.LightningModule):
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/dtw",  dtw,  prog_bar=False)
 
-    # ---------------- inference: one-shot full sequence (recommended) ----------------
     @torch.no_grad()
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
         """
@@ -246,7 +269,6 @@ class LitMinimal(pl.LightningModule):
 
         return torch.cat(outs, dim=0)  # [B,Tf,J,C]
 
-    # ---------------- bookkeeping ----------------
     def on_fit_end(self):
         os.makedirs(self.log_dir, exist_ok=True)
         csv_path = os.path.join(self.log_dir, "minimal_metrics.csv")
