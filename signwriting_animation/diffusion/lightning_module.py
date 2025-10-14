@@ -149,7 +149,7 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.10 * torch.randn_like(fut) + 0.10 * self._time_ramp(T, fut.device)
+        in_seq = 0.20 * torch.randn_like(fut) + 0.20 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -178,7 +178,7 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.10 * torch.randn_like(fut) + 0.10 * self._time_ramp(T, fut.device)
+        in_seq = 0.20 * torch.randn_like(fut) + 0.20 * self._time_ramp(T, fut.device)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -231,7 +231,7 @@ class LitMinimal(pl.LightningModule):
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
             t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
-            x_query = 0.10 * torch.randn((1, Tf, J, C), device=self.device) + 0.10 * t
+            x_query = 0.20 * torch.randn((1, Tf, J, C), device=self.device) + 0.20 * t
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             print(f"[DBG] Tf={Tf}, t.min={float(t.min()):.3f}, t.max={float(t.max()):.3f}", flush=True)
             print(f"[DBG] x_query.mean={float(x_query.mean()):.5f}, x_query.std={float(x_query.std()):.5f}", flush=True)
@@ -240,7 +240,8 @@ class LitMinimal(pl.LightningModule):
             if Tf > 1:
                 dv = (pred[:, 1:, :, :2] - pred[:, :-1, :, :2]).abs().mean().item()
                 print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred| BEFORE-CPU = {dv:.6f}", flush=True)
-
+                tv = pred[:, :, :, :2].std(dim=1).mean().item()
+                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred|={dv:.6f}, time-std={tv:.6f}", flush=True)
             outs.append(pred)
 
         return torch.cat(outs, dim=0)  # [B,Tf,J,C]

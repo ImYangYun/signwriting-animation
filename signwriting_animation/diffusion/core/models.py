@@ -131,9 +131,9 @@ class SignWritingToPoseDiffusion(nn.Module):
         t  = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)  # [Tf,1,1]
         t_latent = self.future_time_proj(t)                  # [Tf,1,D]
         t_latent = t_latent.expand(-1, B, -1)                # [Tf,B,D]
-        future_motion_emb = future_motion_emb + t_latent
-        future_motion_emb = self.future_after_time_ln(future_motion_emb)
-        
+        future_motion_emb = future_motion_emb + 2* t_latent
+        #future_motion_emb = self.future_after_time_ln(future_motion_emb)
+
         xseq = torch.cat((time_emb,
                           signwriting_emb,
                           past_motion_emb,
