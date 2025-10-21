@@ -111,10 +111,25 @@ def _edge_colors_or_palette(edge_colors, num_edges, palette="tab20"):
 def _get_pose_header_from_loader(loader):
     ds = loader.dataset
     base = getattr(ds, "base", None) or getattr(ds, "dataset", None)
-    base = getattr(base, "base", None) or base  # 再解一层常见包装
-    if base is not None and hasattr(base, "header"):
+    base = getattr(base, "base", None) or base
+    # 1) 直接拿数据集上的 header
+    if base is not None and hasattr(base, "header") and base.header is not None:
         return base.header
-    return getattr(ds, "header", None)
+    if hasattr(ds, "header") and ds.header is not None:
+        return ds.header
+    # 2) 兜底：从一个样本里找
+    try:
+        sample = ds[0] if len(ds) > 0 else None
+        if isinstance(sample, dict):
+            meta = sample.get("metadata", {}) or {}
+            # 常见字段名：pose_header / header
+            if "pose_header" in meta and meta["pose_header"] is not None:
+                return meta["pose_header"]
+            if "header" in meta and meta["header"] is not None:
+                return meta["header"]
+    except Exception:
+        pass
+    return None
 
 
 def unnormalize_btjc(x_btjc, header):
@@ -142,7 +157,7 @@ def unnormalize_btjc(x_btjc, header):
 def visualize_pose_components(
     pred_btjc, gt_btjc, header,
     save_path="logs/free_run_posefmt.gif",
-    fps=12, show_points=True, trail=0, annotate_indices=False
+    fps=12, show_points=True, trail=0, annotate_indices=True
 ):
     """
     Pred vs GT 并排动画：按组件（body/face/hands...）分色；支持残影与关节编号标注。
