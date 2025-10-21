@@ -40,12 +40,16 @@ def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5)
     plt.savefig(save_path)
     plt.close()
 
+
 def _get_pose_header_from_loader(loader):
     ds = loader.dataset
     base = getattr(ds, "base", None) or getattr(ds, "dataset", None)
+    # 多解一层常见包装（如 FilteredDataset -> base）
+    base = getattr(base, "base", None) or base
     if base is not None and hasattr(base, "header"):
         return base.header
     return getattr(ds, "header", None)
+
 
 def unnormalize_btjc(x_btjc, header):
     """
@@ -68,6 +72,7 @@ def unnormalize_btjc(x_btjc, header):
         trans = torch.tensor(ni.translation, dtype=x.dtype).view(1, 1, 1, -1)
         return x * scale + trans
     return x
+
 
 def visualize_with_pose_format(pred_btjc, gt_btjc, header, save_path="logs/free_run_posefmt.gif", fps=10):
     """
@@ -157,6 +162,7 @@ class FilteredDataset(Dataset):
     def __getitem__(self, i):
         return self.base[self.idx[i]]
 
+
 def _as_dense_cpu_btjc(x):
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
@@ -166,6 +172,7 @@ def _as_dense_cpu_btjc(x):
     if x.dim() == 5:
         x = x[:, :, 0, ...]
     return x
+
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
@@ -213,7 +220,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("[WARN] on_fit_end() failed:", e)
 
-    # Inference on 1 example for visual check
+    # ============ Inference on 1 example for visual check ============
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
@@ -231,15 +238,16 @@ if __name__ == "__main__":
             target_mask=mask_bt,
         )
 
-        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)[0]  # [T,J,C]
-        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)[0]    # [T,J,C]
+        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)  # [1,T,J,C]
+        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)    # [1,T,J,C]
 
-        def frame_disp_cpu(x):  # x: [T,J,C]
+        def frame_disp_cpu(x_btjc):  # x: [1,T,J,C]
+            x = x_btjc[0]
             if x.size(0) < 2: return 0.0
             dx = x[1:, :, :2] - x[:-1, :, :2]
             return dx.abs().mean().item()
 
-        Tf = gen_btjc_cpu.size(0)
+        Tf = gen_btjc_cpu.size(1)
         mv_pred = frame_disp_cpu(gen_btjc_cpu)
         mv_gt   = frame_disp_cpu(fut_gt_cpu)
         print(f"[GEN] Tf={Tf}, mean|Δpred|={mv_pred:.4f}, mean|Δgt|={mv_gt:.4f}", flush=True)
@@ -251,16 +259,23 @@ if __name__ == "__main__":
             print("[Free-run] DTW eval skipped:", e)
 
         os.makedirs("logs", exist_ok=True)
-        torch.save({"gen": gen_btjc_cpu, "gt": fut_gt_cpu}, "logs/free_run.pt")
+        torch.save({"gen": gen_btjc_cpu[0], "gt": fut_gt_cpu[0]}, "logs/free_run.pt")
         print("Saved free-run sequences to logs/free_run.pt", flush=True)
 
         header = _get_pose_header_from_loader(train_loader)
-        gen_unnorm = unnormalize_btjc(gen_btjc_cpu.unsqueeze(0), header)  # [1,T,J,C]
-        gt_unnorm  = unnormalize_btjc(fut_gt_cpu.unsqueeze(0),  header)   # [1,T,J,C]
-        visualize_with_pose_format(gen_unnorm, gt_unnorm, header,
-                                   save_path="logs/free_run_posefmt.gif", fps=10c_cpu, "gt": fut_gt_cpu}, "logs/free_run.pt")
-        print("Saved free-run sequences to logs/free_run.pt", flush=True)
+        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
+        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
+        # —— 修复过的调用行（只修这里） ——
+        visualize_with_pose_format(
+            pred_btjc=gen_unnorm,
+            gt_btjc=gt_unnorm,
+            header=header,
+            save_path="logs/free_run_posefmt.gif",
+            fps=10,
+        )
+
+        # 可选：简单散点动画（原样保留）
         fig, ax = plt.subplots(figsize=(5, 5))
         sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
         sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT",        alpha=0.35, animated=True)
@@ -282,13 +297,13 @@ if __name__ == "__main__":
             return sc_pred, sc_gt
 
         def _update(f):
-            ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu)}")
-            sc_pred.set_offsets(gen_btjc_cpu[f, :, :2].numpy())
-            sc_gt.set_offsets(  fut_gt_cpu[f,   :, :2].numpy())
+            ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu[0])}")
+            sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
+            sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
             return sc_pred, sc_gt
 
         ani = animation.FuncAnimation(
-            fig, _update, frames= max(1, len(gen_btjc_cpu)),
+            fig, _update, frames=max(1, len(gen_btjc_cpu[0])),
             init_func=_init, interval=100, blit=True
         )
         ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
