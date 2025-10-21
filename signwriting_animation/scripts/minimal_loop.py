@@ -41,11 +41,77 @@ def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5)
     plt.close()
 
 
+def _parse_components_from_header(header):
+    """
+    返回一个组件列表 comps，每个元素形如：
+      {
+        "name": "body"/"face"/"lh"/"rh"/...，
+        "edges": [(a,b), ...],            # 已加上全局 joint offset
+        "edge_colors": [(r,g,b,a) or None] * len(edges),
+        "j_range": (start, end),          # 该组件在全局 joint 下标范围（左闭右开）
+      }
+    如果 header 只有一个 skeleton，则作为一个组件返回。
+    """
+    comps = []
+    if header is None:
+        return comps
+
+    def _safe_edges_and_colors(sk):
+        e = [(int(a), int(b)) for a, b in (getattr(sk, "edges", []) or [])]
+        c = getattr(sk, "edge_colors", None)
+        if c and len(c) == len(e):
+            c = [tuple(cc) for cc in c]
+        else:
+            c = [None] * len(e)
+        return e, c
+
+    # 情况 1：单一 skeleton
+    sk = getattr(header, "skeleton", None)
+    if sk is not None and getattr(sk, "edges", None):
+        e, c = _safe_edges_and_colors(sk)
+        j_end = getattr(header, "num_joints", None)
+        if j_end is None:
+            j_end = (max([max(a, b) for a, b in e]) + 1) if e else 0
+        comps.append({
+            "name": getattr(sk, "name", "pose").lower(),
+            "edges": e,
+            "edge_colors": c,
+            "j_range": (0, j_end),
+        })
+        return comps
+
+    # 情况 2：多组件（常见于 body/face/hands）
+    header_comps = getattr(header, "components", None) or []
+    for comp in header_comps:
+        comp_sk = getattr(comp, "skeleton", None)
+        if comp_sk is None:
+            continue
+        offset = int(getattr(comp, "offset", 0))
+        e, c = _safe_edges_and_colors(comp_sk)
+        e = [(a + offset, b + offset) for a, b in e]
+        name = getattr(comp, "name", None) or getattr(comp_sk, "name", None) or f"comp@{offset}"
+        j_end = (max([max(a, b) for a, b in e]) + 1) if e else offset
+        comps.append({
+            "name": name.lower(),
+            "edges": e,
+            "edge_colors": c,
+            "j_range": (offset, j_end),
+        })
+    return comps
+
+
+def _edge_colors_or_palette(edge_colors, num_edges, palette="tab20"):
+    """header 提供就用；没有就用 matplotlib 调色盘循环。"""
+    if edge_colors and len(edge_colors) == num_edges and all(c is not None for c in edge_colors):
+        return edge_colors
+    cmap = plt.get_cmap(palette)
+    return [cmap(i % cmap.N) for i in range(num_edges)]
+
+
 def _get_pose_header_from_loader(loader):
     ds = loader.dataset
     base = getattr(ds, "base", None) or getattr(ds, "dataset", None)
-    # 多解一层常见包装（如 FilteredDataset -> base）
-    base = getattr(base, "base", None) or base
+    base = getattr(base, "base", None) or base  # 再解一层常见包装
     if base is not None and hasattr(base, "header"):
         return base.header
     return getattr(ds, "header", None)
@@ -55,54 +121,57 @@ def unnormalize_btjc(x_btjc, header):
     """
     Inverse normalization using pose-format header if available.
     x_btjc: [B,T,J,C] float CPU tensor.
-    If no info exists, returns input as-is.
     """
     x = x_btjc.detach().float().cpu()
     if header is None or not hasattr(header, "normalization_info") or header.normalization_info is None:
         return x
     ni = header.normalization_info
-    # Try mean/std pattern
-    if hasattr(ni, "mean") and hasattr(ni, "std") and ni.mean is not None and ni.std is not None:
-        mean = torch.tensor(ni.mean, dtype=x.dtype).view(1, 1, 1, -1)   # [1,1,1,C]
+    # mean/std
+    if getattr(ni, "mean", None) is not None and getattr(ni, "std", None) is not None:
+        mean = torch.tensor(ni.mean, dtype=x.dtype).view(1, 1, 1, -1)
         std  = torch.tensor(ni.std,  dtype=x.dtype).view(1, 1, 1, -1)
         return x * std + mean
-    # Try scale/translation pattern
-    if hasattr(ni, "scale") and hasattr(ni, "translation") and ni.scale is not None and ni.translation is not None:
+    # scale/translation
+    if getattr(ni, "scale", None) is not None and getattr(ni, "translation", None) is not None:
         scale = torch.tensor(ni.scale, dtype=x.dtype).view(1, 1, 1, -1)
         trans = torch.tensor(ni.translation, dtype=x.dtype).view(1, 1, 1, -1)
         return x * scale + trans
     return x
 
 
-def visualize_with_pose_format(pred_btjc, gt_btjc, header, save_path="logs/free_run_posefmt.gif", fps=10):
+def visualize_pose_components(
+    pred_btjc, gt_btjc, header,
+    save_path="logs/free_run_posefmt.gif",
+    fps=12, show_points=True, trail=0, annotate_indices=False
+):
     """
-    Render side-by-side animation using pose-format skeleton edges & colors.
-    pred_btjc, gt_btjc: [1,T,J,C] CPU tensors.
+    Pred vs GT 并排动画：按组件（body/face/hands...）分色；支持残影与关节编号标注。
+    传入 pred_btjc / gt_btjc 应为 UNnormalized 的 [1,T,J,C] CPU tensor。
     """
-    import matplotlib.pyplot as plt
-    from matplotlib import animation
-
     pred = pred_btjc[0].numpy()  # [T,J,C]
-    gt   = gt_btjc[0].numpy()    # [T,J,C]
-    T, J, C = pred.shape
+    gt   = gt_btjc[0].numpy()
+    T, J, _ = pred.shape
 
-    edges, colors = [], []
-    if header is not None and hasattr(header, "skeleton") and header.skeleton is not None:
-        sk = header.skeleton
-        if hasattr(sk, "edges") and sk.edges is not None:
-            edges = [(int(a), int(b)) for a, b in sk.edges]
-        if hasattr(sk, "edge_colors") and sk.edge_colors is not None:
-            colors = [tuple(c) for c in sk.edge_colors]
-    if not edges:
-        edges = [(i, i + 1) for i in range(min(J - 1, 20))]
-        colors = [(0.5, 0.5, 0.5)] * len(edges)
+    # 组件解析
+    comps = _parse_components_from_header(header)
+    used_fallback = False
+    if not comps:
+        used_fallback = True
+        n = max(0, min(J - 1, 20))
+        edges = [(i, i + 1) for i in range(n)]
+        comps = [{
+            "name": "fallback",
+            "edges": edges,
+            "edge_colors": [(0.5, 0.5, 0.5, 1.0)] * len(edges),
+            "j_range": (0, J),
+        }]
 
-    # Axis limits from both sequences
+    # 坐标范围
     xy = np.concatenate([pred[..., :2].reshape(-1, 2), gt[..., :2].reshape(-1, 2)], axis=0)
     x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
     pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
 
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.5), sharex=True, sharey=True)
     ax_pred, ax_gt = axes
     for ax, title in [(ax_pred, "Predicted (unnormalized)"), (ax_gt, "Ground Truth (unnormalized)")]:
         ax.set_title(title)
@@ -111,32 +180,123 @@ def visualize_with_pose_format(pred_btjc, gt_btjc, header, save_path="logs/free_
         ax.set_ylim(y_min - pad, y_max + pad)
         ax.axis("off")
 
-    # line artists
-    pred_lines = [ax_pred.plot([], [], lw=2, color=colors[i % len(colors)])[0] for i in range(len(edges))]
-    gt_lines   = [ax_gt.plot([],   [], lw=2, color=colors[i % len(colors)])[0] for i in range(len(edges))]
+    # artists 容器
+    artists_pred, artists_gt = [], []
+    legend_handles = []
+    # 文字标注对象（可选）
+    idx_text_pred = idx_text_gt = None
+    if annotate_indices:
+        idx_text_pred = [ax_pred.text(0, 0, "", fontsize=6, ha="center", va="center") for _ in range(J)]
+        idx_text_gt   = [ax_gt.text(0, 0, "", fontsize=6, ha="center", va="center") for _ in range(J)]
 
-    def _set_lines(lines, pose_xy):
+    for comp in comps:
+        name  = comp["name"]
+        edges = comp["edges"]
+        colors = _edge_colors_or_palette(comp.get("edge_colors"), len(edges))
+
+        # 当前帧线
+        pred_lines = [ax_pred.plot([], [], lw=2, color=colors[i])[0] for i in range(len(edges))]
+        gt_lines   = [ax_gt.plot([],   [], lw=2, color=colors[i])[0] for i in range(len(edges))]
+
+        # 残影
+        pred_trails, gt_trails = [], []
+        if trail > 0:
+            alpha_step = 0.6 / max(1, trail)
+            for k in range(trail):
+                fade = 0.4 + alpha_step * (trail - 1 - k)
+                pred_trails.append([ax_pred.plot([], [], lw=1, color=(*colors[i][:3], fade))[0]
+                                    for i in range(len(edges))])
+                gt_trails.append([ax_gt.plot([], [], lw=1, color=(*colors[i][:3], fade))[0]
+                                  for i in range(len(edges))])
+
+        # 关节点散点
+        pred_pts = gt_pts = None
+        if show_points:
+            pred_pts = ax_pred.scatter([], [], s=10, label=name)
+            gt_pts   = ax_gt.scatter([], [], s=10)
+
+        artists_pred.append((pred_lines, pred_trails, pred_pts, edges))
+        artists_gt.append((gt_lines,   gt_trails,   gt_pts,   edges))
+
+        # 图例（左图）
+        handle = ax_pred.scatter([], [], s=20, color=colors[0], label=name) if show_points \
+                 else ax_pred.plot([], [], lw=2, color=colors[0], label=name)[0]
+        legend_handles.append(handle)
+
+    if legend_handles:
+        ax_pred.legend(handles=legend_handles, loc="upper left", frameon=False, fontsize=9)
+
+    # ------- 内部工具 -------
+
+    def _set_current_lines(line_list, edges, pose_xy):
         for k, (a, b) in enumerate(edges):
             xa, ya = pose_xy[a, 0], pose_xy[a, 1]
             xb, yb = pose_xy[b, 0], pose_xy[b, 1]
-            lines[k].set_data([xa, xb], [ya, yb])
+            line_list[k].set_data([xa, xb], [ya, yb])
+
+    def _set_trails(trails_lists, edges, pose_xy_hist):  # pose_xy_hist: [trail, J, 2]
+        if not trails_lists: return
+        trail_len = min(len(trails_lists), len(pose_xy_hist))
+        for t in range(trail_len):
+            for k, (a, b) in enumerate(edges):
+                xa, ya = pose_xy_hist[t][a, 0], pose_xy_hist[t][a, 1]
+                xb, yb = pose_xy_hist[t][b, 0], pose_xy_hist[t][b, 1]
+                trails_lists[t][k].set_data([xa, xb], [ya, yb])
+
+    def _set_points(scatter_obj, pose_xy):
+        if scatter_obj is not None:
+            scatter_obj.set_offsets(pose_xy)
+
+    def _set_indices(text_objs, pose_xy):
+        if text_objs is None: return
+        for j, txt in enumerate(text_objs):
+            x, y = pose_xy[j, 0], pose_xy[j, 1]
+            txt.set_position((x, y))
+            txt.set_text(str(j))
+
+    pred_xy = pred[:, :, :2]
+    gt_xy   = gt[:,   :, :2]
 
     def _init():
-        _set_lines(pred_lines, pred[0, :, :2])
-        _set_lines(gt_lines,   gt[0,   :, :2])
-        return pred_lines + gt_lines
+        for (pl, ptrails, ppts, pedges), (gl, gtrails, gpts, gedges) in zip(artists_pred, artists_gt):
+            _set_current_lines(pl, pedges, pred_xy[0])
+            _set_current_lines(gl, gedges, gt_xy[0])
+            _set_points(ppts, pred_xy[0])
+            _set_points(gpts, gt_xy[0])
+        _set_indices(idx_text_pred, pred_xy[0])
+        _set_indices(idx_text_gt,   gt_xy[0])
+        return sum([[*ap[0], *sum(ap[1], []), ap[2]] for ap in artists_pred], []) + \
+               sum([[*ag[0], *sum(ag[1], []), ag[2]] for ag in artists_gt], []) + \
+               (idx_text_pred or []) + (idx_text_gt or [])
 
-    def _update(tidx):
-        _set_lines(pred_lines, pred[tidx, :, :2])
-        _set_lines(gt_lines,   gt[tidx,   :, :2])
-        return pred_lines + gt_lines
+    def _update(t):
+        for (pl, ptrails, ppts, pedges), (gl, gtrails, gpts, gedges) in zip(artists_pred, artists_gt):
+            _set_current_lines(pl, pedges, pred_xy[t])
+            _set_current_lines(gl, gedges, gt_xy[t])
+            _set_points(ppts, pred_xy[t])
+            _set_points(gpts, gt_xy[t])
+            if trail > 0 and t > 0:
+                hist_idx = list(range(max(0, t - trail), t))[::-1]
+                _set_trails(ptrails, pedges, pred_xy[hist_idx])
+                _set_trails(gtrails, gedges, gt_xy[hist_idx])
+        _set_indices(idx_text_pred, pred_xy[t])
+        _set_indices(idx_text_gt,   gt_xy[t])
+        return sum([[*ap[0], *sum(ap[1], []), ap[2]] for ap in artists_pred], []) + \
+               sum([[*ag[0], *sum(ag[1], []), ag[2]] for ag in artists_gt], []) + \
+               (idx_text_pred or []) + (idx_text_gt or [])
 
-    ani = animation.FuncAnimation(fig, _update, frames=T, init_func=_init,
-                                  interval=1000 // max(1, fps), blit=True)
+    ani = animation.FuncAnimation(
+        fig, _update, frames=T, init_func=_init,
+        interval=max(1, int(1000 / max(1, fps))), blit=True
+    )
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     ani.save(save_path, writer="pillow", fps=fps)
     plt.close(fig)
-    print(f"[viz] saved pose-format-style animation to {save_path}")
+    comp_names = ",".join([c["name"] for c in comps])
+    print(f"[viz] components={len(comps)} [{comp_names}], fallback={used_fallback} -> {save_path}")
+
+
+# -------------------- dataset & training (保持不变) --------------------
 
 class FilteredDataset(Dataset):
     """Subset of valid samples for minimal overfit test."""
@@ -266,16 +426,14 @@ if __name__ == "__main__":
         gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
         gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
-        # —— 修复过的调用行（只修这里） ——
-        visualize_with_pose_format(
-            pred_btjc=gen_unnorm,
-            gt_btjc=gt_unnorm,
-            header=header,
+        # —— 新版可视化（注意括号缩进） ——
+        visualize_pose_components(
+            gen_unnorm, gt_unnorm, header,
             save_path="logs/free_run_posefmt.gif",
-            fps=10,
+            fps=12, show_points=True, trail=3, annotate_indices=False
         )
 
-        # 可选：简单散点动画（原样保留）
+        # 可选：简单散点动画（保留）
         fig, ax = plt.subplots(figsize=(5, 5))
         sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
         sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT",        alpha=0.35, animated=True)
@@ -291,20 +449,20 @@ if __name__ == "__main__":
         ax.set_xlim(x_min - pad, x_max + pad)
         ax.set_ylim(y_min - pad, y_max + pad)
 
-        def _init():
+        def _init_scatter():
             sc_pred.set_offsets(np.empty((0, 2)))
             sc_gt.set_offsets(np.empty((0, 2)))
             return sc_pred, sc_gt
 
-        def _update(f):
+        def _update_scatter(f):
             ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu[0])}")
             sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
             sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
             return sc_pred, sc_gt
 
         ani = animation.FuncAnimation(
-            fig, _update, frames=max(1, len(gen_btjc_cpu[0])),
-            init_func=_init, interval=100, blit=True
+            fig, _update_scatter, frames=max(1, len(gen_btjc_cpu[0])),
+            init_func=_init_scatter, interval=100, blit=True
         )
         ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
         plt.close(fig)
