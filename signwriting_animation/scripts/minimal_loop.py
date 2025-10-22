@@ -9,7 +9,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from torch.utils.data import DataLoader, Dataset
-
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.pose_visualizer import PoseVisualizer
@@ -17,7 +16,6 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
-
 
 def _to_plain_tensor(x):
     if hasattr(x, "tensor"):
@@ -32,11 +30,12 @@ def _as_dense_cpu_btjc(x):
     if getattr(x, "is_sparse", False):
         x = x.to_dense()
     x = x.detach().float().cpu().contiguous()
-    if x.dim() == 5:  # [B,T,P,J,C]
+    if x.dim() == 5:  # [B,T,P,J,C] -> 取 P=0
         x = x[:, :, 0, ...]
     return x
 
 def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5):
+    """原有简易散点轨迹，保留。"""
     seq = _to_plain_tensor(seq_btjc)[0]  # [T,J,C]
     T, J, C = seq.shape
     plt.figure(figsize=(5, 5))
@@ -53,7 +52,7 @@ def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5)
 def _get_pose_header_from_loader(loader):
     """尽量从 dataloader/dataset 链条里拿 header；拿不到返回 None。"""
     ds = loader.dataset
-    # 解最多两层包装（FilteredDataset -> base -> dataset）
+    # 解最多 3 层包装（FilteredDataset -> base -> dataset）
     for _ in range(3):
         if hasattr(ds, "header") and ds.header is not None:
             return ds.header
@@ -92,6 +91,7 @@ def _probe_header_from_csv(csv_path, data_dir):
     return None
 
 def unnormalize_btjc(x_btjc, header):
+    """根据 header.normalization_info 做反归一化。"""
     x = x_btjc.detach().float().cpu()
     if header is None or not hasattr(header, "normalization_info") or header.normalization_info is None:
         return x
@@ -106,13 +106,28 @@ def unnormalize_btjc(x_btjc, header):
         return x * scale + trans
     return x
 
+def print_header_info(header):
+    """调试：打印 header 关键字段。"""
+    if header is None:
+        print("[header] is None")
+        return
+    sk = getattr(header, "skeleton", None)
+    comps = getattr(header, "components", None) or []
+    print("[header] has_skeleton =", sk is not None)
+    if sk is not None:
+        n_edges = len(getattr(sk, "edges", []) or [])
+        num_j = getattr(sk, "num_joints", None)
+        print(f"[header] skeleton edges: {n_edges}, num_joints: {num_j}")
+    print(f"[header] components: {len(comps)}",
+          [getattr(c, "name", f"comp{i}") for i, c in enumerate(comps)])
+
 
 # =========================
-# pose-format 官方可视化
+# pose-format 官方可视化（Pred/GT 各导一张 GIF）
 # =========================
 def btjc_to_pose(x_btjc, header, fps=25):
     """x_btjc: [1,T,J,C]（已 unnormalize, CPU）→ Pose（NumPy 后端）"""
-    x = x_btjc[0].detach().cpu().numpy()                  # [T,J,C]
+    x = x_btjc[0].detach().cpu().numpy()                        # [T,J,C]
     conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T,J]
     body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
@@ -130,12 +145,45 @@ def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
     viz_gt.save_gif(gt_path,     viz_gt.draw())
     print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
+def align_to_header_joints(x_btjc, header):
+    """
+    确保 x_btjc 的 J 与 header 的 J 一致；多了就截取，少了返回 None（交给 fallback）。
+    仅影响可视化，不影响训练。
+    """
+    x_btjc = x_btjc.clone()
+    J_pred = x_btjc.size(2)
+    # 估 header 的 J
+    J_h = None
+    sk = getattr(header, "skeleton", None)
+    if sk is not None and hasattr(sk, "num_joints"):
+        J_h = int(sk.num_joints)
+    if J_h is None:
+        comps = getattr(header, "components", None) or []
+        if comps:
+            last_end = 0
+            for comp in comps:
+                off = int(getattr(comp, "offset", 0))
+                skc = getattr(comp, "skeleton", None)
+                if skc is not None and hasattr(skc, "edges"):
+                    mx = 0
+                    for a, b in (skc.edges or []):
+                        mx = max(mx, int(a), int(b))
+                    last_end = max(last_end, off + mx + 1)
+            J_h = last_end if last_end > 0 else None
+    if J_h is None:
+        return None
+    if J_pred == J_h:
+        return x_btjc
+    if J_pred > J_h:
+        return x_btjc[:, :, :J_h, :]
+    return None  # J_pred < J_h 无法补点，放弃对齐
+
 
 # =========================
-# fallback 可视化（无 header）
+# fallback 可视化（无 header 时兜底）
 # =========================
 def visualize_pose_components_fallback(pred_btjc, gt_btjc, save_path="logs/free_run_posefmt_fallback.gif",
-                                       fps=12, show_points=True, trail=0):
+                                       fps=12, show_points=True):
     pred = pred_btjc[0].numpy()
     gt   = gt_btjc[0].numpy()
     T, J, _ = pred.shape
@@ -162,10 +210,10 @@ def visualize_pose_components_fallback(pred_btjc, gt_btjc, save_path="logs/free_
             lines[k].set_data([xa, xb], [ya, yb])
         if pts is not None: pts.set_offsets(pose_xy)
     def _init():
-        _set(pln, pp, pred[0, :, :2]); _set(gln, gp, gt[0, :, :2]); 
+        _set(pln, pp, pred[0, :, :2]); _set(gln, gp, gt[0, :, :2])
         return pln + gln + ([pp] if pp is not None else []) + ([gp] if gp is not None else [])
     def _update(t):
-        _set(pln, pp, pred[t, :, :2]); _set(gln, gp, gt[t, :, :2]); 
+        _set(pln, pp, pred[t, :, :2]); _set(gln, gp, gt[t, :, :2])
         return pln + gln + ([pp] if pp is not None else []) + ([gp] if gp is not None else [])
     ani = animation.FuncAnimation(fig, _update, frames=T, init_func=_init,
                                   interval=max(1, int(1000 / max(1, fps))), blit=True)
@@ -175,9 +223,10 @@ def visualize_pose_components_fallback(pred_btjc, gt_btjc, save_path="logs/free_
 
 
 # =========================
-# dataset / loader（不动）
+# Dataset / Loader（保持原样）
 # =========================
 class FilteredDataset(Dataset):
+    """Subset of valid samples for minimal overfit test."""
     def __init__(self, base: Dataset, target_count=4, max_scan=500):
         self.base = base
         self.idx = []
@@ -208,7 +257,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
 
 
 # =========================
-# main（训练 & 可视化）
+# main（训练 & 可视化）—— 训练配置等保持不变
 # =========================
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
@@ -289,32 +338,32 @@ if __name__ == "__main__":
         header = _get_pose_header_from_loader(train_loader)
         if header is None or getattr(header, "skeleton", None) is None:
             header = _probe_header_from_csv(csv_path, data_dir)
-        print("[header] has_skeleton =", bool(header and getattr(header, "skeleton", None) is not None))
+        print_header_info(header)
 
-        # 反归一化后再可视化
         gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
         gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
-        if header is not None and getattr(header, "skeleton", None) is not None:
+        gen_aligned = align_to_header_joints(gen_unnorm, header) if header is not None else None
+        gt_aligned  = align_to_header_joints(gt_unnorm,  header) if header is not None else None
+
+        if (header is not None and getattr(header, "skeleton", None) is not None
+                and gen_aligned is not None and gt_aligned is not None):
             save_pose_gifs_with_pose_format(
-                gen_unnorm, gt_unnorm, header,
+                gen_aligned, gt_aligned, header,
                 out_dir="logs", stem="free_run_posefmt", fps=12
             )
         else:
             visualize_pose_components_fallback(
                 gen_unnorm, gt_unnorm, save_path="logs/free_run_posefmt_fallback.gif",
-                fps=12, show_points=True, trail=3
+                fps=12, show_points=True
             )
 
-        # 额外散点动画
         fig, ax = plt.subplots(figsize=(5, 5))
         sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
         sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT", alpha=0.35, animated=True)
         ax.legend(loc="upper right", frameon=False); ax.axis("equal")
-        xy = torch.cat([
-            gen_btjc_cpu[..., :2].reshape(-1, 2),
-            fut_gt_cpu[...,  :2].reshape(-1, 2)
-        ], dim=0).numpy()
+        xy = torch.cat([gen_btjc_cpu[..., :2].reshape(-1, 2),
+                        fut_gt_cpu[...,  :2].reshape(-1, 2)], dim=0).numpy()
         x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
         pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
         ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad)
