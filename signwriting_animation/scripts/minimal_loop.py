@@ -121,10 +121,28 @@ def print_header_info(header):
     print(f"[header] components: {len(comps)}",
           [getattr(c, "name", f"comp{i}") for i, c in enumerate(comps)])
 
+def debug_header_topology(header):
+    if header is None:
+        print("[header-debug] header is None")
+        return
+    comps = getattr(header, "components", None) or []
+    print(f"[header-debug] #components = {len(comps)}")
+    for i, comp in enumerate(comps):
+        name = (getattr(comp, "name", f"comp{i}") or "").upper()
+        off  = int(getattr(comp, "offset", 0))
+        sk   = getattr(comp, "skeleton", None)
+        if sk is None:
+            print(f"  - {name:<24} offset={off:>3}  skeleton=None")
+            continue
+        # joints / edges
+        nj = getattr(sk, "num_joints", None)
+        joints_attr = getattr(sk, "joints", None)
+        if nj is None and joints_attr is not None:
+            try: nj = len(joints_attr)
+            except: nj = None
+        edges = getattr(sk, "edges", None) or []
+        print(f"  - {name:<24} offset={off:>3}  nj={nj}  edges={len(edges)}")
 
-# =========================
-# pose-format 官方可视化（Pred/GT 各导一张 GIF）
-# =========================
 def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
     x = x_btjc[0].detach().cpu().numpy()                        # [T, J, C]
     if conf_btj is None:
@@ -148,10 +166,19 @@ def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
     print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
 def align_to_header_joints(x_btjc, header, ignore_world=False):
+    """
+    仅用于【可视化】的关节数对齐。
+    - 预测 J > 需要的 J_h：截断到前 J_h。
+    - 预测 J < J_h：右侧 0 填充，并将补出的关节 conf=0（PoseVisualizer 会隐藏）。
+    推不出 J_h 时，退回使用 J_pred（保底走 pose-format，而不是 fallback）。
+    返回：x_btjc_aligned [1,T,J_h,C], conf_btj [1,T,J_h]
+    """
     x_btjc = x_btjc.clone()
     B, T, J_pred, C = x_btjc.shape
 
+    # --- 计算 header 目标关节数 J_h（更鲁棒） ---
     sk = getattr(header, "skeleton", None)
+
     def _njoints(skc):
         if skc is None:
             return None
@@ -162,7 +189,6 @@ def align_to_header_joints(x_btjc, header, ignore_world=False):
                 return int(len(skc.joints))
             except Exception:
                 pass
-        # 最后用 edges 推断
         edges = getattr(skc, "edges", None) or []
         m = 0
         for a, b in edges:
@@ -187,7 +213,10 @@ def align_to_header_joints(x_btjc, header, ignore_world=False):
             J_h = total
 
     if J_h is None:
-        return None, None  # 仍推不出，交给上层 fallback
+        J_h = J_pred
+        print(f"[align] WARN: failed to infer J_h from header; fallback to J_pred={J_pred}")
+
+    print(f"[align] J_pred={J_pred}, J_h={J_h}")
 
     if J_pred == J_h:
         conf = torch.ones((B, T, J_h), dtype=torch.float32)
@@ -365,6 +394,9 @@ if __name__ == "__main__":
             header = _probe_header_from_csv(csv_path, data_dir)
         print_header_info(header)
 
+        print_header_info(header)
+        debug_header_topology(header)
+        
         def _has_drawable_topology(h):
             return (h is not None) and (
                 getattr(h, "skeleton", None) is not None or
