@@ -125,10 +125,12 @@ def print_header_info(header):
 # =========================
 # pose-format 官方可视化（Pred/GT 各导一张 GIF）
 # =========================
-def btjc_to_pose(x_btjc, header, fps=25):
-    """x_btjc: [1,T,J,C]（已 unnormalize, CPU）→ Pose（NumPy 后端）"""
-    x = x_btjc[0].detach().cpu().numpy()                        # [T,J,C]
-    conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T,J]
+def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
+    x = x_btjc[0].detach().cpu().numpy()                        # [T, J, C]
+    if conf_btj is None:
+        conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T, J]
+    else:
+        conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)  # [T, J]
     body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
 
@@ -146,21 +148,13 @@ def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
     print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
 def align_to_header_joints(x_btjc, header, ignore_world=True):
-    """
-    仅用于【可视化】的关节数对齐：
-    - 从 header.skeleton 或 header.components 推断需要的 J_h
-    - 预测 J > J_h 时截断到前 J_h；预测 J < J_h 返回 None（交给 fallback）
-    - ignore_world=True 时会忽略 '...WORLD...' 组件（常见于 MediaPipe 的 POSE_WORLD_LANDMARKS）
-    """
     x_btjc = x_btjc.clone()
-    J_pred = x_btjc.size(2)
+    B, T, J_pred, C = x_btjc.shape
 
-    # 1) 直接用全局 skeleton.num_joints
     sk = getattr(header, "skeleton", None)
     if sk is not None and hasattr(sk, "num_joints") and sk.num_joints:
         J_h = int(sk.num_joints)
     else:
-        # 2) 聚合 components：offset + component 内的关节数/最大下标
         J_h = None
         comps = getattr(header, "components", None) or []
         max_end = 0
@@ -172,7 +166,6 @@ def align_to_header_joints(x_btjc, header, ignore_world=True):
             skc = getattr(comp, "skeleton", None)
             if skc is None:
                 continue
-            # 优先 num_joints；没有就从 edges 估计
             if hasattr(skc, "num_joints") and skc.num_joints:
                 end = off + int(skc.num_joints)
             else:
@@ -184,19 +177,26 @@ def align_to_header_joints(x_btjc, header, ignore_world=True):
             J_h = max_end
 
     if J_h is None:
-        return None  # 还是无法推断，交给 fallback
+        return None, None  # 还推不出来，交给上层 fallback
 
     if J_pred == J_h:
-        return x_btjc
+        conf = torch.ones((B, T, J_h), dtype=torch.float32)
+        return x_btjc, conf
+
     if J_pred > J_h:
-        return x_btjc[:, :, :J_h, :]
-    # 预测比 header 少，没法补点
-    return None
+        x_aligned = x_btjc[:, :, :J_h, :].contiguous()
+        conf = torch.ones((B, T, J_h), dtype=torch.float32)
+        return x_aligned, conf
+
+    pad = J_h - J_pred
+    x_pad = torch.zeros((B, T, pad, C), dtype=x_btjc.dtype)
+    x_aligned = torch.cat([x_btjc, x_pad], dim=2).contiguous()
+    conf = torch.ones((B, T, J_pred), dtype=torch.float32)
+    conf_pad = torch.zeros((B, T, pad), dtype=torch.float32)
+    conf = torch.cat([conf, conf_pad], dim=2)
+    return x_aligned, conf
 
 
-# =========================
-# fallback 可视化（无 header 时兜底）
-# =========================
 def visualize_pose_components_fallback(pred_btjc, gt_btjc, save_path="logs/free_run_posefmt_fallback.gif",
                                        fps=12, show_points=True):
     pred = pred_btjc[0].numpy()
@@ -351,15 +351,9 @@ if __name__ == "__main__":
 
         # ---- header（先 loader，后 CSV）----
         header = _get_pose_header_from_loader(train_loader)
-        if header is None or getattr(header, "skeleton", None) is None:
+        if header is None or (getattr(header, "skeleton", None) is None and not getattr(header, "components", None)):
             header = _probe_header_from_csv(csv_path, data_dir)
         print_header_info(header)
-
-        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
-        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
-
-        gen_aligned = align_to_header_joints(gen_unnorm, header) if header is not None else None
-        gt_aligned  = align_to_header_joints(gt_unnorm,  header) if header is not None else None
 
         def _has_drawable_topology(h):
             return (h is not None) and (
@@ -367,14 +361,23 @@ if __name__ == "__main__":
                 (len(getattr(h, "components", None) or []) > 0)
             )
 
-        gen_aligned = align_to_header_joints(gen_unnorm, header) if header is not None else None
-        gt_aligned  = align_to_header_joints(gt_unnorm,  header) if header is not None else None
+        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
+        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
-        if _has_drawable_topology(header) and gen_aligned is not None and gt_aligned is not None:
-            save_pose_gifs_with_pose_format(
-                gen_aligned, gt_aligned, header,
-                out_dir="logs", stem="free_run_posefmt", fps=12
-            )
+        # 2) 与 header 对齐（不足则补 0，conf=0；多则截断）
+        gen_aligned, gen_conf = align_to_header_joints(gen_unnorm, header) if header is not None else (None, None)
+        gt_aligned,  gt_conf  = align_to_header_joints(gt_unnorm,  header) if header is not None else (None, None)
+
+        # 3) 只要 header 有拓扑且能对齐，就用 pose-format 可视化；否则 fallback
+        if _has_drawable_topology(header) and (gen_aligned is not None) and (gt_aligned is not None):
+            pred_pose = btjc_to_pose(gen_aligned, header, fps=12, conf_btj=gen_conf)
+            gt_pose   = btjc_to_pose(gt_aligned,  header, fps=12, conf_btj=gt_conf)
+            viz_pred = PoseVisualizer(pred_pose)
+            viz_gt   = PoseVisualizer(gt_pose)
+            os.makedirs("logs", exist_ok=True)
+            viz_pred.save_gif("logs/free_run_posefmt_pred.gif", viz_pred.draw())
+            viz_gt.save_gif("logs/free_run_posefmt_gt.gif",   viz_gt.draw())
+            print("[viz] pose-format GIF saved -> logs/free_run_posefmt_pred.gif / _gt.gif")
         else:
             visualize_pose_components_fallback(
                 gen_unnorm, gt_unnorm, save_path="logs/free_run_posefmt_fallback.gif",
