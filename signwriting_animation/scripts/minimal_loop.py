@@ -11,7 +11,7 @@ from matplotlib import animation
 from torch.utils.data import DataLoader, Dataset
 
 from pose_format import Pose
-from pose_format.torch import TorchPoseBody
+from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.torch.masked.collator import zero_pad_collator
 
@@ -118,9 +118,13 @@ def unnormalize_btjc(x_btjc, header):
 # pose-format 官方可视化
 # =========================
 def btjc_to_pose(x_btjc, header, fps=25):
-    """把 [1,T,J,C]（已 unnormalize）组装成 Pose（torch 后端）。"""
-    assert x_btjc.ndim == 4 and x_btjc.size(0) == 1
-    body = TorchPoseBody(data=x_btjc[0], confidence=None, fps=fps)  # x: [T,J,C]
+    """
+    x_btjc: [1, T, J, C] (已 unnormalize, CPU tensor)
+    返回 pose-format 的 Pose（NumPy 后端）
+    """
+    x = x_btjc[0].detach().cpu().numpy()                  # [T, J, C]
+    conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T, J]
+    body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
 
 def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
