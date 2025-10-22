@@ -145,38 +145,53 @@ def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
     viz_gt.save_gif(gt_path,     viz_gt.draw())
     print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
-def align_to_header_joints(x_btjc, header):
+def align_to_header_joints(x_btjc, header, ignore_world=True):
     """
-    确保 x_btjc 的 J 与 header 的 J 一致；多了就截取，少了返回 None（交给 fallback）。
-    仅影响可视化，不影响训练。
+    仅用于【可视化】的关节数对齐：
+    - 从 header.skeleton 或 header.components 推断需要的 J_h
+    - 预测 J > J_h 时截断到前 J_h；预测 J < J_h 返回 None（交给 fallback）
+    - ignore_world=True 时会忽略 '...WORLD...' 组件（常见于 MediaPipe 的 POSE_WORLD_LANDMARKS）
     """
     x_btjc = x_btjc.clone()
     J_pred = x_btjc.size(2)
-    # 估 header 的 J
-    J_h = None
+
+    # 1) 直接用全局 skeleton.num_joints
     sk = getattr(header, "skeleton", None)
-    if sk is not None and hasattr(sk, "num_joints"):
+    if sk is not None and hasattr(sk, "num_joints") and sk.num_joints:
         J_h = int(sk.num_joints)
-    if J_h is None:
+    else:
+        # 2) 聚合 components：offset + component 内的关节数/最大下标
+        J_h = None
         comps = getattr(header, "components", None) or []
-        if comps:
-            last_end = 0
-            for comp in comps:
-                off = int(getattr(comp, "offset", 0))
-                skc = getattr(comp, "skeleton", None)
-                if skc is not None and hasattr(skc, "edges"):
-                    mx = 0
-                    for a, b in (skc.edges or []):
-                        mx = max(mx, int(a), int(b))
-                    last_end = max(last_end, off + mx + 1)
-            J_h = last_end if last_end > 0 else None
+        max_end = 0
+        for comp in comps:
+            name = (getattr(comp, "name", "") or "").upper()
+            if ignore_world and "WORLD" in name:
+                continue
+            off = int(getattr(comp, "offset", 0))
+            skc = getattr(comp, "skeleton", None)
+            if skc is None:
+                continue
+            # 优先 num_joints；没有就从 edges 估计
+            if hasattr(skc, "num_joints") and skc.num_joints:
+                end = off + int(skc.num_joints)
+            else:
+                end = off
+                for a, b in (getattr(skc, "edges", None) or []):
+                    end = max(end, off + int(a) + 1, off + int(b) + 1)
+            max_end = max(max_end, end)
+        if max_end > 0:
+            J_h = max_end
+
     if J_h is None:
-        return None
+        return None  # 还是无法推断，交给 fallback
+
     if J_pred == J_h:
         return x_btjc
     if J_pred > J_h:
         return x_btjc[:, :, :J_h, :]
-    return None  # J_pred < J_h 无法补点，放弃对齐
+    # 预测比 header 少，没法补点
+    return None
 
 
 # =========================
@@ -346,8 +361,16 @@ if __name__ == "__main__":
         gen_aligned = align_to_header_joints(gen_unnorm, header) if header is not None else None
         gt_aligned  = align_to_header_joints(gt_unnorm,  header) if header is not None else None
 
-        if (header is not None and getattr(header, "skeleton", None) is not None
-                and gen_aligned is not None and gt_aligned is not None):
+        def _has_drawable_topology(h):
+            return (h is not None) and (
+                getattr(h, "skeleton", None) is not None or
+                (len(getattr(h, "components", None) or []) > 0)
+            )
+
+        gen_aligned = align_to_header_joints(gen_unnorm, header) if header is not None else None
+        gt_aligned  = align_to_header_joints(gt_unnorm,  header) if header is not None else None
+
+        if _has_drawable_topology(header) and gen_aligned is not None and gt_aligned is not None:
             save_pose_gifs_with_pose_format(
                 gen_aligned, gt_aligned, header,
                 out_dir="logs", stem="free_run_posefmt", fps=12
