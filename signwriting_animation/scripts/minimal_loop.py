@@ -147,37 +147,47 @@ def save_pose_gifs_with_pose_format(pred_btjc, gt_btjc, header,
     viz_gt.save_gif(gt_path,     viz_gt.draw())
     print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
-def align_to_header_joints(x_btjc, header, ignore_world=True):
+def align_to_header_joints(x_btjc, header, ignore_world=False):
     x_btjc = x_btjc.clone()
     B, T, J_pred, C = x_btjc.shape
 
     sk = getattr(header, "skeleton", None)
-    if sk is not None and hasattr(sk, "num_joints") and sk.num_joints:
-        J_h = int(sk.num_joints)
-    else:
-        J_h = None
+    def _njoints(skc):
+        if skc is None:
+            return None
+        if hasattr(skc, "num_joints") and skc.num_joints:
+            return int(skc.num_joints)
+        if hasattr(skc, "joints") and skc.joints is not None:
+            try:
+                return int(len(skc.joints))
+            except Exception:
+                pass
+        # 最后用 edges 推断
+        edges = getattr(skc, "edges", None) or []
+        m = 0
+        for a, b in edges:
+            m = max(m, int(a) + 1, int(b) + 1)
+        return m if m > 0 else None
+
+    J_h = None
+    if sk is not None:
+        J_h = _njoints(sk)
+
+    if J_h is None:
         comps = getattr(header, "components", None) or []
-        max_end = 0
+        total = 0
         for comp in comps:
             name = (getattr(comp, "name", "") or "").upper()
             if ignore_world and "WORLD" in name:
                 continue
             off = int(getattr(comp, "offset", 0))
-            skc = getattr(comp, "skeleton", None)
-            if skc is None:
-                continue
-            if hasattr(skc, "num_joints") and skc.num_joints:
-                end = off + int(skc.num_joints)
-            else:
-                end = off
-                for a, b in (getattr(skc, "edges", None) or []):
-                    end = max(end, off + int(a) + 1, off + int(b) + 1)
-            max_end = max(max_end, end)
-        if max_end > 0:
-            J_h = max_end
+            nj = _njoints(getattr(comp, "skeleton", None)) or 0
+            total = max(total, off + nj)
+        if total > 0:
+            J_h = total
 
     if J_h is None:
-        return None, None  # 还推不出来，交给上层 fallback
+        return None, None  # 仍推不出，交给上层 fallback
 
     if J_pred == J_h:
         conf = torch.ones((B, T, J_h), dtype=torch.float32)
@@ -191,9 +201,9 @@ def align_to_header_joints(x_btjc, header, ignore_world=True):
     pad = J_h - J_pred
     x_pad = torch.zeros((B, T, pad, C), dtype=x_btjc.dtype)
     x_aligned = torch.cat([x_btjc, x_pad], dim=2).contiguous()
-    conf = torch.ones((B, T, J_pred), dtype=torch.float32)
-    conf_pad = torch.zeros((B, T, pad), dtype=torch.float32)
-    conf = torch.cat([conf, conf_pad], dim=2)
+    conf_left = torch.ones((B, T, J_pred), dtype=torch.float32)
+    conf_pad  = torch.zeros((B, T, pad),    dtype=torch.float32)
+    conf = torch.cat([conf_left, conf_pad], dim=2)
     return x_aligned, conf
 
 
@@ -365,8 +375,8 @@ if __name__ == "__main__":
         gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
         # 2) 与 header 对齐（不足则补 0，conf=0；多则截断）
-        gen_aligned, gen_conf = align_to_header_joints(gen_unnorm, header) if header is not None else (None, None)
-        gt_aligned,  gt_conf  = align_to_header_joints(gt_unnorm,  header) if header is not None else (None, None)
+        gen_aligned, gen_conf = align_to_header_joints(gen_unnorm, header, ignore_world=False) if header is not None else (None, None)
+        gt_aligned,  gt_conf  = align_to_header_joints(gt_unnorm,  header, ignore_world=False) if header is not None else (None, None)
 
         # 3) 只要 header 有拓扑且能对齐，就用 pose-format 可视化；否则 fallback
         if _has_drawable_topology(header) and (gen_aligned is not None) and (gt_aligned is not None):
