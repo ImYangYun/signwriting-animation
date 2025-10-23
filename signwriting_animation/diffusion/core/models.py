@@ -143,6 +143,11 @@ class SignWritingToPoseDiffusion(nn.Module):
                           future_motion_emb), axis=0)
 
         xseq = self.sequence_pos_encoder(xseq)
+
+        with torch.no_grad():
+            pos_enc_time_std = xseq[-20:].float().std(dim=0).mean().item()
+            print(f"[DBG/model] after_pos_enc time-std={pos_enc_time_std:.6f}", flush=True)
+            
         output = self.seqEncoder(xseq)[-num_frames:]
         with torch.no_grad():
             enc_time_std = output.float().std(dim=0).mean().item()

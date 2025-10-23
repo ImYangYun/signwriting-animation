@@ -225,6 +225,25 @@ if __name__ == "__main__":
     train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers)
     val_loader = train_loader  # same small subset for validation
 
+    print("\n" + "="*60)
+    print("[DATA DEBUG] Checking data shapes...")
+    batch = next(iter(train_loader))
+    print(f"[DATA] batch['data'].shape = {batch['data'].shape}")
+    print(f"[DATA] target_mask.shape = {batch['conditions']['target_mask'].shape}")
+    print(f"[DATA] input_pose.shape = {batch['conditions']['input_pose'].shape}")
+
+    mask = batch['conditions']['target_mask']
+    if hasattr(mask, 'zero_filled'):
+        mask = mask.zero_filled()
+    if mask.dim() == 5:
+        mask_bt = (mask.abs().sum(dim=(2,3,4)) > 0).float()
+    elif mask.dim() == 4:
+        mask_bt = (mask.abs().sum(dim=(2,3)) > 0).float()
+    else:
+        mask_bt = mask.float()
+    print(f"[DATA] mask valid lengths per sample: {mask_bt.sum(dim=1)}")
+    print("="*60 + "\n")
+
     model = LitMinimal(log_dir="logs")
 
     trainer = pl.Trainer(
