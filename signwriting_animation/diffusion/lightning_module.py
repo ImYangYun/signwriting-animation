@@ -194,7 +194,7 @@ class LitMinimal(pl.LightningModule):
             with torch.no_grad():
                 mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
                 print(f"[Step {self.global_step}] mean |Δpred| = {mv:.6f}")
-                
+
         self.train_losses.append(loss.item())
         self.log("train/loss", loss, prog_bar=True, on_step=True)
         return loss
@@ -206,10 +206,11 @@ class LitMinimal(pl.LightningModule):
         mask = self._make_mask_bt(cond["target_mask"])
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        
         T = fut.size(1)
-        t_ramp = self._time_ramp(T, fut.device)
-        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp 
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(torch.randint(0, 10_000_000, (1,)).item()))
+            in_seq = 0.05 * torch.randn_like(fut) + 1.0 * self._time_ramp(T, fut.device)
+
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -222,10 +223,10 @@ class LitMinimal(pl.LightningModule):
 
         dtw  = masked_dtw(pred, fut, mask)
 
-        if self.global_step == 0:
-            with torch.no_grad():
-                mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
-                print(f"[Sanity] mean |Δpred| (val) = {mv:.6f}")
+        with torch.no_grad():
+            delta_mean = (pred[:,1:]-pred[:,:-1]).abs().mean().item() if fut.size(1) > 1 else 0.0
+            tstd = pred.std(dim=1).mean().item()
+            print(f"[DBG/val] mean|Δpred|={delta_mean:.6f}, time-std={tstd:.6f}", flush=True)
 
         self.val_losses.append(loss.item())
         self.val_dtws.append(dtw.item())
