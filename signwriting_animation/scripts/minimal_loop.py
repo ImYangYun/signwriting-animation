@@ -117,10 +117,7 @@ def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
     return Pose(header, body)
 
 
-def save_with_pose_visualizer(pred_btjc, gt_btjc, header, out_dir="logs", stem="free_run_posefmt", fps=12):
-    """用 PoseVisualizer 渲染 Pred/GT（并去掉 POSE_WORLD_LANDMARKS）"""
-    os.makedirs(out_dir, exist_ok=True)
-
+def save_with_pose_visualizer(pred_btjc, gt_btjc, header, fps=12):
     pred_pose = btjc_to_pose(pred_btjc, header, fps=fps)
     gt_pose   = btjc_to_pose(gt_btjc,   header, fps=fps)
     try:
@@ -131,12 +128,10 @@ def save_with_pose_visualizer(pred_btjc, gt_btjc, header, out_dir="logs", stem="
 
     viz_pred = PoseVisualizer(pred_pose)
     viz_gt   = PoseVisualizer(gt_pose)
-
-    pred_path = os.path.join(out_dir, f"{stem}_pred.gif")
-    gt_path   = os.path.join(out_dir, f"{stem}_gt.gif")
-    viz_pred.save_gif(pred_path, viz_pred.draw())
-    viz_gt.save_gif(gt_path,     viz_gt.draw())
-    print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
+    os.makedirs("logs", exist_ok=True)
+    viz_pred.save_gif("logs/free_run_posefmt_pred.gif", viz_pred.draw())
+    viz_gt.save_gif("logs/free_run_posefmt_gt.gif",   viz_gt.draw())
+    print("[viz] saved -> logs/free_run_posefmt_pred.gif / _gt.gif")
 
 # ------------------------
 # Dataset / Loader：保持原样
@@ -256,21 +251,13 @@ if __name__ == "__main__":
         if header is None:
             header = _probe_header_from_csv(csv_path, data_dir)
 
-        # 反归一化（如果 header 中有 normalization_info）
-        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
-        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
-
         if header is not None:
-            # 用内置的 PoseVisualizer，并去掉 POSE_WORLD_LANDMARKS
-            save_with_pose_visualizer(
-                gen_unnorm, gt_unnorm, header,
-                out_dir="logs", stem="free_run_posefmt", fps=12
-            )
+            save_with_pose_visualizer(gen_btjc_cpu, fut_gt_cpu, header, fps=12)
         else:
-            # 实在拿不到 header，就保留你原来的散点动画兜底
+            # 拿不到 header 的兜底方案：散点动画
             fig, ax = plt.subplots(figsize=(5, 5))
-            sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
-            sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT", alpha=0.35, animated=True)
+            sc_pred = ax.scatter([], [], s=15, label="Pred")
+            sc_gt   = ax.scatter([], [], s=15, label="GT", alpha=0.35)
             ax.legend(loc="upper right", frameon=False); ax.axis("equal")
 
             xy = torch.cat([
@@ -281,20 +268,20 @@ if __name__ == "__main__":
             pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
             ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad)
 
-            def _init_scatter():
+            def _init():
                 sc_pred.set_offsets(np.empty((0, 2))); sc_gt.set_offsets(np.empty((0, 2)))
                 return sc_pred, sc_gt
 
-            def _update_scatter(f):
-                ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu[0])}")
+            def _update(f):
+                ax.set_title(f"Free-run | frame {f+1}/{len(gen_btjc_cpu[0])}")
                 sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
                 sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
                 return sc_pred, sc_gt
 
             ani = animation.FuncAnimation(
-                fig, _update_scatter, frames=max(1, len(gen_btjc_cpu[0])),
-                init_func=_init_scatter, interval=100, blit=True
+                fig, _update, frames=max(1, len(gen_btjc_cpu[0])),
+                init_func=_init, interval=100, blit=True
             )
             ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
             plt.close(fig)
-            print("Saved free-run animation to logs/free_run_anim.gif", flush=True)
+            print("Saved fallback scatter animation to logs/free_run_anim.gif")
