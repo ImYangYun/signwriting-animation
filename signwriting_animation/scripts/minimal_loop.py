@@ -203,6 +203,12 @@ class FilteredDataset(Dataset):
         if not self.idx:
             self.idx = [0]
 
+    def __len__(self):
+        return len(self.idx)
+    
+    def __getitem__(self, i):
+        return self.base[self.idx[i]]
+    
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
