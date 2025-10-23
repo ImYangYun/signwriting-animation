@@ -235,12 +235,15 @@ if __name__ == "__main__":
     mask = batch['conditions']['target_mask']
     if hasattr(mask, 'zero_filled'):
         mask = mask.zero_filled()
-    if mask.dim() == 5:
-        mask_bt = (mask.abs().sum(dim=(2,3,4)) > 0).float()
-    elif mask.dim() == 4:
-        mask_bt = (mask.abs().sum(dim=(2,3)) > 0).float()
+
+    mask_float = mask.float()
+    if mask_float.dim() == 5:
+        mask_bt = (mask_float.sum(dim=(2,3,4)) > 0).float()  # 改这里：先float再sum
+    elif mask_float.dim() == 4:
+        mask_bt = (mask_float.sum(dim=(2,3)) > 0).float()    # 改这里
     else:
-        mask_bt = mask.float()
+        mask_bt = mask_float
+
     print(f"[DATA] mask valid lengths per sample: {mask_bt.sum(dim=1)}")
     print("="*60 + "\n")
 
