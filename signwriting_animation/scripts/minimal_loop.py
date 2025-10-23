@@ -34,6 +34,7 @@ def _as_dense_cpu_btjc(x):
         x = x[:, :, 0, ...]
     return x
 
+# 旧的散点静态图（保留，不必调用）
 def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5):
     seq = _to_plain_tensor(seq_btjc)[0]  # [T,J,C]
     T, J, C = seq.shape
@@ -48,8 +49,9 @@ def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5)
     plt.savefig(save_path)
     plt.close()
 
-# 新增：尽量从 CSV 里随便找一条 .pose 来拿 header（PoseVisualizer 需要）
+# ============== Header 获取 ==============
 def _probe_header_from_csv(csv_path, data_dir):
+    """从 CSV 中任取一条 .pose 读 header。若你的列名不是 'pose' 请改这里。"""
     try:
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
@@ -83,52 +85,97 @@ def _get_pose_header_from_loader(loader):
         pass
     return None
 
-def unnormalize_btjc(x_btjc, header):
-    x = x_btjc.detach().float().cpu()
-    if header is None or not hasattr(header, "normalization_info") or header.normalization_info is None:
-        return x
-    ni = header.normalization_info
-    if getattr(ni, "mean", None) is not None and getattr(ni, "std", None) is not None:
-        mean = torch.tensor(ni.mean, dtype=x.dtype).view(1, 1, 1, -1)
-        std  = torch.tensor(ni.std,  dtype=x.dtype).view(1, 1, 1, -1)
-        return x * std + mean
-    if getattr(ni, "scale", None) is not None and getattr(ni, "translation", None) is not None:
-        scale = torch.tensor(ni.scale, dtype=x.dtype).view(1, 1, 1, -1)
-        trans = torch.tensor(ni.translation, dtype=x.dtype).view(1, 1, 1, -1)
-        return x * scale + trans
+# ============== 诊断 + 可视化辅助 ==============
+def _header_joint_count(h):
+    if h is None:
+        return None
+    try:
+        # 新版 pose-format
+        return sum(getattr(c, "points", 0) or 0 for c in h.components)
+    except Exception:
+        try:
+            # 旧版字段名
+            return sum(len(c.joints) for c in h.components)
+        except Exception:
+            return None
+
+def _dump_stats(tag, x_btjc):
+    x = x_btjc[0, :, :, :2]
+    print(f"[{tag}] shape={tuple(x_btjc.shape)} "
+          f"min={x.min().item():.6f} max={x.max().item():.6f} "
+          f"nan={torch.isnan(x).any().item()} "
+          f"frameΔ={(x[1:]-x[:-1]).abs().mean().item():.6f}", flush=True)
+
+def normalize_for_viz(x_btjc, eps=1e-8):
+    """把坐标线性拉到 [0.1, 0.9] 区间，仅用于画图，不影响评估。"""
+    x = x_btjc.clone()
+    x2 = x[..., :2]
+    x_min = x2.amin(dim=(1, 2, 3), keepdim=True)
+    x_max = x2.amax(dim=(1, 2, 3), keepdim=True)
+    scale = (x_max - x_min).clamp_min(eps)
+    x2 = (x2 - x_min) / scale
+    x2 = 0.1 + 0.8 * x2
+    x[..., :2] = x2
+    # 清 NaN
+    x[torch.isnan(x)] = 0.0
     return x
 
+def save_scatter(seq_btjc, path, label):
+    """完全独立于 header 的散点动图兜底。"""
+    x = seq_btjc[0, :, :, :2].cpu().numpy()
+    x = x - x.mean(axis=(0, 1), keepdims=True)
+    M = float(np.abs(x).max())
+    if M < 1e-8:
+        M = 1.0
+    x = x / M
+    T = x.shape[0]
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sc = ax.scatter([], [], s=15)
+    ax.axis("equal")
+    ax.set_xlim(-1.1, 1.1); ax.set_ylim(-1.1, 1.1)
 
+    def _init():
+        sc.set_offsets(np.empty((0, 2)))
+        return sc,
+
+    def _update(f):
+        ax.set_title(f"{label}: frame {f+1}/{T}")
+        sc.set_offsets(x[f])
+        return sc,
+
+    ani = animation.FuncAnimation(fig, _update, frames=T, init_func=_init, interval=100, blit=True)
+    ani.save(path, writer="pillow", fps=10)
+    plt.close(fig)
+    print(f"[scatter] saved -> {path}")
+
+# ============== pose-format 构造 & 可视化 ==============
 def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
     """
-    输入: x_btjc [1,T,J,C] -> 转为 pose-format 期望的 [T,P,J,C]（P=1）
-    confidence: [T,J] -> [T,P,J]（P=1）
+    x_btjc: [1,T,J,C] -> [T,1,J,C]
+    conf:   [1,T,J]   -> [T,1,J]
     """
-    x = x_btjc[0].detach().cpu().numpy().astype(np.float32)  # [T,J,C]
-    x = x[:, np.newaxis, :, :]  # -> [T,1,J,C]  插入 P=1 维
-
+    x = x_btjc[0].detach().cpu().numpy().astype(np.float32)     # [T,J,C]
+    x = x[:, np.newaxis, :, :]                                  # [T,1,J,C]
     if conf_btj is None:
-        conf = np.ones((x.shape[0], x.shape[2]), dtype=np.float32)  # [T,J]
+        conf = np.ones((x.shape[0], x.shape[2]), dtype=np.float32)
     else:
-        conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)  # [T,J]
-    conf = conf[:, np.newaxis, :]  # -> [T,1,J]
-
+        conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)
+    conf = conf[:, np.newaxis, :]                               # [T,1,J]
     body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
-
 
 def save_with_pose_visualizer(pred_btjc, gt_btjc, header, fps=12):
     pred_pose = btjc_to_pose(pred_btjc, header, fps=fps)
     gt_pose   = btjc_to_pose(gt_btjc,   header, fps=fps)
+    # 2D 可视化移除 3D 组件
     try:
         pred_pose = pred_pose.remove_components(["POSE_WORLD_LANDMARKS"])
         gt_pose   = gt_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     except Exception:
         pass
-
+    os.makedirs("logs", exist_ok=True)
     viz_pred = PoseVisualizer(pred_pose)
     viz_gt   = PoseVisualizer(gt_pose)
-    os.makedirs("logs", exist_ok=True)
     viz_pred.save_gif("logs/free_run_posefmt_pred.gif", viz_pred.draw())
     viz_gt.save_gif("logs/free_run_posefmt_gt.gif",   viz_gt.draw())
     print("[viz] saved -> logs/free_run_posefmt_pred.gif / _gt.gif")
@@ -223,17 +270,15 @@ if __name__ == "__main__":
         gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)  # [1,T,J,C]
         fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)    # [1,T,J,C]
 
-        # 简单数值检查（保留）
+        # ------- 诊断 -------
         def frame_disp_cpu(x_btjc):
             x = x_btjc[0]
             if x.size(0) < 2: return 0.0
             dx = x[1:, :, :2] - x[:-1, :, :2]
             return dx.abs().mean().item()
-
         Tf = gen_btjc_cpu.size(1)
-        mv_pred = frame_disp_cpu(gen_btjc_cpu)
-        mv_gt   = frame_disp_cpu(fut_gt_cpu)
-        print(f"[GEN] Tf={Tf}, mean|Δpred|={mv_pred:.4f}, mean|Δgt|={mv_gt:.4f}", flush=True)
+        print(f"[GEN] Tf={Tf}, mean|Δpred|={frame_disp_cpu(gen_btjc_cpu):.6f}, "
+              f"mean|Δgt|={frame_disp_cpu(fut_gt_cpu):.6f}", flush=True)
 
         try:
             dtw_free = masked_dtw(gen_btjc, fut_gt, mask_bt).item()
@@ -245,43 +290,34 @@ if __name__ == "__main__":
         torch.save({"gen": gen_btjc_cpu[0], "gt": fut_gt_cpu[0]}, "logs/free_run.pt")
         print("Saved free-run sequences to logs/free_run.pt", flush=True)
 
-        # ===== 可视化部分（唯一改动重点）=====
-        # 拿一个 header：优先 loader，其次 CSV 里任意 .pose
+        # ===== 可视化部分 =====
+        # 1) header：优先 loader，其次 CSV
         header = _get_pose_header_from_loader(train_loader)
         if header is None:
             header = _probe_header_from_csv(csv_path, data_dir)
 
-        if header is not None:
-            save_with_pose_visualizer(gen_btjc_cpu, fut_gt_cpu, header, fps=12)
-        else:
-            # 拿不到 header 的兜底方案：散点动画
-            fig, ax = plt.subplots(figsize=(5, 5))
-            sc_pred = ax.scatter([], [], s=15, label="Pred")
-            sc_gt   = ax.scatter([], [], s=15, label="GT", alpha=0.35)
-            ax.legend(loc="upper right", frameon=False); ax.axis("equal")
+        # 2) 打印数值与 header-J 对齐情况
+        _dump_stats("PRED", gen_btjc_cpu)
+        _dump_stats("GT",   fut_gt_cpu)
+        expJ = _header_joint_count(header)
+        print("[HEADER] expected_J =", expJ, "| actual_J =", gen_btjc_cpu.size(2))
 
-            xy = torch.cat([
-                gen_btjc_cpu[..., :2].reshape(-1, 2),
-                fut_gt_cpu[...,  :2].reshape(-1, 2)
-            ], dim=0).numpy()
-            x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
-            pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
-            ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad)
+        # 3) 若 J 不匹配，重探 header（避免只出一个点）
+        if expJ is not None and expJ != gen_btjc_cpu.size(2):
+            print("[WARN] header J mismatch, re-probing header from CSV...")
+            header = _probe_header_from_csv(csv_path, data_dir)
+            print("[HEADER] reprobe expected_J =", _header_joint_count(header))
 
-            def _init():
-                sc_pred.set_offsets(np.empty((0, 2))); sc_gt.set_offsets(np.empty((0, 2)))
-                return sc_pred, sc_gt
+        # 4) 仅用于画图的归一化（把坐标拉到[0.1,0.9]）
+        gen_viz = normalize_for_viz(gen_btjc_cpu)
+        gt_viz  = normalize_for_viz(fut_gt_cpu)
 
-            def _update(f):
-                ax.set_title(f"Free-run | frame {f+1}/{len(gen_btjc_cpu[0])}")
-                sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
-                sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
-                return sc_pred, sc_gt
+        # 5) 用 pose-format 画 gif；并行导出散点兜底
+        try:
+            save_with_pose_visualizer(gen_viz, gt_viz, header, fps=12)
+        except Exception as e:
+            print("[viz] PoseVisualizer failed:", e)
 
-            ani = animation.FuncAnimation(
-                fig, _update, frames=max(1, len(gen_btjc_cpu[0])),
-                init_func=_init, interval=100, blit=True
-            )
-            ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
-            plt.close(fig)
-            print("Saved fallback scatter animation to logs/free_run_anim.gif")
+        save_scatter(gen_btjc_cpu, "logs/free_run_scatter_pred.gif", "PRED")
+        save_scatter(fut_gt_cpu,  "logs/free_run_scatter_gt.gif",   "GT")
+
