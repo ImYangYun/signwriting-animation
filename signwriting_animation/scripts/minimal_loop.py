@@ -183,7 +183,7 @@ def save_with_pose_visualizer(pred_btjc, gt_btjc, header, fps=12):
 # Dataset / Loader：保持原样
 # ------------------------
 class FilteredDataset(Dataset):
-    def __init__(self, base: Dataset, target_count=4, max_scan=500):
+    def __init__(self, base: Dataset, target_count=4, max_scan=500, min_frames=15):
         self.base = base
         self.idx = []
         N = len(base)
@@ -191,15 +191,17 @@ class FilteredDataset(Dataset):
             try:
                 it = base[i]
                 if isinstance(it, dict) and "data" in it and "conditions" in it:
-                    self.idx.append(i)
+                    data = it["data"]
+                    if hasattr(data, 'zero_filled'):
+                        data = data.zero_filled()
+                    if data.shape[1] >= min_frames:
+                        self.idx.append(i)
                 if len(self.idx) >= target_count:
                     break
             except Exception:
                 continue
         if not self.idx:
             self.idx = [0]
-    def __len__(self): return len(self.idx)
-    def __getitem__(self, i): return self.base[self.idx[i]]
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
@@ -277,13 +279,13 @@ if __name__ == "__main__":
         past_btjc = cond["input_pose"][:1].to(model.device)
         sign_img  = cond["sign_image"][:1].to(model.device)
         fut_gt    = batch["data"][:1].to(model.device)
-        mask_bt   = cond["target_mask"][:1].to(model.device)
+        #mask_bt   = cond["target_mask"][:1].to(model.device)
 
         print("[GEN] using generate_full_sequence", flush=True)
         gen_btjc = model.generate_full_sequence(
             past_btjc=past_btjc,
             sign_img=sign_img,
-            target_mask=mask_bt,
+            target_mask=20,
         )
 
         gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)  # [1,T,J,C]
