@@ -101,16 +101,21 @@ def unnormalize_btjc(x_btjc, header):
 
 def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
     """
-    x_btjc: [1,T,J,C] (CPU)
-    header: 来自任意 .pose 的 header（组件名要在）
+    输入: x_btjc [1,T,J,C] -> 转为 pose-format 期望的 [T,P,J,C]（P=1）
+    confidence: [T,J] -> [T,P,J]（P=1）
     """
-    x = x_btjc[0].detach().cpu().numpy()                        # [T,J,C]
+    x = x_btjc[0].detach().cpu().numpy().astype(np.float32)  # [T,J,C]
+    x = x[:, np.newaxis, :, :]  # -> [T,1,J,C]  插入 P=1 维
+
     if conf_btj is None:
-        conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T,J]
+        conf = np.ones((x.shape[0], x.shape[2]), dtype=np.float32)  # [T,J]
     else:
-        conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)
+        conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)  # [T,J]
+    conf = conf[:, np.newaxis, :]  # -> [T,1,J]
+
     body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
+
 
 def save_with_pose_visualizer(pred_btjc, gt_btjc, header, out_dir="logs", stem="free_run_posefmt", fps=12):
     """用 PoseVisualizer 渲染 Pred/GT（并去掉 POSE_WORLD_LANDMARKS）"""
