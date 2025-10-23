@@ -99,7 +99,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         Args:
             x (Tensor):
                 The noisy input tensor at the current diffusion step, denoted as x_t in the CAMDM paper.
-                Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_future_frames].
 
             timesteps (Tensor):
                 Diffusion timesteps for each sample in the batch.
@@ -115,44 +115,49 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         Returns:
             Tensor:
-                The predicted denoised motion at the current timestep.
-                Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
+                Predicted future motion.
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_future_frames].
         """
 
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
-        time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
-        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
-        past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
-        future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
+        time_emb = self.embed_timestep(timesteps)                 # [1, B, D]
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
 
+        # ---- 2. Local motion embeddings ----
+        past_motion_emb = self.past_motion_process(past_motion)   # [Tp, B, D]
+        future_motion_emb = self.future_motion_process(x)         # [Tf, B, D]
+
+        # ---- 3. Add continuous time embedding to future ----
         Tf = future_motion_emb.size(0)
         B  = future_motion_emb.size(1)
-        t  = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)  # [Tf,1,1]
-        t_latent = self.future_time_proj(t)                  # [Tf,1,D]
-        t_latent = t_latent.expand(-1, B, -1)                # [Tf,B,D]
+        t  = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
+        t_latent = self.future_time_proj(t)                       # [Tf,1,D]
+        t_latent = t_latent.expand(-1, B, -1)                     # [Tf,B,D]
         future_motion_emb = future_motion_emb + 2.0 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
         with torch.no_grad():
-            fut_time_std = future_motion_emb.float().std(dim=0).mean().item()  # time=dim 0
+            fut_time_std = future_motion_emb.float().std(dim=0).mean().item()
             print(f"[DBG/model] future_emb time-std={fut_time_std:.6f}", flush=True)
-        xseq = torch.cat((time_emb,
-                          signwriting_emb,
-                          past_motion_emb,
-                          future_motion_emb), axis=0)
 
+        time_cond = time_emb.repeat(Tf, 1, 1)         # [Tf,B,D]
+        sign_cond = signwriting_emb.repeat(Tf, 1, 1)  # [Tf,B,D]
+
+        xseq = future_motion_emb + 0.5 * (time_cond + sign_cond)
         xseq = self.sequence_pos_encoder(xseq)
 
         with torch.no_grad():
-            pos_enc_time_std = xseq[-20:].float().std(dim=0).mean().item()
+            pos_enc_time_std = xseq.float().std(dim=0).mean().item()
             print(f"[DBG/model] after_pos_enc time-std={pos_enc_time_std:.6f}", flush=True)
-            
-        output = self.seqEncoder(xseq)[-num_frames:]
+
+        output = self.seqEncoder(xseq)               # [Tf,B,D]
+
         with torch.no_grad():
             enc_time_std = output.float().std(dim=0).mean().item()
             print(f"[DBG/model] encoder_out time-std={enc_time_std:.6f}", flush=True)
-        output = self.pose_projection(output)
+
+        output = self.pose_projection(output)        # [B,J,C,T]
         return output
 
     def interface(self,
