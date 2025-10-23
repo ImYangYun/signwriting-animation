@@ -173,14 +173,15 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.20 * torch.randn_like(fut) + 0.20 * self._time_ramp(T, fut.device)
+        t_ramp = self._time_ramp(T, fut.device)
+        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp 
         pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
         loss_pos = masked_mse(pred, fut, mask)
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 0.5 * loss_vel
+            loss = loss_pos + 2.0 * loss_vel
         else:
             loss = loss_pos
 
@@ -202,14 +203,15 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         
         T = fut.size(1)
-        in_seq = 0.20 * torch.randn_like(fut) + 0.20 * self._time_ramp(T, fut.device)
+        t_ramp = self._time_ramp(T, fut.device)
+        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp 
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 1 * loss_vel
+            loss = loss_pos + 2.0 * loss_vel
         else:
             loss = loss_pos
 
@@ -254,7 +256,7 @@ class LitMinimal(pl.LightningModule):
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
             t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
-            x_query = 0.20 * torch.randn((1, Tf, J, C), device=self.device) + 0.20 * t
+            x_query = 0.05 * torch.randn((1, Tf, J, C), device=self.device) + 1.0 * t
             ts = torch.zeros(1, dtype=torch.long, device=self.device)
             print(f"[DBG] Tf={Tf}, t.min={float(t.min()):.3f}, t.max={float(t.max()):.3f}", flush=True)
             print(f"[DBG] x_query.mean={float(x_query.mean()):.5f}, x_query.std={float(x_query.std()):.5f}", flush=True)
