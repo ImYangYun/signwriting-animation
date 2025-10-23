@@ -34,7 +34,6 @@ def _as_dense_cpu_btjc(x):
         x = x[:, :, 0, ...]
     return x
 
-# 旧的散点静态图（保留，不必调用）
 def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5):
     seq = _to_plain_tensor(seq_btjc)[0]  # [T,J,C]
     T, J, C = seq.shape
@@ -212,9 +211,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
         ds, batch_size=bs, shuffle=True, num_workers=num_workers, collate_fn=zero_pad_collator
     )
 
-# ------------------------
-# main：训练流程不改；只改可视化
-# ------------------------
+
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
@@ -231,11 +228,11 @@ if __name__ == "__main__":
     model = LitMinimal(log_dir="logs")
 
     trainer = pl.Trainer(
-        max_steps=500,
+        max_steps=2000,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         log_every_n_steps=5,
-        limit_train_batches=10,
+        limit_train_batches=20,
         limit_val_batches=5,
         check_val_every_n_epoch=1,
         deterministic=True,

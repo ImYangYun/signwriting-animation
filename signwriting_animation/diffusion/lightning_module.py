@@ -190,6 +190,11 @@ class LitMinimal(pl.LightningModule):
                 mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
                 print(f"[Sanity] mean |Δpred| (train) = {mv:.6f}")
 
+        if self.global_step % 100 == 0 and self.global_step > 0:
+            with torch.no_grad():
+                mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
+                print(f"[Step {self.global_step}] mean |Δpred| = {mv:.6f}")
+                
         self.train_losses.append(loss.item())
         self.log("train/loss", loss, prog_bar=True, on_step=True)
         return loss
