@@ -16,14 +16,19 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
+
 def _to_plain_tensor(x):
-    if hasattr(x, "tensor"): x = x.tensor
-    if hasattr(x, "zero_filled"): x = x.zero_filled()
+    if hasattr(x, "tensor"):
+        x = x.tensor
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
     return x.detach().cpu()
 
 def _as_dense_cpu_btjc(x):
-    if hasattr(x, "zero_filled"): x = x.zero_filled()
-    if getattr(x, "is_sparse", False): x = x.to_dense()
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
+    if getattr(x, "is_sparse", False):
+        x = x.to_dense()
     x = x.detach().float().cpu().contiguous()
     if x.dim() == 5:  # [B,T,P,J,C] -> 取 P=0
         x = x[:, :, 0, ...]
@@ -40,17 +45,35 @@ def visualize_pose_sequence(seq_btjc, save_path="logs/free_run_vis.png", step=5)
     plt.axis("equal")
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path); plt.close()
+    plt.savefig(save_path)
+    plt.close()
+
+# 新增：尽量从 CSV 里随便找一条 .pose 来拿 header（PoseVisualizer 需要）
+def _probe_header_from_csv(csv_path, data_dir):
+    try:
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                p = row.get("pose", "")
+                if isinstance(p, str) and p.lower().endswith(".pose"):
+                    full = p if os.path.isabs(p) else os.path.join(data_dir, p)
+                    if not os.path.exists(full):
+                        continue
+                    with open(full, "rb") as pf:
+                        return Pose.read(pf).header
+    except Exception as e:
+        print("[probe] failed to read header from csv:", e)
+    return None
 
 def _get_pose_header_from_loader(loader):
     ds = loader.dataset
     for _ in range(3):
         if hasattr(ds, "header") and ds.header is not None:
             return ds.header
-        ds = getattr(ds, "base", None) or getattr(ds, "dataset", None)
-        if ds is None:
+        base = getattr(ds, "base", None) or getattr(ds, "dataset", None)
+        if base is None:
             break
-    # 兜底：样本里
+        ds = base
     try:
         sample = loader.dataset[0]
         if isinstance(sample, dict):
@@ -58,38 +81,6 @@ def _get_pose_header_from_loader(loader):
             return meta.get("pose_header") or meta.get("header")
     except Exception:
         pass
-    return None
-
-def _probe_header_from_csv(csv_path, data_dir):
-    # 找到第一条含“可绘制拓扑（有 edges）”的 .pose
-    from pose_format import Pose as _Pose
-    try:
-        with open(csv_path, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                p = row.get("pose", "")
-                if not (isinstance(p, str) and p.lower().endswith(".pose")):
-                    continue
-                full = p if os.path.isabs(p) else os.path.join(data_dir, p)
-                if not os.path.exists(full):
-                    print(f"[probe] not found: {full}")
-                    continue
-                with open(full, "rb") as pf:
-                    header = _Pose.read(pf).header
-                has_edges = False
-                sk = getattr(header, "skeleton", None)
-                has_edges |= bool(sk is not None and getattr(sk, "edges", None))
-                for c in (getattr(header, "components", None) or []):
-                    skc = getattr(c, "skeleton", None)
-                    if skc is not None and getattr(skc, "edges", None):
-                        has_edges = True; break
-                if has_edges:
-                    print(f"[probe] found header with edges at: {full}")
-                    return header
-                else:
-                    print(f"[probe] {full} has NO edges, skipping…")
-    except Exception as e:
-        print("[probe] failed to read header from csv:", e)
     return None
 
 def unnormalize_btjc(x_btjc, header):
@@ -107,159 +98,44 @@ def unnormalize_btjc(x_btjc, header):
         return x * scale + trans
     return x
 
-def print_header_info(header):
-    if header is None:
-        print("[header] is None"); return
-    sk = getattr(header, "skeleton", None)
-    comps = getattr(header, "components", None) or []
-    print("[header] has_skeleton =", sk is not None)
-    if sk is not None:
-        n_edges = len(getattr(sk, "edges", []) or [])
-        num_j = getattr(sk, "num_joints", None)
-        print(f"[header] skeleton edges: {n_edges}, num_joints: {num_j}")
-    print(f"[header] components: {len(comps)}",
-          [getattr(c, "name", f"comp{i}") for i, c in enumerate(comps)])
-
-def debug_header_topology(header):
-    if header is None:
-        print("[header-debug] header is None"); return
-    comps = getattr(header, "components", None) or []
-    print(f"[header-debug] #components = {len(comps)}")
-    for i, comp in enumerate(comps):
-        name = (getattr(comp, "name", f"comp{i}") or "").upper()
-        off  = int(getattr(comp, "offset", 0))
-        sk   = getattr(comp, "skeleton", None)
-        if sk is None:
-            print(f"  - {name:<24} offset={off:>3}  skeleton=None")
-            continue
-        nj = getattr(sk, "num_joints", None)
-        joints_attr = getattr(sk, "joints", None)
-        if nj is None and joints_attr is not None:
-            try: nj = len(joints_attr)
-            except: nj = None
-        edges = getattr(sk, "edges", None) or []
-        print(f"  - {name:<24} offset={off:>3}  nj={nj}  edges={len(edges)}")
-
-def _has_drawable_topology(h):
-    if h is None: return False
-    sk = getattr(h, "skeleton", None)
-    if sk is not None and getattr(sk, "edges", None): return True
-    for c in (getattr(h, "components", None) or []):
-        skc = getattr(c, "skeleton", None)
-        if skc is not None and getattr(skc, "edges", None): return True
-    return False
 
 def btjc_to_pose(x_btjc, header, fps=25, conf_btj=None):
-    x = x_btjc[0].detach().cpu().numpy()  # [T, J, C]
+    """
+    x_btjc: [1,T,J,C] (CPU)
+    header: 来自任意 .pose 的 header（组件名要在）
+    """
+    x = x_btjc[0].detach().cpu().numpy()                        # [T,J,C]
     if conf_btj is None:
-        conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)
+        conf = np.ones((x.shape[0], x.shape[1]), dtype=np.float32)  # [T,J]
     else:
         conf = conf_btj[0].detach().cpu().numpy().astype(np.float32)
     body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
     return Pose(header, body)
 
-def align_to_header_joints(x_btjc, header, ignore_world=True):
-    """
-    仅用于可视化的关节数对齐；不足右侧补0并置置信度0，多了则截断。
-    默认 ignore_world=True：忽略 POSE_WORLD_LANDMARKS。
-    """
-    x_btjc = x_btjc.clone()
-    B, T, J_pred, C = x_btjc.shape
-    sk = getattr(header, "skeleton", None)
+def save_with_pose_visualizer(pred_btjc, gt_btjc, header, out_dir="logs", stem="free_run_posefmt", fps=12):
+    """用 PoseVisualizer 渲染 Pred/GT（并去掉 POSE_WORLD_LANDMARKS）"""
+    os.makedirs(out_dir, exist_ok=True)
 
-    def _njoints(skc):
-        if skc is None: return None
-        if hasattr(skc, "num_joints") and skc.num_joints: return int(skc.num_joints)
-        if hasattr(skc, "joints") and skc.joints is not None:
-            try: return int(len(skc.joints))
-            except Exception: pass
-        edges = getattr(skc, "edges", None) or []
-        m = 0
-        for a, b in edges: m = max(m, int(a) + 1, int(b) + 1)
-        return m if m > 0 else None
+    pred_pose = btjc_to_pose(pred_btjc, header, fps=fps)
+    gt_pose   = btjc_to_pose(gt_btjc,   header, fps=fps)
+    try:
+        pred_pose = pred_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        gt_pose   = gt_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+    except Exception:
+        pass
 
-    J_h = _njoints(sk) if sk is not None else None
-    if J_h is None:
-        comps = getattr(header, "components", None) or []
-        total = 0
-        for comp in comps:
-            name = (getattr(comp, "name", "") or "").upper()
-            if ignore_world and "WORLD" in name:  # 忽略 world 分量
-                continue
-            off = int(getattr(comp, "offset", 0))
-            nj = _njoints(getattr(comp, "skeleton", None)) or 0
-            total = max(total, off + nj)
-        if total > 0: J_h = total
+    viz_pred = PoseVisualizer(pred_pose)
+    viz_gt   = PoseVisualizer(gt_pose)
 
-    if J_h is None:
-        J_h = J_pred
-        print(f"[align] WARN: failed to infer J_h from header; fallback to J_pred={J_pred}")
+    pred_path = os.path.join(out_dir, f"{stem}_pred.gif")
+    gt_path   = os.path.join(out_dir, f"{stem}_gt.gif")
+    viz_pred.save_gif(pred_path, viz_pred.draw())
+    viz_gt.save_gif(gt_path,     viz_gt.draw())
+    print(f"[viz] pose-format GIF saved:\n  - {pred_path}\n  - {gt_path}")
 
-    print(f"[align] J_pred={J_pred}, J_h={J_h}")
-
-    if J_pred == J_h:
-        conf = torch.ones((B, T, J_h), dtype=torch.float32)
-        return x_btjc, conf
-
-    if J_pred > J_h:
-        x_aligned = x_btjc[:, :, :J_h, :].contiguous()
-        conf = torch.ones((B, T, J_h), dtype=torch.float32)
-        return x_aligned, conf
-
-    pad = J_h - J_pred
-    x_pad = torch.zeros((B, T, pad, C), dtype=x_btjc.dtype)
-    x_aligned = torch.cat([x_btjc, x_pad], dim=2).contiguous()
-    conf_left = torch.ones((B, T, J_pred), dtype=torch.float32)
-    conf_pad  = torch.zeros((B, T, pad), dtype=torch.float32)
-    conf = torch.cat([conf_left, conf_pad], dim=2)
-    return x_aligned, conf
-
-def visualize_pose_components_fallback(
-    pred_btjc, gt_btjc, save_path="logs/free_run_posefmt_fallback.gif", fps=12, show_points=True
-):
-    pred = pred_btjc[0].numpy(); gt = gt_btjc[0].numpy()
-    T, J, _ = pred.shape
-    n = max(0, min(J - 1, 20))
-    edges = [(i, i + 1) for i in range(n)]
-    xy = np.concatenate([pred[..., :2].reshape(-1, 2), gt[..., :2].reshape(-1, 2)], axis=0)
-    x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
-    pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
-
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4.5), sharex=True, sharey=True)
-    axp, axg = axes
-    for ax, title in [(axp, "Predicted (unnormalized) – fallback"),
-                      (axg, "Ground Truth (unnormalized) – fallback")]:
-        ax.set_title(title); ax.set_aspect("equal")
-        ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad); ax.axis("off")
-
-    def _mk(ax):
-        lines = [ax.plot([], [], lw=2, color=(0.5, 0.5, 0.5, 1.0))[0] for _ in edges]
-        pts = ax.scatter([], [], s=10) if show_points else None
-        return lines, pts
-    pln, pp = _mk(axp); gln, gp = _mk(axg)
-
-    def _set(lines, pts, pose_xy):
-        for k, (a, b) in enumerate(edges):
-            xa, ya = pose_xy[a, 0], pose_xy[a, 1]
-            xb, yb = pose_xy[b, 0], pose_xy[b, 1]
-            lines[k].set_data([xa, xb], [ya, yb])
-        if pts is not None: pts.set_offsets(pose_xy)
-
-    def _init():
-        _set(pln, pp, pred[0, :, :2]); _set(gln, gp, gt[0, :, :2])
-        return pln + gln + ([pp] if pp is not None else []) + ([gp] if gp is not None else [])
-
-    def _update(t):
-        _set(pln, pp, pred[t, :, :2]); _set(gln, gp, gt[t, :, :2])
-        return pln + gln + ([pp] if pp is not None else []) + ([gp] if gp is not None else [])
-
-    ani = animation.FuncAnimation(fig, _update, frames=T, init_func=_init,
-                                  interval=max(1, int(1000 / max(1, fps))), blit=True)
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    ani.save(save_path, writer="pillow", fps=fps); plt.close(fig)
-    print(f"[viz] fallback animation saved to {save_path}")
-
-
+# ------------------------
+# Dataset / Loader：保持原样
+# ------------------------
 class FilteredDataset(Dataset):
     def __init__(self, base: Dataset, target_count=4, max_scan=500):
         self.base = base
@@ -270,10 +146,12 @@ class FilteredDataset(Dataset):
                 it = base[i]
                 if isinstance(it, dict) and "data" in it and "conditions" in it:
                     self.idx.append(i)
-                if len(self.idx) >= target_count: break
+                if len(self.idx) >= target_count:
+                    break
             except Exception:
                 continue
-        if not self.idx: self.idx = [0]
+        if not self.idx:
+            self.idx = [0]
     def __len__(self): return len(self.idx)
     def __getitem__(self, i): return self.base[self.idx[i]]
 
@@ -283,10 +161,13 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     )
     ds = FilteredDataset(base, target_count=4, max_scan=1000)
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
-    return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=num_workers, collate_fn=zero_pad_collator)
+    return DataLoader(
+        ds, batch_size=bs, shuffle=True, num_workers=num_workers, collate_fn=zero_pad_collator
+    )
 
-
-# -------------------- main（训练 & 可视化保持不变） --------------------
+# ------------------------
+# main：训练流程不改；只改可视化
+# ------------------------
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
@@ -298,7 +179,7 @@ if __name__ == "__main__":
     num_workers = 2
 
     train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers)
-    val_loader = train_loader
+    val_loader = train_loader  # same small subset for validation
 
     model = LitMinimal(log_dir="logs")
 
@@ -334,13 +215,15 @@ if __name__ == "__main__":
 
         print("[GEN] using generate_full_sequence", flush=True)
         gen_btjc = model.generate_full_sequence(
-            past_btjc=past_btjc, sign_img=sign_img, target_mask=mask_bt
+            past_btjc=past_btjc,
+            sign_img=sign_img,
+            target_mask=mask_bt,
         )
 
-        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)
-        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)
+        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)  # [1,T,J,C]
+        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)    # [1,T,J,C]
 
-        # quick stats
+        # 简单数值检查（保留）
         def frame_disp_cpu(x_btjc):
             x = x_btjc[0]
             if x.size(0) < 2: return 0.0
@@ -348,69 +231,65 @@ if __name__ == "__main__":
             return dx.abs().mean().item()
 
         Tf = gen_btjc_cpu.size(1)
-        print(f"[GEN] Tf={Tf}, mean|Δpred|={frame_disp_cpu(gen_btjc_cpu):.4f}, mean|Δgt|={frame_disp_cpu(fut_gt_cpu):.4f}")
+        mv_pred = frame_disp_cpu(gen_btjc_cpu)
+        mv_gt   = frame_disp_cpu(fut_gt_cpu)
+        print(f"[GEN] Tf={Tf}, mean|Δpred|={mv_pred:.4f}, mean|Δgt|={mv_gt:.4f}", flush=True)
+
         try:
-            print(f"[Free-run] DTW: {masked_dtw(gen_btjc, fut_gt, mask_bt).item():.4f}")
+            dtw_free = masked_dtw(gen_btjc, fut_gt, mask_bt).item()
+            print(f"[Free-run] DTW: {dtw_free:.4f}", flush=True)
         except Exception as e:
             print("[Free-run] DTW eval skipped:", e)
 
         os.makedirs("logs", exist_ok=True)
         torch.save({"gen": gen_btjc_cpu[0], "gt": fut_gt_cpu[0]}, "logs/free_run.pt")
-        print("Saved free-run sequences to logs/free_run.pt")
+        print("Saved free-run sequences to logs/free_run.pt", flush=True)
 
-        # header：先 loader，后 CSV
+        # ===== 可视化部分（唯一改动重点）=====
+        # 拿一个 header：优先 loader，其次 CSV 里任意 .pose
         header = _get_pose_header_from_loader(train_loader)
-        if header is None or not _has_drawable_topology(header):
+        if header is None:
             header = _probe_header_from_csv(csv_path, data_dir)
 
-        print_header_info(header)
-        debug_header_topology(header)
+        # 反归一化（如果 header 中有 normalization_info）
+        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)  # [1,T,J,C]
+        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)   # [1,T,J,C]
 
-        # unnormalize
-        gen_unnorm = unnormalize_btjc(gen_btjc_cpu, header)
-        gt_unnorm  = unnormalize_btjc(fut_gt_cpu,  header)
-
-        # 与 header 对齐（只用于可视化）
-        gen_aligned, gen_conf = (None, None)
-        gt_aligned,  gt_conf  = (None, None)
         if header is not None:
-            gen_aligned, gen_conf = align_to_header_joints(gen_unnorm, header, ignore_world=True)
-            gt_aligned,  gt_conf  = align_to_header_joints(gt_unnorm,  header, ignore_world=True)
-
-        # 可视化：有拓扑就用 pose-format，否则 fallback
-        if _has_drawable_topology(header) and (gen_aligned is not None) and (gt_aligned is not None):
-            viz_pred = PoseVisualizer(btjc_to_pose(gen_aligned, header, fps=12, conf_btj=gen_conf))
-            viz_gt   = PoseVisualizer(btjc_to_pose(gt_aligned,  header, fps=12, conf_btj=gt_conf))
-            viz_pred.save_gif("logs/free_run_posefmt_pred.gif", viz_pred.draw())
-            viz_gt.save_gif(  "logs/free_run_posefmt_gt.gif",   viz_gt.draw())
-            print("[viz] pose-format GIF saved -> logs/free_run_posefmt_pred.gif / _gt.gif")
-        else:
-            visualize_pose_components_fallback(
-                gen_unnorm, gt_unnorm, save_path="logs/free_run_posefmt_fallback.gif", fps=12, show_points=True
+            # 用内置的 PoseVisualizer，并去掉 POSE_WORLD_LANDMARKS
+            save_with_pose_visualizer(
+                gen_unnorm, gt_unnorm, header,
+                out_dir="logs", stem="free_run_posefmt", fps=12
             )
+        else:
+            # 实在拿不到 header，就保留你原来的散点动画兜底
+            fig, ax = plt.subplots(figsize=(5, 5))
+            sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
+            sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT", alpha=0.35, animated=True)
+            ax.legend(loc="upper right", frameon=False); ax.axis("equal")
 
-        # 额外：散点对比动图
-        fig, ax = plt.subplots(figsize=(5, 5))
-        sc_pred = ax.scatter([], [], s=15, c="red",  label="Predicted", animated=True)
-        sc_gt   = ax.scatter([], [], s=15, c="blue", label="GT", alpha=0.35, animated=True)
-        ax.legend(loc="upper right", frameon=False); ax.axis("equal")
-        xy = torch.cat([gen_btjc_cpu[..., :2].reshape(-1, 2),
-                        fut_gt_cpu[...,  :2].reshape(-1, 2)], dim=0).numpy()
-        x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
-        pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
-        ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad)
+            xy = torch.cat([
+                gen_btjc_cpu[..., :2].reshape(-1, 2),
+                fut_gt_cpu[...,  :2].reshape(-1, 2)
+            ], dim=0).numpy()
+            x_min, y_min = xy.min(axis=0); x_max, y_max = xy.max(axis=0)
+            pad = 0.05 * max(x_max - x_min, y_max - y_min, 1e-6)
+            ax.set_xlim(x_min - pad, x_max + pad); ax.set_ylim(y_min - pad, y_max + pad)
 
-        def _init_scatter():
-            sc_pred.set_offsets(np.empty((0, 2))); sc_gt.set_offsets(np.empty((0, 2)))
-            return sc_pred, sc_gt
-        def _update_scatter(f):
-            ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu[0])}")
-            sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
-            sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
-            return sc_pred, sc_gt
+            def _init_scatter():
+                sc_pred.set_offsets(np.empty((0, 2))); sc_gt.set_offsets(np.empty((0, 2)))
+                return sc_pred, sc_gt
 
-        ani = animation.FuncAnimation(fig, _update_scatter, frames=max(1, len(gen_btjc_cpu[0])),
-                                      init_func=_init_scatter, interval=100, blit=True)
-        ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
-        plt.close(fig)
-        print("Saved free-run animation to logs/free_run_anim.gif")
+            def _update_scatter(f):
+                ax.set_title(f"Free-run prediction  |  frame {f+1}/{len(gen_btjc_cpu[0])}")
+                sc_pred.set_offsets(gen_btjc_cpu[0, f, :, :2].numpy())
+                sc_gt.set_offsets(  fut_gt_cpu[0,  f, :, :2].numpy())
+                return sc_pred, sc_gt
+
+            ani = animation.FuncAnimation(
+                fig, _update_scatter, frames=max(1, len(gen_btjc_cpu[0])),
+                init_func=_init_scatter, interval=100, blit=True
+            )
+            ani.save("logs/free_run_anim.gif", writer="pillow", fps=10)
+            plt.close(fig)
+            print("Saved free-run animation to logs/free_run_anim.gif", flush=True)
