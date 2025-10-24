@@ -83,7 +83,13 @@ def btjc_to_pose(x_btjc, header, fps=12):
     return Pose(header, body)
 
 def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
-    """Save predicted and ground truth poses to .pose files for visualization."""
+    """
+    Save predicted and ground truth poses to .pose files for visualization.
+    Ensures compatibility with sign.mt (removes 3D world coordinates).
+    """
+    from pose_format import Pose
+
+    # ======== 1. Header sourcing ========
     if header is None:
         print("[POSE SAVE] Loading header from CSV...")
         header = _probe_header_from_csv(csv_path, data_dir)
@@ -97,16 +103,42 @@ def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
         gt_pose   = btjc_to_pose(gt_btjc, header)
 
 
+        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS",
+                           "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
+
+        available = [c for c in keep_components if c in pred_pose.body.data]
+        if not available:
+            print("[POSE SAVE] ⚠️ No 2D components found in header, keeping all.")
+        else:
+            pred_pose = pred_pose.select_components(available)
+            gt_pose   = gt_pose.select_components(available)
+            print(f"[POSE SAVE] ✅ Kept components: {available}")
+
+        # ======== 4. Scale normalization (optional safeguard) ========
+        # Rescale to ~[0,1] if values look too small or too large
+        for pose_obj, label in [(pred_pose, "pred"), (gt_pose, "gt")]:
+            data = pose_obj.body.data
+            if np.abs(data).max() < 0.05:  # e.g., all near zero
+                print(f"[POSE SAVE] ⚠️ {label} coords near zero — rescaling by 100.")
+                pose_obj.body.data = data * 100.0
+            elif np.abs(data).max() > 100:
+                print(f"[POSE SAVE] ⚠️ {label} coords too large — normalizing to 0–1.")
+                pose_obj.body.data = data / np.abs(data).max()
+
+        # ======== 5. Save to disk ========
         os.makedirs("logs", exist_ok=True)
-        with open("logs/prediction.pose", "wb") as f:
+        pred_path = "logs/prediction.pose"
+        gt_path   = "logs/groundtruth.pose"
+
+        with open(pred_path, "wb") as f:
             pred_pose.write(f)
-        with open("logs/groundtruth.pose", "wb") as f:
+        with open(gt_path, "wb") as f:
             gt_pose.write(f)
 
         print("\n" + "="*65)
         print("✅ Saved .pose files for visualization:")
-        print("   • logs/prediction.pose")
-        print("   • logs/groundtruth.pose\n")
+        print(f"   • {pred_path}")
+        print(f"   • {gt_path}\n")
         print("To visualize locally:")
         print("   visualize_pose -i logs/prediction.pose -o logs/prediction.mp4")
         print("   visualize_pose -i logs/groundtruth.pose -o logs/groundtruth.mp4\n")
@@ -115,7 +147,7 @@ def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
 
         return True
     except Exception as e:
-        print(f"[POSE SAVE] ❌ Error: {e}")
+        print(f"[POSE SAVE] ❌ Error during save: {e}")
         import traceback; traceback.print_exc()
         return False
 
