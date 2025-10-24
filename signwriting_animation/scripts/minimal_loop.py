@@ -120,16 +120,21 @@ def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
         except Exception:
             pass
 
-        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS", 
-                           "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
         header_names = [c.name for c in header.components]
-        available = [c for c in keep_components if c in header_names]
-        if available:
-            pred_pose = pred_pose.select_components(available)
-            gt_pose   = gt_pose.select_components(available)
-            print(f"[POSE SAVE] ✅ Kept components: {available}")
-        else:
-            print(f"[POSE SAVE] ⚠️ No 2D components matched, keeping all.")
+        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
+        try:
+            if hasattr(pred_pose, "select_components"):
+                available = [c for c in keep_components if c in [comp.name for comp in pred_pose.header.components]]
+                if available:
+                    pred_pose = pred_pose.select_components(available)
+                    gt_pose = gt_pose.select_components(available)
+                    print(f"[POSE SAVE] ✅ Kept components: {available}")
+                else:
+                    print("[POSE SAVE] ⚠️ No target components found, kept all.")
+            else:
+                print("[POSE SAVE] ℹ️ select_components() not available, skipping filtering.")
+        except Exception as e:
+            print(f"[POSE SAVE] ⚠️ Skipped component filtering ({e})")
 
         for pose_obj, label in [(pred_pose, "pred"), (gt_pose, "gt")]:
             data = pose_obj.body.data
