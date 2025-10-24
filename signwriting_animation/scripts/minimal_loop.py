@@ -11,13 +11,11 @@ from matplotlib import animation
 from torch.utils.data import DataLoader, Dataset
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
-from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 
-# ==================== Tensor Utilities ====================
 def _to_plain_tensor(x):
     if hasattr(x, "tensor"):
         x = x.tensor
@@ -36,7 +34,6 @@ def _as_dense_cpu_btjc(x):
     return x
 
 
-# ==================== Header Access ====================
 def _get_pose_header_from_loader(loader):
     ds = loader.dataset
     for _ in range(3):
@@ -66,13 +63,16 @@ def _probe_header_from_csv(csv_path, data_dir):
                     if not os.path.exists(full):
                         continue
                     with open(full, "rb") as pf:
-                        header = Pose.read(pf).header
+                        pose = Pose.read(pf)
                         print(f"[HEADER] Loaded header from: {full}")
-                        return header
+                        print("          Components:", [c.name for c in pose.header.components])
+                        return pose.header
     except Exception as e:
         print(f"[HEADER] Failed to probe CSV: {e}")
     return None
 
+
+# ==================== Pose Saving ====================
 def btjc_to_pose(x_btjc, header, fps=12):
     """Convert [B,T,J,C] → Pose object for saving"""
     x = x_btjc[0].detach().cpu().numpy().astype(np.float32)  # [T,J,C]
@@ -96,11 +96,6 @@ def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
         pred_pose = btjc_to_pose(pred_btjc, header)
         gt_pose   = btjc_to_pose(gt_btjc, header)
 
-        try:
-            pred_pose = pred_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-            gt_pose   = gt_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-        except Exception:
-            pass
 
         os.makedirs("logs", exist_ok=True)
         with open("logs/prediction.pose", "wb") as f:
@@ -150,6 +145,7 @@ def save_scatter_backup(seq_btjc, path, label):
         print(f"[BACKUP] ❌ Failed scatter: {e}")
 
 
+# ==================== Dataset Wrappers ====================
 class FilteredDataset(Dataset):
     def __init__(self, base: Dataset, target_count=4, max_scan=500, min_frames=15):
         self.base = base
@@ -183,6 +179,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=num_workers, collate_fn=zero_pad_collator)
 
 
+# ==================== Main ====================
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
@@ -231,7 +228,6 @@ if __name__ == "__main__":
         gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)
         fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)
 
-        # Simple motion diagnostics
         def frame_disp(x_btjc):
             x = x_btjc[0]
             return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item() if x.size(0) > 1 else 0.0
@@ -247,11 +243,34 @@ if __name__ == "__main__":
         os.makedirs("logs", exist_ok=True)
         torch.save({"gen": gen_btjc_cpu[0], "gt": fut_gt_cpu[0]}, "logs/free_run.pt")
 
-        header = _get_pose_header_from_loader(train_loader)
-        pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header, data_dir, csv_path)
+        header = None
 
-        if not pose_saved:
-            print("[FALLBACK] Using scatter backup...")
-            save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.gif", "PRED")
-            save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.gif", "GT")
+        for root, _, files in os.walk(data_dir):
+            for name in files:
+                if name.endswith(".pose"):
+                    ref_pose_path = os.path.join(root, name)
+                    try:
+                        with open(ref_pose_path, "rb") as f:
+                            pose = Pose.read(f)
+                            header = pose.header
+                            print(f"[HEADER] ✅ Auto-loaded reference header from {ref_pose_path}")
+                            print("          Components:", [c.name for c in header.components])
+                            break
+                    except Exception as e:
+                        print(f"[HEADER] Skipped invalid file: {ref_pose_path} ({e})")
+                        continue
+            if header is not None:
+                break
 
+        # ② fallback：如果上面没找到，就用 loader / CSV 探测
+        if header is None:
+            header = _get_pose_header_from_loader(train_loader)
+        if header is None:
+            header = _probe_header_from_csv(csv_path, data_dir)
+
+        if header:
+            print("[HEADER DEBUG]")
+            for c in header.components:
+                print(f"  - {c.name} ({getattr(c, 'points', 'unknown')} points)")
+        else:
+            print("[HEADER DEBUG] ❌ None (pose header missing!)")
