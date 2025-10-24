@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
+from pose_anonymization.data.normalization import unnormalize_mean_std
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
@@ -85,7 +86,7 @@ def btjc_to_pose(x_btjc, header, fps=12):
 def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
     """
     Save predicted and ground truth poses to .pose files for visualization.
-    Ensures compatibility with sign.mt (removes 3D world coordinates).
+    Includes unnormalization and correct component selection for sign.mt.
     """
     from pose_format import Pose
 
@@ -102,30 +103,42 @@ def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
         pred_pose = btjc_to_pose(pred_btjc, header)
         gt_pose   = btjc_to_pose(gt_btjc, header)
 
+        pred_pose = unnormalize_mean_std(pred_pose)
+        gt_pose   = unnormalize_mean_std(gt_pose)
 
-        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS",
+        for label, pose_obj in [("pred", pred_pose), ("gt", gt_pose)]:
+            data = pose_obj.body.data
+            print(
+                f"[POSE SAVE] After unnormalize ({label}): "
+                f"mean={data.mean():.3f}, std={data.std():.3f}, "
+                f"min={data.min():.3f}, max={data.max():.3f}"
+            )
+
+        try:
+            pred_pose = pred_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+            gt_pose   = gt_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        except Exception:
+            pass
+
+        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS", 
                            "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
-
-        available = [c for c in keep_components if c in pred_pose.body.data]
-        if not available:
-            print("[POSE SAVE] ⚠️ No 2D components found in header, keeping all.")
-        else:
+        header_names = [c.name for c in header.components]
+        available = [c for c in keep_components if c in header_names]
+        if available:
             pred_pose = pred_pose.select_components(available)
             gt_pose   = gt_pose.select_components(available)
             print(f"[POSE SAVE] ✅ Kept components: {available}")
+        else:
+            print(f"[POSE SAVE] ⚠️ No 2D components matched, keeping all.")
 
-        # ======== 4. Scale normalization (optional safeguard) ========
-        # Rescale to ~[0,1] if values look too small or too large
         for pose_obj, label in [(pred_pose, "pred"), (gt_pose, "gt")]:
             data = pose_obj.body.data
-            if np.abs(data).max() < 0.05:  # e.g., all near zero
-                print(f"[POSE SAVE] ⚠️ {label} coords near zero — rescaling by 100.")
+            min_v, max_v = np.min(data), np.max(data)
+            print(f"[POSE SAVE] {label}: range=({min_v:.3f}, {max_v:.3f})")
+            if np.abs(data).max() < 0.05:  # too small
+                print(f"[POSE SAVE] ⚠️ {label} coords very small — scaling ×100")
                 pose_obj.body.data = data * 100.0
-            elif np.abs(data).max() > 100:
-                print(f"[POSE SAVE] ⚠️ {label} coords too large — normalizing to 0–1.")
-                pose_obj.body.data = data / np.abs(data).max()
 
-        # ======== 5. Save to disk ========
         os.makedirs("logs", exist_ok=True)
         pred_path = "logs/prediction.pose"
         gt_path   = "logs/groundtruth.pose"
