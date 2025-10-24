@@ -319,3 +319,10 @@ if __name__ == "__main__":
                 print(f"  - {c.name} ({getattr(c, 'points', 'unknown')} points)")
         else:
             print("[HEADER DEBUG] ❌ None (pose header missing!)")
+
+        # === SAVE POSES FOR VISUALIZATION ===
+        pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header, data_dir, csv_path)
+        if not pose_saved:
+            print("[FALLBACK] Using scatter backup...")
+            save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.gif", "PRED")
+            save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.gif", "GT")
