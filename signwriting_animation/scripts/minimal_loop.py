@@ -264,7 +264,7 @@ if __name__ == "__main__":
     torch.set_default_dtype(torch.float32)
 
     data_dir = "/data/yayun/pose_data"
-    csv_path = "/data/yayun/signwriting-animation/data.csv"
+    csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     batch_size, num_workers = 2, 2
 
     train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers)

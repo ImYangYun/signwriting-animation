@@ -170,7 +170,7 @@ def get_num_workers():
 
 def main():
     data_dir = "/data/yayun/pose_data"
-    csv_path = "/data/yayun/signwriting-animation/data.csv"
+    csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
 
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
