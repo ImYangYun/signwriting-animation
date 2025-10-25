@@ -197,28 +197,56 @@ def save_scatter_backup(seq_btjc, path, label):
 
 # ==================== Dataset Wrappers ====================
 class FilteredDataset(Dataset):
-    def __init__(self, base: Dataset, target_count=4, max_scan=500, min_frames=15):
+    def __init__(self, base: Dataset, target_count=4, max_scan=500, min_frames=15, motion_thresh=1e-3):
+        """
+        Wrapper dataset that filters out too-short or static pose samples.
+        - target_count: how many samples to keep
+        - max_scan: max number of samples to check
+        - min_frames: minimum length in frames
+        - motion_thresh: minimum mean frame-to-frame movement to consider "dynamic"
+        """
         self.base = base
         self.idx = []
         N = len(base)
+
         for i in range(min(N, max_scan)):
             try:
                 it = base[i]
-                if isinstance(it, dict) and "data" in it and "conditions" in it:
-                    data = it["data"]
-                    if hasattr(data, "zero_filled"):
-                        data = data.zero_filled()
-                    if data.shape[1] >= min_frames:
-                        self.idx.append(i)
+                if not isinstance(it, dict) or "data" not in it:
+                    continue
+
+                data = it["data"]
+                if hasattr(data, "zero_filled"):
+                    data = data.zero_filled()
+
+                # Check minimum frames
+                if data.shape[1] < min_frames:
+                    continue
+
+                # Compute mean frame-to-frame motion (|Δpose|)
+                arr = data[0].detach().cpu().numpy()
+                motion = np.abs(arr[1:] - arr[:-1]).mean()
+
+                if motion > motion_thresh:
+                    self.idx.append(i)
+
                 if len(self.idx) >= target_count:
                     break
+
             except Exception:
                 continue
+
         if not self.idx:
+            print("⚠️ No sufficiently dynamic samples found — using [0] as fallback.")
             self.idx = [0]
-    def __len__(self): 
+
+        print(f"[FILTER] Retained {len(self.idx)} / {min(N, max_scan)} samples "
+              f"(motion>{motion_thresh}, frames>={min_frames})")
+
+    def __len__(self):
         return len(self.idx)
-    def __getitem__(self, i): 
+
+    def __getitem__(self, i):
         return self.base[self.idx[i]]
 
 
@@ -226,7 +254,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
     )
-    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15)
+    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15, motion_thresh=1e-3)
 
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
 
@@ -237,7 +265,6 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
         num_workers=num_workers,
         collate_fn=zero_pad_collator,
     )
-
 
 
 # ==================== Main ====================
@@ -260,7 +287,8 @@ if __name__ == "__main__":
     print(f"  input_pose.shape  = {batch['conditions']['input_pose'].shape}")
     print("="*60 + "\n")
 
-    gt = batch["data"][0].cpu().numpy()
+    gt = _to_plain_tensor(batch["data"][0])
+    gt = gt.numpy()
     frame_diff = np.abs(gt[1:] - gt[:-1]).mean()
     print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
     if frame_diff < 1e-3:
