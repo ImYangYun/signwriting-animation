@@ -84,7 +84,10 @@ class SignWritingToPoseDiffusion(nn.Module):
                         sel = sel.squeeze(0).squeeze(0)
                     elif sel.dim() == 2:
                         sel = sel.unsqueeze(1)
-                    return self.embed_timestep.time_embed(sel).permute(1, 0, 2)
+                    out = self.embed_timestep.time_embed(sel)
+                    if out.dim() == 2:
+                        out = out.unsqueeze(0)  # ensure [1, B, D]
+                    return out.permute(1, 0, 2)
                 raise e
 
         self.embed_timestep.forward = safe_forward

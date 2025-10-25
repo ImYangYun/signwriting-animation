@@ -197,7 +197,7 @@ def save_scatter_backup(seq_btjc, path, label):
 
 # ==================== Dataset Wrappers ====================
 class FilteredDataset(Dataset):
-    def __init__(self, base: Dataset, target_count=4, max_scan=500, min_frames=15, motion_thresh=1e-3):
+    def __init__(self, base, target_count=200, max_scan=5000, min_frames=15):
         """
         Wrapper dataset that filters out too-short or static pose samples.
         - target_count: how many samples to keep
@@ -212,46 +212,22 @@ class FilteredDataset(Dataset):
         for i in range(min(N, max_scan)):
             try:
                 it = base[i]
-                if not isinstance(it, dict) or "data" not in it:
-                    continue
-
                 data = it["data"]
                 if hasattr(data, "zero_filled"):
                     data = data.zero_filled()
 
-                # Check minimum frames
-                if data.shape[1] < min_frames:
-                    continue
-
-                # Compute mean frame-to-frame motion (|Δpose|)
-                arr = data.detach().cpu().numpy()  # shape [T, J, C] or [1, T, J, C]
-                if arr.ndim == 4:  # e.g. [B, T, J, C]
-                    arr = arr[0]
-
-                motion = (
-                    float(np.abs(arr[:, 1:, :, :] - arr[:, :-1, :, :]).mean())
-                    if arr.ndim == 4
-                    else float(np.abs(arr[1:] - arr[:-1]).mean())
-                )
-
-                if np.isnan(motion):
-                    motion = 0.0
-
-                if motion > motion_thresh:
+                if data.shape[1] >= min_frames:
                     self.idx.append(i)
-
                 if len(self.idx) >= target_count:
                     break
-
             except Exception:
                 continue
 
         if not self.idx:
-            print("⚠️ No sufficiently dynamic samples found — using [0] as fallback.")
+            print("⚠️ No samples found — using [0] as fallback.")
             self.idx = [0]
 
-        print(f"[FILTER] Retained {len(self.idx)} / {min(N, max_scan)} samples "
-              f"(motion>{motion_thresh}, frames>={min_frames})")
+        print(f"[FILTER] Retained {len(self.idx)} samples (frames ≥ {min_frames})")
 
     def __len__(self):
         return len(self.idx)
