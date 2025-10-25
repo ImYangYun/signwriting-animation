@@ -30,8 +30,17 @@ def _as_dense_cpu_btjc(x):
     if getattr(x, "is_sparse", False):
         x = x.to_dense()
     x = x.detach().float().cpu().contiguous()
-    if x.dim() == 5:  # [B,T,P,J,C] -> [B,T,J,C]
-        x = x[:, :, 0, ...]
+
+    # handle possible permuted dimensions
+    if x.dim() == 5:
+        # [B,T,P,J,C] or [T,B,P,J,C]
+        if x.shape[1] < 5:  # assume T at dim=1
+            x = x[:, :, 0, ...]
+        else:  # assume T at dim=0
+            x = x.permute(1, 0, 2, 3, 4)[:, :, 0, ...]
+    elif x.dim() == 4 and x.shape[0] < x.shape[1]:
+        # maybe [T,B,J,C]
+        x = x.permute(1, 0, 2, 3)
     return x
 
 
@@ -240,12 +249,8 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
     )
-    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15)
-
-    print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
-
     return DataLoader(
-        ds,
+        base,
         batch_size=bs,
         shuffle=True,
         num_workers=num_workers,

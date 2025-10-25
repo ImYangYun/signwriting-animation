@@ -80,12 +80,30 @@ class DynamicPosePredictionDataset(Dataset):
         rec = self.records[idx]
 
         pose_path = os.path.join(self.data_dir, rec["pose"])
+        if not pose_path.endswith(".pose"):
+            pose_path += ".pose"
+
         start = _coalesce_maybe_nan(rec.get("start"))
         end   = _coalesce_maybe_nan(rec.get("end"))
+        
+        if not os.path.exists(pose_path):
+            raise FileNotFoundError(f"[ERR] Pose file not found: {pose_path}")
 
         with open(pose_path, "rb") as f:
-            raw = Pose.read(f, start_time=start, end_time=end)
+            raw = Pose.read(f)
 
+        try:
+            if start is not None or end is not None:
+                total_frames = len(raw.body.data)
+                s = int(start or 0)
+                e = int(end or total_frames)
+                e = min(e, total_frames)
+                if s < e:
+                    raw.body = raw.body[s:e]
+        except Exception as e:
+            print(f"[WARN] Failed slicing {pose_path}: {e}")
+
+        # === 4. Optional holistic reduction ===
         if self._reduce_holistic_fn is not None:
             try:
                 raw = self._reduce_holistic_fn(raw)
@@ -93,12 +111,11 @@ class DynamicPosePredictionDataset(Dataset):
                 pass
         pose = normalize_mean_std(raw)
 
-        # time length
         total_frames = len(pose.body.data)
+        if idx < 3:
+            print(f"[DEBUG] idx={idx} | frames={total_frames} | file={os.path.basename(pose_path)}")
 
-        # guard extremely short sequences
         if total_frames <= 1:
-            # Degenerate: make empty past and 1-frame future
             pivot_frame = 0
             input_pose = pose.body[0:0].torch()
             target_pose = pose.body[0:1].torch()
@@ -114,13 +131,11 @@ class DynamicPosePredictionDataset(Dataset):
             target_end = min(total_frames, pivot_frame + self.num_future_frames)
             target_pose = pose.body[pivot_frame:target_end].torch()
 
-        # Return masked tensors; padding is handled by zero_pad_collator
         input_data  = input_pose.data
         target_data = target_pose.data
         input_mask  = input_pose.data.mask
         target_mask = target_pose.data.mask
 
-        # SignWriting -> CLIP image tensor [3,224,224]
         pil_img = signwriting_to_clip_image(rec.get("text", ""))
         sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
 
@@ -139,7 +154,7 @@ class DynamicPosePredictionDataset(Dataset):
             meta = {
                 "total_frames": total_frames,
                 "sample_start": pivot_frame,
-                "sample_end": pivot_frame + len(target_data),  # approximate
+                "sample_end": pivot_frame + len(target_data),
                 "orig_start": start or 0,
                 "orig_end": end or total_frames,
             }
@@ -148,15 +163,14 @@ class DynamicPosePredictionDataset(Dataset):
         return sample
 
 
-# Optional: quick local sanity check
 def get_num_workers():
     cpu_count = os.cpu_count()
     return 0 if cpu_count is None or cpu_count <= 1 else cpu_count
 
 
 def main():
-    data_dir = "/scratch/yayun/pose_data/raw_poses"
-    csv_path = os.path.join(os.path.dirname(data_dir), "data.csv")
+    data_dir = "/data/yayun/pose_data"
+    csv_path = "/data/yayun/signwriting-animation/data.csv"
 
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
