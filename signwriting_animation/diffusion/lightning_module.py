@@ -144,6 +144,8 @@ class LitMinimal(pl.LightningModule):
         """Forward pass through diffusion model (batch-first format)."""
         x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
         past_bjct = btjc_to_bjct(sanitize_btjc(past_btjc))
+        if timesteps.dtype != torch.long:
+            timesteps = timesteps.long()
         out_bjct  = self.model.forward(x_bjct, timesteps, past_bjct, sign_img)
         pred_btjc = bjct_to_btjc(out_bjct)  # [B,T,J,C]
         return pred_btjc

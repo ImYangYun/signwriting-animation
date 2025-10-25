@@ -224,8 +224,14 @@ class FilteredDataset(Dataset):
                     continue
 
                 # Compute mean frame-to-frame motion (|Δpose|)
-                arr = data[0].detach().cpu().numpy()
-                motion = np.abs(arr[1:] - arr[:-1]).mean()
+                arr = data.detach().cpu().numpy()  # shape [T, J, C] or [1, T, J, C]
+                if arr.ndim == 4:  # e.g. [B, T, J, C]
+                    arr = arr[0]
+
+                motion = float(np.abs(arr[1:] - arr[:-1]).mean())
+
+                if np.isnan(motion):
+                    motion = 0.0
 
                 if motion > motion_thresh:
                     self.idx.append(i)
@@ -254,7 +260,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
     )
-    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15, motion_thresh=1e-3)
+    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15, motion_thresh=5e-5)
 
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
 
