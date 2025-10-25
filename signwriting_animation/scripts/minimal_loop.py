@@ -240,7 +240,7 @@ def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
     )
-    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15, motion_thresh=5e-5)
+    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15)
 
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
 
