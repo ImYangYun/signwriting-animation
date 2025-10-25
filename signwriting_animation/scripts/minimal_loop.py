@@ -228,7 +228,11 @@ class FilteredDataset(Dataset):
                 if arr.ndim == 4:  # e.g. [B, T, J, C]
                     arr = arr[0]
 
-                motion = float(np.abs(arr[1:] - arr[:-1]).mean())
+                motion = (
+                    float(np.abs(arr[:, 1:, :, :] - arr[:, :-1, :, :]).mean())
+                    if arr.ndim == 4
+                    else float(np.abs(arr[1:] - arr[:-1]).mean())
+                )
 
                 if np.isnan(motion):
                     motion = 0.0

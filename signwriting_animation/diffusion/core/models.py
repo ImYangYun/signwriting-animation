@@ -69,6 +69,26 @@ class SignWritingToPoseDiffusion(nn.Module):
         self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
         self.embed_timestep = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
 
+        orig_forward = self.embed_timestep.forward
+
+        def safe_forward(timesteps):
+            try:
+                return orig_forward(timesteps)
+            except RuntimeError as e:
+                if "permute" in str(e) or "sparse_coo" in str(e):
+                    pe = self.sequence_pos_encoder.pe
+                    if isinstance(pe, torch.Tensor) and pe.dim() == 4:
+                        pe = pe.squeeze(0).squeeze(0)
+                    sel = pe[timesteps]
+                    if sel.dim() == 4:
+                        sel = sel.squeeze(0).squeeze(0)
+                    elif sel.dim() == 2:
+                        sel = sel.unsqueeze(1)
+                    return self.embed_timestep.time_embed(sel).permute(1, 0, 2)
+                raise e
+
+        self.embed_timestep.forward = safe_forward
+
         self.seqEncoder = seq_encoder_factory(arch=arch,
                                               latent_dim=num_latent_dims,
                                               ff_size=ff_size,
