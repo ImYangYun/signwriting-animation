@@ -216,17 +216,28 @@ class FilteredDataset(Dataset):
                 continue
         if not self.idx:
             self.idx = [0]
-    def __len__(self): return len(self.idx)
-    def __getitem__(self, i): return self.base[self.idx[i]]
+    def __len__(self): 
+        return len(self.idx)
+    def __getitem__(self, i): 
+        return self.base[self.idx[i]]
 
 
 def make_loader(data_dir, csv_path, split, bs, num_workers):
     base = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
     )
-    ds = FilteredDataset(base, target_count=4, max_scan=1000)
+    ds = FilteredDataset(base, target_count=200, max_scan=5000, min_frames=15)
+
     print(f"[DEBUG] split={split} | batch_size={bs} | len(ds)={len(ds)}")
-    return DataLoader(ds, batch_size=bs, shuffle=True, num_workers=num_workers, collate_fn=zero_pad_collator)
+
+    return DataLoader(
+        ds,
+        batch_size=bs,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=zero_pad_collator,
+    )
+
 
 
 # ==================== Main ====================
@@ -248,6 +259,12 @@ if __name__ == "__main__":
     print(f"  target_mask.shape = {batch['conditions']['target_mask'].shape}")
     print(f"  input_pose.shape  = {batch['conditions']['input_pose'].shape}")
     print("="*60 + "\n")
+
+    gt = batch["data"][0].cpu().numpy()
+    frame_diff = np.abs(gt[1:] - gt[:-1]).mean()
+    print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
+    if frame_diff < 1e-3:
+        print("⚠️ Warning: this GT sample looks static (almost no motion). Try increasing target_count or max_scan.")
 
     model = LitMinimal(log_dir="logs")
     trainer = pl.Trainer(

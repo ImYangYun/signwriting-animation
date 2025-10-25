@@ -237,12 +237,11 @@ class LitMinimal(pl.LightningModule):
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
         """
         Predict the entire future segment in one forward pass (per sample length).
-        - If `target_len` is None, infer per-sample Tf from `target_mask`.
-        - Supports dynamic window (different Tf per sample).
+        Now supports time-varying generation to avoid static outputs.
         """
         print("[GEN/full] ENTER generate_full_sequence", flush=True)
         self.eval()
-        ctx  = sanitize_btjc(past_btjc).to(self.device)     # [B,Tp,J,C]
+        ctx  = sanitize_btjc(past_btjc).to(self.device)  # [B,Tp,J,C]
         sign = sign_img.to(self.device)
         B, _, J, C = ctx.shape
 
@@ -255,27 +254,25 @@ class LitMinimal(pl.LightningModule):
                 tf_list = [int(x) for x in target_len]
         else:
             assert target_mask is not None, "Need target_len or target_mask"
-            mask_bt = self._make_mask_bt(target_mask).to(self.device)      # [B,T]
+            mask_bt = self._make_mask_bt(target_mask).to(self.device)
             tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()
 
         outs = []
         for b in range(B):
             Tf = max(1, int(tf_list[b]))
-            t  = torch.linspace(0, 1, steps=Tf, device=self.device).view(1, Tf, 1, 1)
-            x_query = 0.05 * torch.randn((1, Tf, J, C), device=self.device) + 1.0 * t
-            ts = torch.zeros(1, dtype=torch.long, device=self.device)
-            print(f"[DBG] Tf={Tf}, t.min={float(t.min()):.3f}, t.max={float(t.max()):.3f}", flush=True)
-            print(f"[DBG] x_query.mean={float(x_query.mean()):.5f}, x_query.std={float(x_query.std()):.5f}", flush=True)
-            pred = self.forward(x_query, ts, ctx[b:b+1], sign[b:b+1])  # [1,Tf,J,C]
+            preds = []
+            for t_idx in range(Tf):
+                t_norm = torch.tensor([[t_idx / Tf]], device=self.device)
+                x_query = 0.05 * torch.randn((1, 1, J, C), device=self.device)
+                pred_t = self.forward(x_query, t_norm, ctx[b:b+1], sign[b:b+1])
+                preds.append(pred_t)
+            pred_seq = torch.cat(preds, dim=1)  # [1, Tf, J, C]
+            outs.append(pred_seq)
 
-            if Tf > 1:
-                dv = (pred[:, 1:, :, :2] - pred[:, :-1, :, :2]).abs().mean().item()
-                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred| BEFORE-CPU = {dv:.6f}", flush=True)
-                tv = pred[:, :, :, :2].std(dim=1).mean().item()
-                print(f"[GEN/full] sample {b}, Tf={Tf}, mean|Δpred|={dv:.6f}, time-std={tv:.6f}", flush=True)
-            outs.append(pred)
+            delta_mean = float((pred_seq[:, 1:, :, :2] - pred_seq[:, :-1, :, :2]).abs().mean())
+            print(f"[GEN/full] sample {b}: Tf={Tf}, mean|Δpred|={delta_mean:.6f}", flush=True)
 
-        return torch.cat(outs, dim=0)  # [B,Tf,J,C]
+        return torch.cat(outs, dim=0)
 
     def on_fit_end(self):
         os.makedirs(self.log_dir, exist_ok=True)
