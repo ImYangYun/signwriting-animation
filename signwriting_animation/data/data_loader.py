@@ -103,7 +103,6 @@ class DynamicPosePredictionDataset(Dataset):
         except Exception as e:
             print(f"[WARN] Failed slicing {pose_path}: {e}")
 
-        # === 4. Optional holistic reduction ===
         if self._reduce_holistic_fn is not None:
             try:
                 raw = self._reduce_holistic_fn(raw)
@@ -119,17 +118,30 @@ class DynamicPosePredictionDataset(Dataset):
             pivot_frame = 0
             input_pose = pose.body[0:0].torch()
             target_pose = pose.body[0:1].torch()
-        else:
-            # safe pivot so both windows non-empty
-            min_pivot = 1
-            max_pivot = max(1, total_frames - 1)
-            pivot_frame = random.randint(min_pivot, max_pivot)
 
-            input_start = max(0, pivot_frame - self.num_past_frames)
+        elif total_frames <= (self.num_past_frames + self.num_future_frames + 2):
+            pivot_frame = total_frames // 2
+            input_start = max(0, pivot_frame - self.num_past_frames // 2)
+            target_end = min(total_frames, input_start + self.num_past_frames + self.num_future_frames)
             input_pose = pose.body[input_start:pivot_frame].torch()
-
-            target_end = min(total_frames, pivot_frame + self.num_future_frames)
             target_pose = pose.body[pivot_frame:target_end].torch()
+
+        else:
+            pivot_min = self.num_past_frames
+            pivot_max = total_frames - self.num_future_frames
+            pivot_frame = random.randint(pivot_min, pivot_max)
+
+            input_start = pivot_frame - self.num_past_frames
+            target_end = pivot_frame + self.num_future_frames
+            input_pose = pose.body[input_start:pivot_frame].torch()
+            target_pose = pose.body[pivot_frame:target_end].torch()
+
+        if target_pose.data.shape[0] <= 1:
+            print(f"[WARN] Static segment detected: file={os.path.basename(pose_path)}, frames={total_frames}")
+
+        if idx < 3:
+            print(f"[DEBUG] idx={idx} | total_frames={total_frames} | pivot={pivot_frame} | "
+                  f"past={input_pose.data.shape[0]} | future={target_pose.data.shape[0]} | file={os.path.basename(pose_path)}")
 
         input_data  = input_pose.data
         target_data = target_pose.data
