@@ -361,6 +361,14 @@ if __name__ == "__main__":
         else:
             print("[HEADER DEBUG] ❌ None (pose header missing!)")
 
+        if header and not getattr(header, "skeleton", None):
+            try:
+                from pose_format.utils.holistic import holistic_skeleton
+                header.skeleton = holistic_skeleton()
+                print("✅ Added holistic skeleton to header for visualization.")
+            except Exception as e:
+                print(f"⚠️ Failed to add holistic skeleton: {e}")
+
         # === SAVE POSES FOR VISUALIZATION ===
         pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header, data_dir, csv_path)
         if not pose_saved:
