@@ -128,7 +128,7 @@ def save_scatter_backup(seq_btjc, save_path, title="PRED"):
     print(f"✅ Saved scatter fallback: {save_path}")
 
 
-def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
+def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_holistic=False):
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -136,7 +136,7 @@ def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
         num_future_frames=20,
         with_metadata=True,
         split=split,
-        reduce_holistic=False,
+        reduce_holistic=reduce_holistic,  # ✅ 透传
     )
     loader = DataLoader(
         dataset,
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     batch_size, num_workers = 2, 2
 
-    train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers)
+    train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers, reduce_holistic=True)
     val_loader = train_loader
 
     print("\n" + "="*60)

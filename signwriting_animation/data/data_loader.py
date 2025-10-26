@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
+from pose_format.utils.holistic import reduce_holistic
 from pose_anonymization.data.normalization import normalize_mean_std
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
@@ -115,7 +116,6 @@ class DynamicPosePredictionDataset(Dataset):
             print(f"[SKIP SHORT CLIP] idx={idx} | total_frames={total_frames}")
             return self.__getitem__((idx + 1) % len(self.records))
 
-        # 🧠 Smart pivot logic
         if total_frames <= (self.num_past_frames + self.num_future_frames + 2):
             # short clip: safely center
             pivot_frame = total_frames // 2
@@ -131,7 +131,6 @@ class DynamicPosePredictionDataset(Dataset):
         input_pose = pose.body[input_start:pivot_frame].torch()
         target_pose = pose.body[pivot_frame:target_end].torch()
 
-        # 🧾 Debug info
         if idx < 3:
             print(f"[DEBUG SPLIT] idx={idx} | total={total_frames} | pivot={pivot_frame} | "
                 f"input={input_start}:{pivot_frame} ({input_pose.data.shape[0]}f) | "
