@@ -83,12 +83,11 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_np = to_tjc(gen_btjc_cpu)   # [T, J, C]
         gt_np  = to_tjc(gt_btjc_cpu)    # [T, J, C]
 
-        # ✅ Reshape into [T, C, P, J_per_component]
         components = header.components
-        total_joints = sum(c.points.shape[0] for c in components)
+        total_joints = sum(len(c.points) for c in components)
         assert gen_np.shape[1] == total_joints, f"Mismatch: got {gen_np.shape[1]} joints, expected {total_joints}"
 
-        split_sizes = [c.points.shape[0] for c in components]
+        split_sizes = [len(c.points) for c in components]
         gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
         gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
