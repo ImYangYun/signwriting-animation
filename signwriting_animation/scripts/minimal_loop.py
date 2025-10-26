@@ -60,29 +60,23 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         header = ensure_skeleton(header)
 
         def to_tjc(tensor):
-            """
-            Convert tensor [B,T,J,C] or [B,J,C,T] → [T,J,C] for Pose().
-            Handles both standard and transposed variants safely.
-            """
             x = tensor[0]  # remove batch dimension
-            print(f"[POSE SAVE] input shape: {tuple(x.shape)}")  # debug line
+            if x.ndim == 4 and x.shape[1] == 1:
+                x = x.squeeze(1)  # [T,1,J,C] → [T,J,C]
+                print(f"[POSE SAVE] squeezed extra dim → {x.shape}")
 
-            if x.ndim == 4:
-                # Some rare cases (shouldn’t happen in this pipeline)
-                raise ValueError(f"Unexpected 4D shape {x.shape}: expected 3D [T,J,C] or [J,C,T].")
+            print(f"[POSE SAVE] input shape: {tuple(x.shape)}")
 
-            elif x.ndim == 3:
+            if x.ndim == 3:
                 if x.shape[-1] == 3:
-                    # [T,J,C] (already correct)
                     print("[POSE SAVE] Detected shape [T,J,C]")
                 elif x.shape[-2] == 3:
-                    # [J,C,T] → permute
                     x = x.permute(2, 0, 1)
                     print("[POSE SAVE] Permuted [J,C,T] → [T,J,C]")
                 else:
                     raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
             else:
-                raise ValueError(f"❌ Unsupported tensor ndim={x.ndim}, shape={x.shape}")
+                raise ValueError(f"❌ Unexpected tensor shape {x.shape}: expected 3D [T,J,C].")
 
             return x.numpy().astype(np.float32)
 
