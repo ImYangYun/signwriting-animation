@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 import os
-import csv
+import random
 import torch
 import numpy as np
 import lightning as pl
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import animation
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from pose_format import Pose
-from pose_format.numpy.pose_body import NumPyPoseBody
+from pose_format.pose_visualizer import PoseVisualizer
+from pose_format.utils.holistic import holistic_skeleton
+from pose_format.utils.openpose import openpose_skeleton
 from pose_format.torch.masked.collator import zero_pad_collator
-from pose_anonymization.data.normalization import unnormalize_mean_std
+
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 
 def _to_plain_tensor(x):
+    """Convert MaskedTensor or custom tensor to plain CPU tensor."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -25,240 +27,93 @@ def _to_plain_tensor(x):
     return x.detach().cpu()
 
 def _as_dense_cpu_btjc(x):
-    if hasattr(x, "zero_filled"):
-        x = x.zero_filled()
-    if getattr(x, "is_sparse", False):
-        x = x.to_dense()
-    x = x.detach().float().cpu().contiguous()
+    if hasattr(x, "tensor"):
+        x = x.tensor
+    return x.detach().cpu()
 
-    # handle possible permuted dimensions
-    if x.dim() == 5:
-        # [B,T,P,J,C] or [T,B,P,J,C]
-        if x.shape[1] < 5:  # assume T at dim=1
-            x = x[:, :, 0, ...]
-        else:  # assume T at dim=0
-            x = x.permute(1, 0, 2, 3, 4)[:, :, 0, ...]
-    elif x.dim() == 4 and x.shape[0] < x.shape[1]:
-        # maybe [T,B,J,C]
-        x = x.permute(1, 0, 2, 3)
-    return x
+def ensure_skeleton(header):
+    """Ensure header has a skeleton for visualization."""
+    if header is None:
+        print("⚠️ [ensure_skeleton] header is None, cannot add skeleton.")
+        return None
+    if getattr(header, "skeleton", None):
+        return header  # already has skeleton
 
-
-def _get_pose_header_from_loader(loader):
-    ds = loader.dataset
-    for _ in range(3):
-        if hasattr(ds, "header") and ds.header is not None:
-            return ds.header
-        base = getattr(ds, "base", None) or getattr(ds, "dataset", None)
-        if base is None:
-            break
-        ds = base
     try:
-        sample = loader.dataset[0]
-        if isinstance(sample, dict):
-            meta = sample.get("metadata", {}) or {}
-            return meta.get("pose_header") or meta.get("header")
-    except Exception:
-        pass
-    return None
-
-def _probe_header_from_csv(csv_path, data_dir):
-    try:
-        with open(csv_path, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                p = row.get("pose", "")
-                if isinstance(p, str) and p.lower().endswith(".pose"):
-                    full = p if os.path.isabs(p) else os.path.join(data_dir, p)
-                    if not os.path.exists(full):
-                        continue
-                    with open(full, "rb") as pf:
-                        pose = Pose.read(pf)
-                        print(f"[HEADER] Loaded header from: {full}")
-                        print("          Components:", [c.name for c in pose.header.components])
-                        return pose.header
+        header.skeleton = holistic_skeleton()
+        print("✅ Added holistic skeleton using pose-format utils.")
     except Exception as e:
-        print(f"[HEADER] Failed to probe CSV: {e}")
-    return None
+        print(f"⚠️ holistic_skeleton() not available: {e}")
+        try:
+            header.skeleton = openpose_skeleton()
+            print("✅ Added openpose skeleton as fallback.")
+        except Exception as e2:
+            print(f"❌ Failed to add any skeleton: {e2}")
+    return header
 
 
-# ==================== Pose Saving ====================
-def btjc_to_pose(x_btjc, header, fps=12):
-    """Convert [B,T,J,C] → Pose object for saving"""
-    x = x_btjc[0].detach().cpu().numpy().astype(np.float32)  # [T,J,C]
-    T, J, C = x.shape
-    x = x[:, np.newaxis, :, :]  # [T,1,J,C]
-    conf = np.ones((T, 1, J), dtype=np.float32)
-    body = NumPyPoseBody(fps=fps, data=x, confidence=conf)
-    return Pose(header, body)
-
-def save_pose_files(pred_btjc, gt_btjc, header, data_dir, csv_path):
-    """
-    Save predicted and ground truth poses to .pose files for visualization.
-    Includes unnormalization and correct component selection for sign.mt.
-    """
-    from pose_format import Pose
-
-    # ======== 1. Header sourcing ========
-    if header is None:
-        print("[POSE SAVE] Loading header from CSV...")
-        header = _probe_header_from_csv(csv_path, data_dir)
-
-    if header is None:
-        print("[POSE SAVE] ❌ No header found, skipping .pose export")
-        return False
-
+def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header, data_dir, csv_path):
+    """Save predicted and ground-truth pose sequences as .pose files."""
     try:
-        pred_pose = btjc_to_pose(pred_btjc, header)
-        gt_pose   = btjc_to_pose(gt_btjc, header)
-
-        pred_pose = unnormalize_mean_std(pred_pose)
-        gt_pose   = unnormalize_mean_std(gt_pose)
-
-        for label, pose_obj in [("pred", pred_pose), ("gt", gt_pose)]:
-            data = pose_obj.body.data
-            print(
-                f"[POSE SAVE] After unnormalize ({label}): "
-                f"mean={data.mean():.3f}, std={data.std():.3f}, "
-                f"min={data.min():.3f}, max={data.max():.3f}"
-            )
-
-        try:
-            pred_pose = pred_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-            gt_pose   = gt_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-        except Exception:
-            pass
-
-        header_names = [c.name for c in header.components]
-        keep_components = ["POSE_LANDMARKS", "FACE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
-        try:
-            if hasattr(pred_pose, "select_components"):
-                available = [c for c in keep_components if c in [comp.name for comp in pred_pose.header.components]]
-                if available:
-                    pred_pose = pred_pose.select_components(available)
-                    gt_pose = gt_pose.select_components(available)
-                    print(f"[POSE SAVE] ✅ Kept components: {available}")
-                else:
-                    print("[POSE SAVE] ⚠️ No target components found, kept all.")
-            else:
-                print("[POSE SAVE] ℹ️ select_components() not available, skipping filtering.")
-        except Exception as e:
-            print(f"[POSE SAVE] ⚠️ Skipped component filtering ({e})")
-
-        for pose_obj, label in [(pred_pose, "pred"), (gt_pose, "gt")]:
-            data = pose_obj.body.data
-            min_v, max_v = np.min(data), np.max(data)
-            print(f"[POSE SAVE] {label}: range=({min_v:.3f}, {max_v:.3f})")
-            if np.abs(data).max() < 0.05:  # too small
-                print(f"[POSE SAVE] ⚠️ {label} coords very small — scaling ×100")
-                pose_obj.body.data = data * 100.0
-
         os.makedirs("logs", exist_ok=True)
-        pred_path = "logs/prediction.pose"
-        gt_path   = "logs/groundtruth.pose"
+        header = ensure_skeleton(header)
 
-        with open(pred_path, "wb") as f:
-            pred_pose.write(f)
-        with open(gt_path, "wb") as f:
-            gt_pose.write(f)
+        # Save predicted pose
+        pose_pred = Pose(header, gen_btjc_cpu[0].numpy())
+        with open("logs/prediction.pose", "wb") as f:
+            pose_pred.write(f)
 
-        print("\n" + "="*65)
-        print("✅ Saved .pose files for visualization:")
-        print(f"   • {pred_path}")
-        print(f"   • {gt_path}\n")
-        print("To visualize locally:")
-        print("   visualize_pose -i logs/prediction.pose -o logs/prediction.mp4")
-        print("   visualize_pose -i logs/groundtruth.pose -o logs/groundtruth.mp4\n")
-        print("Or drag the .pose files into https://sign.mt")
-        print("="*65 + "\n")
+        # Save GT pose
+        pose_gt = Pose(header, gt_btjc_cpu[0].numpy())
+        with open("logs/groundtruth.pose", "wb") as f:
+            pose_gt.write(f)
 
+        print("✅ Saved prediction.pose & groundtruth.pose to logs/")
         return True
     except Exception as e:
-        print(f"[POSE SAVE] ❌ Error during save: {e}")
-        import traceback; traceback.print_exc()
+        print(f"❌ Failed saving pose files: {e}")
         return False
 
-def save_scatter_backup(seq_btjc, path, label):
-    try:
-        x = seq_btjc[0, :, :, :2].cpu().numpy()
-        x = x - x.mean(axis=(0, 1), keepdims=True)
-        M = float(np.abs(x).max()) or 1.0
-        x = x / M
-        T = x.shape[0]
 
-        fig, ax = plt.subplots(figsize=(5, 5))
-        sc = ax.scatter([], [], s=15)
-        ax.axis("equal"); ax.set_xlim(-1.1, 1.1); ax.set_ylim(-1.1, 1.1)
-
-        def _init(): sc.set_offsets(np.empty((0, 2))); return sc,
-        def _update(f):
-            ax.set_title(f"{label}: frame {f+1}/{T}")
-            sc.set_offsets(x[f])
-            return sc,
-
-        ani = animation.FuncAnimation(fig, _update, frames=T, init_func=_init, interval=100, blit=True)
-        ani.save(path, writer="pillow", fps=10)
-        plt.close(fig)
-        print(f"[BACKUP] Saved scatter: {path}")
-    except Exception as e:
-        print(f"[BACKUP] ❌ Failed scatter: {e}")
+def save_scatter_backup(seq_btjc, save_path, title="PRED"):
+    """Fallback visualization if pose saving fails."""
+    seq = _to_plain_tensor(seq_btjc)[0]
+    T, J, C = seq.shape
+    plt.figure(figsize=(5, 5))
+    for t in range(0, T, max(1, T // 20)):
+        plt.scatter(seq[t, :, 0], -seq[t, :, 1], label=f"t={t}")
+    plt.legend()
+    plt.title(title)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"✅ Saved scatter fallback: {save_path}")
 
 
-# ==================== Dataset Wrappers ====================
-class FilteredDataset(Dataset):
-    def __init__(self, base, target_count=200, max_scan=5000, min_frames=15):
-        """
-        Wrapper dataset that filters out too-short or static pose samples.
-        - target_count: how many samples to keep
-        - max_scan: max number of samples to check
-        - min_frames: minimum length in frames
-        - motion_thresh: minimum mean frame-to-frame movement to consider "dynamic"
-        """
-        self.base = base
-        self.idx = []
-        N = len(base)
+# ============================== Main Training & Generation ==============================
 
-        for i in range(min(N, max_scan)):
-            try:
-                it = base[i]
-                data = it["data"]
-                if hasattr(data, "zero_filled"):
-                    data = data.zero_filled()
-
-                if data.shape[1] >= min_frames:
-                    self.idx.append(i)
-                if len(self.idx) >= target_count:
-                    break
-            except Exception:
-                continue
-
-        if not self.idx:
-            print("⚠️ No samples found — using [0] as fallback.")
-            self.idx = [0]
-
-        print(f"[FILTER] Retained {len(self.idx)} samples (frames ≥ {min_frames})")
-
-    def __len__(self):
-        return len(self.idx)
-
-    def __getitem__(self, i):
-        return self.base[self.idx[i]]
-
-
-def make_loader(data_dir, csv_path, split, bs, num_workers):
-    base = DynamicPosePredictionDataset(
-        data_dir=data_dir, csv_path=csv_path, with_metadata=True, split=split
+def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
+    dataset = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split=split,
+        reduce_holistic=False,
     )
-    return DataLoader(
-        base,
+    loader = DataLoader(
+        dataset,
         batch_size=bs,
         shuffle=True,
-        num_workers=num_workers,
         collate_fn=zero_pad_collator,
+        num_workers=num_workers,
+        pin_memory=False,
     )
+    return loader
 
 
-# ==================== Main ====================
+# ============================== MAIN ==============================
+
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
@@ -285,6 +140,7 @@ if __name__ == "__main__":
     if frame_diff < 1e-3:
         print("⚠️ Warning: this GT sample looks static (almost no motion). Try increasing target_count or max_scan.")
 
+    # --- Training
     model = LitMinimal(log_dir="logs")
     trainer = pl.Trainer(
         max_steps=500,
@@ -299,6 +155,7 @@ if __name__ == "__main__":
     )
     trainer.fit(model, train_loader, val_loader)
 
+    # --- Generation
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
@@ -317,6 +174,7 @@ if __name__ == "__main__":
         def frame_disp(x_btjc):
             x = x_btjc[0]
             return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item() if x.size(0) > 1 else 0.0
+
         print(f"[GEN] Tf={gen_btjc_cpu.size(1)}, mean|Δpred|={frame_disp(gen_btjc_cpu):.6f}, mean|Δgt|={frame_disp(fut_gt_cpu):.6f}")
 
         try:
@@ -326,11 +184,10 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[EVAL] DTW failed: {e}")
 
-        os.makedirs("logs", exist_ok=True)
-        torch.save({"gen": gen_btjc_cpu[0], "gt": fut_gt_cpu[0]}, "logs/free_run.pt")
-
+        # --- Save & visualize
         header = None
 
+        # ① Try to load header from data_dir
         for root, _, files in os.walk(data_dir):
             for name in files:
                 if name.endswith(".pose"):
@@ -339,39 +196,32 @@ if __name__ == "__main__":
                         with open(ref_pose_path, "rb") as f:
                             pose = Pose.read(f)
                             header = pose.header
-                            print(f"[HEADER] ✅ Auto-loaded reference header from {ref_pose_path}")
-                            print("          Components:", [c.name for c in header.components])
+                            print(f"[HEADER] ✅ Loaded reference header from {ref_pose_path}")
                             break
-                    except Exception as e:
-                        print(f"[HEADER] Skipped invalid file: {ref_pose_path} ({e})")
+                    except Exception:
                         continue
-            if header is not None:
+            if header:
                 break
 
-        # ② fallback：如果上面没找到，就用 loader / CSV 探测
-        if header is None:
-            header = _get_pose_header_from_loader(train_loader)
-        if header is None:
-            header = _probe_header_from_csv(csv_path, data_dir)
-
-        if header:
-            print("[HEADER DEBUG]")
-            for c in header.components:
-                print(f"  - {c.name} ({getattr(c, 'points', 'unknown')} points)")
-        else:
-            print("[HEADER DEBUG] ❌ None (pose header missing!)")
-
-        if header and not getattr(header, "skeleton", None):
-            try:
-                from pose_format.utils.holistic import holistic_skeleton
-                header.skeleton = holistic_skeleton()
-                print("✅ Added holistic skeleton to header for visualization.")
-            except Exception as e:
-                print(f"⚠️ Failed to add holistic skeleton: {e}")
-
-        # === SAVE POSES FOR VISUALIZATION ===
+        header = ensure_skeleton(header)
         pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header, data_dir, csv_path)
+
         if not pose_saved:
             print("[FALLBACK] Using scatter backup...")
             save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.gif", "PRED")
             save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.gif", "GT")
+
+        # --- Convert to video (optional)
+        try:
+            for name in ["prediction", "groundtruth"]:
+                pose_path = f"logs/{name}.pose"
+                if os.path.exists(pose_path):
+                    with open(pose_path, "rb") as f:
+                        pose = Pose.read(f)
+                        if not getattr(pose.header, "skeleton", None):
+                            pose.header.skeleton = holistic_skeleton()
+                        v = PoseVisualizer(pose)
+                        v.save_video(f"logs/{name}.mp4", v.draw())
+                        print(f"🎥 Saved visualization video: logs/{name}.mp4")
+        except Exception as e:
+            print(f"⚠️ Visualization with PoseVisualizer failed: {e}")
