@@ -44,12 +44,12 @@ def build_holistic_header():
 def ensure_skeleton(header):
     """Ensure header exists; rebuild if None or empty"""
     if header is None:
-        print("⚠️ [ensure_skeleton] No header found — building new holistic header")
+        print("[ensure_skeleton] No header found — building new holistic header")
         return build_holistic_header()
     if not getattr(header, "components", None):
-        print("⚠️ [ensure_skeleton] header missing components — rebuilding")
+        print("[ensure_skeleton] header missing components — rebuilding")
         return build_holistic_header()
-    print("ℹ️ Using existing header with components.")
+    print("ℹUsing existing header with components.")
     return header
 
 
@@ -80,12 +80,27 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             return x.numpy().astype(np.float32)
 
-        gen_np = to_tjc(gen_btjc_cpu)
-        gt_np  = to_tjc(gt_btjc_cpu)
-        print(f"[POSE SAVE] final gen_np shape: {gen_np.shape}, gt_np shape: {gt_np.shape}")
+        gen_np = to_tjc(gen_btjc_cpu)   # [T, J, C]
+        gt_np  = to_tjc(gt_btjc_cpu)    # [T, J, C]
 
-        pose_pred = Pose(header, gen_np)
-        pose_gt   = Pose(header, gt_np)
+        # ✅ Reshape into [T, C, P, J_per_component]
+        components = header.components
+        total_joints = sum(c.points.shape[0] for c in components)
+        assert gen_np.shape[1] == total_joints, f"Mismatch: got {gen_np.shape[1]} joints, expected {total_joints}"
+
+        split_sizes = [c.points.shape[0] for c in components]
+        gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
+        gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
+
+        # stack into [T, C, P, J]
+        gen_np_4d = np.stack([x.transpose(0,2,1) for x in gen_split], axis=2)
+        gt_np_4d  = np.stack([x.transpose(0,2,1) for x in gt_split], axis=2)
+
+        print(f"[POSE SAVE] reshaped gen_np → {gen_np_4d.shape}, gt_np → {gt_np_4d.shape}")
+
+        pose_pred = Pose(header, gen_np_4d)
+        pose_gt   = Pose(header, gt_np_4d)
+
 
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
