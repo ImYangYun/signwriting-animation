@@ -10,8 +10,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from pose_format import Pose
 from pose_format.pose_visualizer import PoseVisualizer
-from pose_format.utils.holistic import holistic_skeleton
-from pose_format.utils.openpose import openpose_skeleton
+from pose_format.utils import holistic
+from pose_format.pose import PoseHeader
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
@@ -19,7 +19,6 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_
 
 
 def _to_plain_tensor(x):
-    """Convert MaskedTensor or custom tensor to plain CPU tensor."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -31,65 +30,62 @@ def _as_dense_cpu_btjc(x):
         x = x.tensor
     return x.detach().cpu()
 
-def ensure_skeleton(header):
-    """Ensure header has a skeleton for visualization."""
-    if header is None:
-        print("⚠️ [ensure_skeleton] header is None, cannot add skeleton.")
-        return None
-    if getattr(header, "skeleton", None):
-        return header  # already has skeleton
-
+def build_holistic_header():
+    """Build a full PoseHeader using holistic components"""
     try:
-        header.skeleton = holistic_skeleton()
-        print("✅ Added holistic skeleton using pose-format utils.")
+        components = holistic.holistic_components()
+        header = PoseHeader(components=components)
+        print(f"✅ Built holistic header with {len(components)} components")
+        return header
     except Exception as e:
-        print(f"⚠️ holistic_skeleton() not available: {e}")
-        try:
-            header.skeleton = openpose_skeleton()
-            print("✅ Added openpose skeleton as fallback.")
-        except Exception as e2:
-            print(f"❌ Failed to add any skeleton: {e2}")
+        print(f"❌ Failed to build header: {e}")
+        return None
+
+def ensure_skeleton(header):
+    """Ensure header exists; rebuild if None or empty"""
+    if header is None:
+        print("⚠️ [ensure_skeleton] No header found — building new holistic header")
+        return build_holistic_header()
+    if not getattr(header, "components", None):
+        print("⚠️ [ensure_skeleton] header missing components — rebuilding")
+        return build_holistic_header()
+    print("ℹ️ Using existing header with components.")
     return header
 
 
-def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header, data_dir, csv_path):
-    """Save predicted and ground-truth pose sequences as .pose files."""
+def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
-        # Save predicted pose
-        pose_pred = Pose(header, gen_btjc_cpu[0].numpy())
+        gen_np = gen_btjc_cpu[0].numpy().astype(np.float32)
+        gt_np  = gt_btjc_cpu[0].numpy().astype(np.float32)
+
+        pose_pred = Pose(header, gen_np)
+        pose_gt   = Pose(header, gt_np)
+
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
-
-        # Save GT pose
-        pose_gt = Pose(header, gt_btjc_cpu[0].numpy())
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved prediction.pose & groundtruth.pose to logs/")
+        print("✅ Saved prediction.pose & groundtruth.pose")
         return True
     except Exception as e:
         print(f"❌ Failed saving pose files: {e}")
         return False
 
-
 def save_scatter_backup(seq_btjc, save_path, title="PRED"):
-    """Fallback visualization if pose saving fails."""
     seq = _to_plain_tensor(seq_btjc)[0]
     T, J, C = seq.shape
     plt.figure(figsize=(5, 5))
     for t in range(0, T, max(1, T // 20)):
-        plt.scatter(seq[t, :, 0], -seq[t, :, 1], label=f"t={t}")
-    plt.legend()
+        plt.scatter(seq[t, :, 0], -seq[t, :, 1], s=10)
     plt.title(title)
     plt.savefig(save_path)
     plt.close()
     print(f"✅ Saved scatter fallback: {save_path}")
 
-
-# ============================== Main Training & Generation ==============================
 
 def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
     dataset = DynamicPosePredictionDataset(
@@ -112,8 +108,6 @@ def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
     return loader
 
 
-# ============================== MAIN ==============================
-
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
@@ -133,14 +127,11 @@ if __name__ == "__main__":
     print(f"  input_pose.shape  = {batch['conditions']['input_pose'].shape}")
     print("="*60 + "\n")
 
-    gt = _to_plain_tensor(batch["data"][0])
-    gt = gt.numpy()
+    # quick GT motion sanity check
+    gt = _to_plain_tensor(batch["data"][0]).numpy()
     frame_diff = np.abs(gt[1:] - gt[:-1]).mean()
     print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
-    if frame_diff < 1e-3:
-        print("⚠️ Warning: this GT sample looks static (almost no motion). Try increasing target_count or max_scan.")
 
-    # --- Training
     model = LitMinimal(log_dir="logs")
     trainer = pl.Trainer(
         max_steps=500,
@@ -155,7 +146,7 @@ if __name__ == "__main__":
     )
     trainer.fit(model, train_loader, val_loader)
 
-    # --- Generation
+    # --- Generate
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
@@ -184,19 +175,16 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[EVAL] DTW failed: {e}")
 
-        # --- Save & visualize
+        # save and visualize
         header = None
-
-        # ① Try to load header from data_dir
         for root, _, files in os.walk(data_dir):
             for name in files:
                 if name.endswith(".pose"):
-                    ref_pose_path = os.path.join(root, name)
                     try:
-                        with open(ref_pose_path, "rb") as f:
+                        with open(os.path.join(root, name), "rb") as f:
                             pose = Pose.read(f)
                             header = pose.header
-                            print(f"[HEADER] ✅ Loaded reference header from {ref_pose_path}")
+                            print(f"[HEADER] ✅ Loaded header from {name}")
                             break
                     except Exception:
                         continue
@@ -204,24 +192,8 @@ if __name__ == "__main__":
                 break
 
         header = ensure_skeleton(header)
-        pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header, data_dir, csv_path)
+        pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header)
 
         if not pose_saved:
-            print("[FALLBACK] Using scatter backup...")
             save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.gif", "PRED")
             save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.gif", "GT")
-
-        # --- Convert to video (optional)
-        try:
-            for name in ["prediction", "groundtruth"]:
-                pose_path = f"logs/{name}.pose"
-                if os.path.exists(pose_path):
-                    with open(pose_path, "rb") as f:
-                        pose = Pose.read(f)
-                        if not getattr(pose.header, "skeleton", None):
-                            pose.header.skeleton = holistic_skeleton()
-                        v = PoseVisualizer(pose)
-                        v.save_video(f"logs/{name}.mp4", v.draw())
-                        print(f"🎥 Saved visualization video: logs/{name}.mp4")
-        except Exception as e:
-            print(f"⚠️ Visualization with PoseVisualizer failed: {e}")
