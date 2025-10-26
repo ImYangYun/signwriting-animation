@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
-from pose_format.utils.holistic import reduce_holistic
+from pose_format.utils.generic import reduce_holistic
 from pose_anonymization.data.normalization import normalize_mean_std
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
