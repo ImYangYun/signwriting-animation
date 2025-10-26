@@ -109,39 +109,34 @@ class DynamicPosePredictionDataset(Dataset):
             except Exception:
                 pass
         pose = normalize_mean_std(raw)
-
         total_frames = len(pose.body.data)
-        if idx < 3:
-            print(f"[DEBUG] idx={idx} | frames={total_frames} | file={os.path.basename(pose_path)}")
 
-        if total_frames <= 1:
-            pivot_frame = 0
-            input_pose = pose.body[0:0].torch()
-            target_pose = pose.body[0:1].torch()
+        if total_frames < 5:
+            print(f"[SKIP SHORT CLIP] idx={idx} | total_frames={total_frames}")
+            return self.__getitem__((idx + 1) % len(self.records))
 
-        elif total_frames <= (self.num_past_frames + self.num_future_frames + 2):
+        # 🧠 Smart pivot logic
+        if total_frames <= (self.num_past_frames + self.num_future_frames + 2):
+            # short clip: safely center
             pivot_frame = total_frames // 2
             input_start = max(0, pivot_frame - self.num_past_frames // 2)
             target_end = min(total_frames, input_start + self.num_past_frames + self.num_future_frames)
-            input_pose = pose.body[input_start:pivot_frame].torch()
-            target_pose = pose.body[pivot_frame:target_end].torch()
-
         else:
             pivot_min = self.num_past_frames
             pivot_max = total_frames - self.num_future_frames
             pivot_frame = random.randint(pivot_min, pivot_max)
-
             input_start = pivot_frame - self.num_past_frames
             target_end = pivot_frame + self.num_future_frames
-            input_pose = pose.body[input_start:pivot_frame].torch()
-            target_pose = pose.body[pivot_frame:target_end].torch()
 
-        if target_pose.data.shape[0] <= 1:
-            print(f"[WARN] Static segment detected: file={os.path.basename(pose_path)}, frames={total_frames}")
+        input_pose = pose.body[input_start:pivot_frame].torch()
+        target_pose = pose.body[pivot_frame:target_end].torch()
 
+        # 🧾 Debug info
         if idx < 3:
-            print(f"[DEBUG] idx={idx} | total_frames={total_frames} | pivot={pivot_frame} | "
-                  f"past={input_pose.data.shape[0]} | future={target_pose.data.shape[0]} | file={os.path.basename(pose_path)}")
+            print(f"[DEBUG SPLIT] idx={idx} | total={total_frames} | pivot={pivot_frame} | "
+                f"input={input_start}:{pivot_frame} ({input_pose.data.shape[0]}f) | "
+                f"target={pivot_frame}:{target_end} ({target_pose.data.shape[0]}f) | "
+                f"file={os.path.basename(pose_path)}")
 
         input_data  = input_pose.data
         target_data = target_pose.data
@@ -173,7 +168,6 @@ class DynamicPosePredictionDataset(Dataset):
             sample["metadata"] = {k: torch.tensor([int(v)], dtype=torch.long) for k, v in meta.items()}
 
         return sample
-
 
 def get_num_workers():
     cpu_count = os.cpu_count()
