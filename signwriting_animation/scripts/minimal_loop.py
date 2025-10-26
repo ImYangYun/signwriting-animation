@@ -54,12 +54,41 @@ def ensure_skeleton(header):
 
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
+    """Save predicted and ground-truth pose sequences as .pose files."""
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
-        gen_np = gen_btjc_cpu[0].numpy().astype(np.float32)
-        gt_np  = gt_btjc_cpu[0].numpy().astype(np.float32)
+        def to_tjc(tensor):
+            """
+            Convert tensor [B,T,J,C] or [B,J,C,T] → [T,J,C] for Pose().
+            Handles both standard and transposed variants safely.
+            """
+            x = tensor[0]  # remove batch dimension
+            print(f"[POSE SAVE] input shape: {tuple(x.shape)}")  # debug line
+
+            if x.ndim == 4:
+                # Some rare cases (shouldn’t happen in this pipeline)
+                raise ValueError(f"Unexpected 4D shape {x.shape}: expected 3D [T,J,C] or [J,C,T].")
+
+            elif x.ndim == 3:
+                if x.shape[-1] == 3:
+                    # [T,J,C] (already correct)
+                    print("[POSE SAVE] Detected shape [T,J,C]")
+                elif x.shape[-2] == 3:
+                    # [J,C,T] → permute
+                    x = x.permute(2, 0, 1)
+                    print("[POSE SAVE] Permuted [J,C,T] → [T,J,C]")
+                else:
+                    raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
+            else:
+                raise ValueError(f"❌ Unsupported tensor ndim={x.ndim}, shape={x.shape}")
+
+            return x.numpy().astype(np.float32)
+
+        gen_np = to_tjc(gen_btjc_cpu)
+        gt_np  = to_tjc(gt_btjc_cpu)
+        print(f"[POSE SAVE] final gen_np shape: {gen_np.shape}, gt_np shape: {gt_np.shape}")
 
         pose_pred = Pose(header, gen_np)
         pose_gt   = Pose(header, gt_np)
@@ -69,13 +98,17 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved prediction.pose & groundtruth.pose")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose")
         return True
+
     except Exception as e:
         print(f"❌ Failed saving pose files: {e}")
         return False
 
 def save_scatter_backup(seq_btjc, save_path, title="PRED"):
+    """Fallback visualization if pose saving fails."""
+    if save_path.endswith(".gif"):
+        save_path = save_path.replace(".gif", ".png")
     seq = _to_plain_tensor(seq_btjc)[0]
     T, J, C = seq.shape
     plt.figure(figsize=(5, 5))
@@ -195,5 +228,5 @@ if __name__ == "__main__":
         pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header)
 
         if not pose_saved:
-            save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.gif", "PRED")
-            save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.gif", "GT")
+            save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.png", "PRED")
+            save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.png", "GT")
