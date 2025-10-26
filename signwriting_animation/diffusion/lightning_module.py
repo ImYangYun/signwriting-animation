@@ -186,6 +186,29 @@ class LitMinimal(pl.LightningModule):
             loss = loss_pos + 2.0 * loss_vel
         else:
             loss = loss_pos
+        # ======================= DEBUG PATCH BEGIN ==========================
+        if batch is not None and "conditions" in batch:
+            x = batch["conditions"]["input_pose"]
+            if hasattr(x, "tensor"):
+                x = x.tensor
+            x = x.detach().float()
+            if torch.isnan(x).any():
+                print("[NaN DETECTED] input_pose has NaN")
+            print(f"[CHECK INPUT] mean={x.mean().item():.4f}, std={x.std().item():.4f}, "
+                f"min={x.min().item():.4f}, max={x.max().item():.4f}, shape={tuple(x.shape)}")
+
+        # 检查参数是否有 NaN
+        for name, p in self.named_parameters():
+            if torch.isnan(p).any():
+                print(f"[NaN PARAM] {name}")
+
+        # 检查输出是否异常
+        if torch.isnan(pred).any():
+            print("[NaN DETECTED] model output (pred) has NaN")
+        else:
+            print(f"[CHECK OUTPUT] mean={pred.mean().item():.4f}, std={pred.std().item():.4f}, "
+                f"min={pred.min().item():.4f}, max={pred.max().item():.4f}, shape={tuple(pred.shape)}")
+        # ======================= DEBUG PATCH END ==========================
 
         if self.global_step == 0:
             with torch.no_grad():

@@ -116,40 +116,37 @@ class SignWritingToPoseDiffusion(nn.Module):
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
         """
-        Performs classifier-free guidance by running a forward pass of the diffusion model in either
-        conditional or unconditional mode.
-
-        Args:
-            x (Tensor):
-                The noisy input tensor at the current diffusion step, denoted as x_t in the CAMDM paper.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_future_frames].
-
-            timesteps (Tensor):
-                Diffusion timesteps for each sample in the batch.
-                Shape: [batch_size], dtype: int.
-
-            past_motion (Tensor):
-                Tensor containing motion history information.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_past_frames].
-
-            signwriting_im_batch (Tensor):
-                Batch of rendered SignWriting images.
-                Shape: [batch_size, 3, 224, 224].
-
-        Returns:
-            Tensor:
-                Predicted future motion.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_future_frames].
+        Performs classifier-free guidance by running a forward pass of the diffusion model.
         """
 
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
+        def _stat(name, tensor):
+            if tensor is None:
+                return
+            if torch.isnan(tensor).any():
+                print(f"[NaN DETECTED] {name} has NaN")
+            else:
+                print(f"[DBG/model] {name} mean={tensor.mean().item():.4f}, std={tensor.std().item():.4f}, "
+                    f"min={tensor.min().item():.4f}, max={tensor.max().item():.4f}, shape={tuple(tensor.shape)}")
+        # ======================= DEBUG PATCH END ==========================
+
+        _stat("input_x", x)
+        _stat("past_motion", past_motion)
+        _stat("signwriting_im_batch", signwriting_im_batch)
+
+        # ---- 1. Embeddings ----
         time_emb = self.embed_timestep(timesteps)                 # [1, B, D]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
+
+        _stat("time_emb", time_emb)
+        _stat("signwriting_emb", signwriting_emb)
 
         # ---- 2. Local motion embeddings ----
         past_motion_emb = self.past_motion_process(past_motion)   # [Tp, B, D]
         future_motion_emb = self.future_motion_process(x)         # [Tf, B, D]
+        _stat("past_motion_emb", past_motion_emb)
+        _stat("future_motion_emb", future_motion_emb)
 
         # ---- 3. Add continuous time embedding to future ----
         Tf = future_motion_emb.size(0)
@@ -159,28 +156,21 @@ class SignWritingToPoseDiffusion(nn.Module):
         t_latent = t_latent.expand(-1, B, -1)                     # [Tf,B,D]
         future_motion_emb = future_motion_emb + 2.0 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
-
-        with torch.no_grad():
-            fut_time_std = future_motion_emb.float().std(dim=0).mean().item()
-            print(f"[DBG/model] future_emb time-std={fut_time_std:.6f}", flush=True)
+        _stat("future_motion_emb + time", future_motion_emb)
 
         time_cond = time_emb.repeat(Tf, 1, 1)         # [Tf,B,D]
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)  # [Tf,B,D]
-
         xseq = future_motion_emb + 0.5 * (time_cond + sign_cond)
         xseq = self.sequence_pos_encoder(xseq)
+        _stat("xseq_after_posenc", xseq)
 
-        with torch.no_grad():
-            pos_enc_time_std = xseq.float().std(dim=0).mean().item()
-            print(f"[DBG/model] after_pos_enc time-std={pos_enc_time_std:.6f}", flush=True)
+        output = self.seqEncoder(xseq)                # [Tf,B,D]
+        _stat("encoder_out", output)
 
-        output = self.seqEncoder(xseq)               # [Tf,B,D]
+        output = self.pose_projection(output)         # [B,J,C,T]
+        _stat("pose_projection_output", output)
 
-        with torch.no_grad():
-            enc_time_std = output.float().std(dim=0).mean().item()
-            print(f"[DBG/model] encoder_out time-std={enc_time_std:.6f}", flush=True)
-
-        output = self.pose_projection(output)        # [B,J,C,T]
+        # ======================= DEBUG PATCH END ==========================
         return output
 
     def interface(self,
