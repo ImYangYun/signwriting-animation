@@ -58,20 +58,31 @@ def ensure_skeleton(header):
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """
-    Save predicted and ground-truth pose sequences as .pose files (component-safe, NumPyPoseBody).
-    Handles multi-component headers and avoids NumPyPoseBody mask mismatch issues.
+    Save predicted and ground-truth pose sequences as .pose files (NumPyPoseBody-safe version).
+    Fixes mismatched mask/data sizes and header 2D format issues.
     """
+    import numpy as np
+    import numpy.ma as ma
+    from pose_format import Pose
+    from pose_format.numpy.pose_body import NumPyPoseBody
+    from pose_format.pose_header import PoseHeader, PoseHeaderComponent
+    import os
 
     try:
         os.makedirs("logs", exist_ok=True)
-        header = ensure_skeleton(header)
-        new_components = []
-        for c in header.components:
-            c.format = "XYZ"
-            new_components.append(c)
-        header.components = new_components
-        print("[DEBUG] header component formats:", [c.format for c in header.components])
 
+        # ✅ Rebuild a clean 3D holistic header to avoid mixed 2D/3D component issues
+        components = [
+            PoseHeaderComponent(name="pose", format="XYZ", points=[f"p{i}" for i in range(33)]),
+            PoseHeaderComponent(name="face", format="XYZ", points=[f"f{i}" for i in range(478)]),
+            PoseHeaderComponent(name="hand_left", format="XYZ", points=[f"lh{i}" for i in range(21)]),
+            PoseHeaderComponent(name="hand_right", format="XYZ", points=[f"rh{i}" for i in range(21)]),
+            PoseHeaderComponent(name="world", format="XYZ", points=[f"w{i}" for i in range(33)]),
+        ]
+        header = PoseHeader(version=0.1, components=components)
+        print("[HEADER] 🔄 Rebuilt unified 3D header with 5 components (XYZ each)")
+
+        # ---------------------- helper: convert to [T,J,C] ----------------------
         def to_tjc(tensor):
             """Convert [B,T,J,C] → [T,J,C]."""
             x = tensor[0]
@@ -90,44 +101,29 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
-        components = header.components
-        split_sizes = [len(c.points) for c in components]
+        split_sizes = [len(c.points) for c in header.components]
         print(f"[DEBUG] header components: {split_sizes}")
 
         gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
         gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
+        # ---------------------- Safe NumPyPoseBody ----------------------
         class SafeNumPyPoseBody(NumPyPoseBody):
             def __init__(self, fps, data, confidence):
                 self.fps = fps
                 self.data = data
                 self.confidence = confidence
 
-        # ---------------------- build NumPyPoseBody from split ----------------------
-        def make_pose_body(header, split_list):
+        def make_pose_body(split_list):
             body_components = []
-            for i, (component, data) in enumerate(zip(header.components, split_list)):
-                expected_joints = len(component.points)
+            for i, data in enumerate(split_list):
                 arr = data.transpose(0, 2, 1)  # [T,C,J]
-                if arr.shape[-1] != expected_joints:
-                    fixed = np.zeros((arr.shape[0], arr.shape[1], expected_joints), dtype=arr.dtype)
-                    fixed[..., :min(expected_joints, arr.shape[-1])] = arr[..., :min(expected_joints, arr.shape[-1])]
-                    arr = fixed
                 body_components.append(arr)
-
-            # pad to same joint count
-            max_joints = sum(len(c.points) for c in header.components)
-            for i in range(len(body_components)):
-                if body_components[i].shape[-1] < max_joints:
-                    pad = np.zeros((body_components[i].shape[0], body_components[i].shape[1],
-                                    max_joints - body_components[i].shape[-1]))
-                    body_components[i] = np.concatenate([body_components[i], pad], axis=-1)
 
             # stack → [T,C,P,J]
             body = np.stack(body_components, axis=2)
-            fps = getattr(header, "fps", 25)
+            fps = 25
 
-            # create empty mask + confidence
             mask = np.zeros_like(body, dtype=bool)
             masked_body = ma.masked_array(body, mask=mask)
             confidence = np.ones((body.shape[0], body.shape[2], body.shape[3]), dtype=np.float32)
@@ -135,15 +131,17 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[POSE SAVE] built NumPyPoseBody: data={body.shape}, confidence={confidence.shape}, fps={fps}")
             return SafeNumPyPoseBody(fps=fps, data=masked_body, confidence=confidence)
 
-        pose_pred = Pose(header, make_pose_body(header, gen_split))
-        pose_gt   = Pose(header, make_pose_body(header, gt_split))
+        # build pose objects
+        pose_pred = Pose(header, make_pose_body(gen_split))
+        pose_gt   = Pose(header, make_pose_body(gt_split))
 
+        # save files
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (SafeNumPyPoseBody)")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose successfully (SafeNumPyPoseBody)")
         return True
 
     except Exception as e:
