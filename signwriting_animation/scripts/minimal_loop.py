@@ -55,14 +55,17 @@ def ensure_skeleton(header):
 
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
-    """Save predicted and ground-truth pose sequences as .pose files (holistic mode)."""
+    """Save predicted and ground-truth pose sequences as .pose files (auto-adapt to header)."""
+    import numpy as np
+    from pose_format import Pose
+
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
         def to_tjc(tensor):
             """Convert [B,T,J,C] → [T,J,C] for Pose()."""
-            x = tensor[0]  # remove batch
+            x = tensor[0]
             if x.ndim == 4 and x.shape[1] == 1:
                 x = x.squeeze(1)
                 print(f"[POSE SAVE] squeezed extra dim → {x.shape}")
@@ -87,21 +90,33 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         for c in header.components:
             print(f"  - {c.name:20s} | points={len(c.points)}")
 
-        assert gen_np.shape[1] == total_joints, \
-            f"Mismatch: gen_np has {gen_np.shape[1]} joints, header defines {total_joints}"
+        components = header.components
+        split_sizes = [len(c.points) for c in components]
 
-        # --- Direct holistic save (flat structure [T,C,J]) ---
-        pose_pred = Pose(header, gen_np.transpose(0, 2, 1))  # [T,C,J]
-        pose_gt   = Pose(header, gt_np.transpose(0, 2, 1))   # [T,C,J]
+        if len(components) == 1:
+            # ✅ Simple header: can save as [T,C,J]
+            print("[POSE SAVE] Single-component header detected → saving as [T,C,J]")
+            pose_pred = Pose(header, gen_np.transpose(0, 2, 1))
+            pose_gt   = Pose(header, gt_np.transpose(0, 2, 1))
 
+        else:
+            # ✅ Multi-component holistic header: must reshape to [T,C,P,J]
+            print("[POSE SAVE] Multi-component header detected → reshape to [T,C,P,J]")
+            gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
+            gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
+            gen_np_4d = np.stack([x.transpose(0, 2, 1) for x in gen_split], axis=2)
+            gt_np_4d  = np.stack([x.transpose(0, 2, 1) for x in gt_split], axis=2)
+            print(f"[POSE SAVE] reshaped gen_np_4d={gen_np_4d.shape}, gt_np_4d={gt_np_4d.shape}")
+            pose_pred = Pose(header, gen_np_4d)
+            pose_gt   = Pose(header, gt_np_4d)
+
+        # ========= Save to disk =========
         print(f"[POSE SAVE] final Pose shapes: pred={pose_pred.body.data.shape}, gt={pose_gt.body.data.shape}")
-
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
-
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (flat holistic mode)")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose")
         return True
 
     except Exception as e:
