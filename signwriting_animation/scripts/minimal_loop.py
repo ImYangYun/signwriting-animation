@@ -45,46 +45,73 @@ def build_holistic_header():
         return None
 
 def ensure_skeleton(header):
-    """Ensure header exists; rebuild if None or empty"""
-    if header is None:
-        print("[ensure_skeleton] No header found — building new holistic header")
-        return build_holistic_header()
-    if not getattr(header, "components", None):
-        print("[ensure_skeleton] header missing components — rebuilding")
-        return build_holistic_header()
-    print("ℹUsing existing header with components.")
+    """
+    Ensure the PoseHeader exists and includes components compatible
+    with this older pose-format version (using point_format='XYZ').
+    """
+    from pose_format.pose_header import PoseHeader, PoseHeaderComponent
+
+    if header is not None and getattr(header, "components", None):
+        print("ℹ Using existing header with components.")
+        return header
+
+    print("[ensure_skeleton] ⚙ Building fallback holistic header (legacy pose-format)")
+
+    components = [
+        PoseHeaderComponent(
+            name="pose",
+            points=[f"p{i}" for i in range(33)],
+            limbs=[],
+            colors=[],
+            point_format="XYZ",
+        ),
+        PoseHeaderComponent(
+            name="face",
+            points=[f"f{i}" for i in range(478)],
+            limbs=[],
+            colors=[],
+            point_format="XYZ",
+        ),
+        PoseHeaderComponent(
+            name="hand_left",
+            points=[f"lh{i}" for i in range(21)],
+            limbs=[],
+            colors=[],
+            point_format="XYZ",
+        ),
+        PoseHeaderComponent(
+            name="hand_right",
+            points=[f"rh{i}" for i in range(21)],
+            limbs=[],
+            colors=[],
+            point_format="XYZ",
+        ),
+        PoseHeaderComponent(
+            name="world",
+            points=[f"w{i}" for i in range(33)],
+            limbs=[],
+            colors=[],
+            point_format="XYZ",
+        ),
+    ]
+
+    header = PoseHeader(version=0.1, components=components)
+    print("[ensure_skeleton] ✅ Built header with 5 components.")
     return header
 
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """
-    Save predicted and ground-truth pose sequences as .pose files (NumPyPoseBody-safe version).
-    Fixes mismatched mask/data sizes and header 2D format issues.
+    Save predicted and ground-truth pose sequences as .pose files.
+    Compatible with legacy pose-format using NumPyPoseBody.
     """
-    import numpy as np
-    import numpy.ma as ma
-    from pose_format import Pose
-    from pose_format.numpy.pose_body import NumPyPoseBody
-    from pose_format.pose_header import PoseHeader, PoseHeaderComponent
-    import os
 
     try:
         os.makedirs("logs", exist_ok=True)
+        header = ensure_skeleton(header)
 
-        # ✅ Rebuild a clean 3D holistic header to avoid mixed 2D/3D component issues
-        components = [
-            PoseHeaderComponent(name="pose", dimensions="XYZ", points=[f"p{i}" for i in range(33)]),
-            PoseHeaderComponent(name="face", dimensions="XYZ", points=[f"f{i}" for i in range(478)]),
-            PoseHeaderComponent(name="hand_left", dimensions="XYZ", points=[f"lh{i}" for i in range(21)]),
-            PoseHeaderComponent(name="hand_right", dimensions="XYZ", points=[f"rh{i}" for i in range(21)]),
-            PoseHeaderComponent(name="world", dimensions="XYZ", points=[f"w{i}" for i in range(33)]),
-        ]
-        header = PoseHeader(version=0.1, components=components)
-        print("[HEADER] 🔄 Rebuilt unified 3D header with 5 components (XYZ each)")
-
-        # ---------------------- helper: convert to [T,J,C] ----------------------
+        # convert tensor → numpy [T,J,C]
         def to_tjc(tensor):
-            """Convert [B,T,J,C] → [T,J,C]."""
             x = tensor[0]
             if x.ndim == 4 and x.shape[1] == 1:
                 x = x.squeeze(1)
@@ -101,47 +128,37 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
-        split_sizes = [len(c.points) for c in header.components]
+        components = header.components
+        split_sizes = [len(c.points) for c in components]
         print(f"[DEBUG] header components: {split_sizes}")
 
         gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
         gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
-        # ---------------------- Safe NumPyPoseBody ----------------------
-        class SafeNumPyPoseBody(NumPyPoseBody):
-            def __init__(self, fps, data, confidence):
-                self.fps = fps
-                self.data = data
-                self.confidence = confidence
-
+        # --- combine splits into NumPyPoseBody (masked) ---
         def make_pose_body(split_list):
             body_components = []
-            for i, data in enumerate(split_list):
+            for data in split_list:
                 arr = data.transpose(0, 2, 1)  # [T,C,J]
                 body_components.append(arr)
 
-            # stack → [T,C,P,J]
-            body = np.stack(body_components, axis=2)
-            fps = 25
-
+            body = np.stack(body_components, axis=2)  # [T,C,P,J]
             mask = np.zeros_like(body, dtype=bool)
             masked_body = ma.masked_array(body, mask=mask)
             confidence = np.ones((body.shape[0], body.shape[2], body.shape[3]), dtype=np.float32)
-
+            fps = getattr(header, "fps", 25)
             print(f"[POSE SAVE] built NumPyPoseBody: data={body.shape}, confidence={confidence.shape}, fps={fps}")
-            return SafeNumPyPoseBody(fps=fps, data=masked_body, confidence=confidence)
+            return NumPyPoseBody(fps=fps, data=masked_body, confidence=confidence)
 
-        # build pose objects
         pose_pred = Pose(header, make_pose_body(gen_split))
         pose_gt   = Pose(header, make_pose_body(gt_split))
 
-        # save files
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose successfully (SafeNumPyPoseBody)")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (NumPyPoseBody legacy-safe)")
         return True
 
     except Exception as e:
