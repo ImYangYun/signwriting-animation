@@ -66,8 +66,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
         for c in header.components:
-            if len(c.format) != 3:
-                c.format = "XYZ"
+            c.format = "XYZ"
 
         # ---------------------- helper: convert to [T,J,C] ----------------------
         def to_tjc(tensor):
