@@ -61,15 +61,13 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     Save predicted and ground-truth pose sequences as .pose files (component-safe, NumPyPoseBody).
     Handles multi-component headers and avoids NumPyPoseBody mask mismatch issues.
     """
-    import numpy as np
-    import numpy.ma as ma
-    from pose_format.numpy.pose_body import NumPyPoseBody
-    from pose_format import Pose
-    import os
 
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
+        for c in header.components:
+            if len(c.format) != 3:
+                c.format = "XYZ"
 
         # ---------------------- helper: convert to [T,J,C] ----------------------
         def to_tjc(tensor):
