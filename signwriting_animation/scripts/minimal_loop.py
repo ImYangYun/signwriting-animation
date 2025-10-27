@@ -106,8 +106,12 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
                                     max_joints - body_components[i].shape[-1]))
                     body_components[i] = np.concatenate([body_components[i], pad], axis=-1)
 
+            fps = getattr(header, "fps", 25)  # fallback for old headers
             body = np.stack(body_components, axis=2)
-            return NumPyPoseBody(fps=getattr(header, "fps", 25), data=body)
+            confidence = np.ones((body.shape[0], body.shape[2], body.shape[3]), dtype=np.float32)
+            
+            print(f"[POSE SAVE] built NumPyPoseBody: data={body.shape}, confidence={confidence.shape}, fps={fps}")
+            return NumPyPoseBody(fps=fps, data=body, confidence=confidence)
 
         pose_pred = Pose(header, make_pose_body(header, gen_split))
         pose_gt   = Pose(header, make_pose_body(header, gt_split))
