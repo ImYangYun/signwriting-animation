@@ -65,10 +65,13 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
+        new_components = []
         for c in header.components:
             c.format = "XYZ"
+            new_components.append(c)
+        header.components = new_components
+        print("[DEBUG] header component formats:", [c.format for c in header.components])
 
-        # ---------------------- helper: convert to [T,J,C] ----------------------
         def to_tjc(tensor):
             """Convert [B,T,J,C] → [T,J,C]."""
             x = tensor[0]
