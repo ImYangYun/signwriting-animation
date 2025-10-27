@@ -107,7 +107,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
                     body_components[i] = np.concatenate([body_components[i], pad], axis=-1)
 
             body = np.stack(body_components, axis=2)
-            return NumPyPoseBody(fps=header.fps, data=body)
+            return NumPyPoseBody(fps=getattr(header, "fps", 25), data=body)
 
         pose_pred = Pose(header, make_pose_body(header, gen_split))
         pose_gt   = Pose(header, make_pose_body(header, gt_split))
