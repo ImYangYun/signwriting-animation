@@ -13,7 +13,7 @@ from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.generic import reduce_holistic
 from pose_format.utils import holistic
 from pose_format.pose import PoseHeader
-from pose_format.pose_body import NumPyPoseBody
+from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
@@ -123,7 +123,6 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     except Exception as e:
         print(f"❌ Failed saving pose files: {e}")
         return False
-
 
 def save_scatter_backup(seq_btjc, save_path, title="PRED"):
     """Fallback visualization if pose saving fails."""
