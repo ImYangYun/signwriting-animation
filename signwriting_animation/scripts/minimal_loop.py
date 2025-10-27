@@ -73,11 +73,11 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
         # ✅ Rebuild a clean 3D holistic header to avoid mixed 2D/3D component issues
         components = [
-            PoseHeaderComponent(name="pose", format="XYZ", points=[f"p{i}" for i in range(33)]),
-            PoseHeaderComponent(name="face", format="XYZ", points=[f"f{i}" for i in range(478)]),
-            PoseHeaderComponent(name="hand_left", format="XYZ", points=[f"lh{i}" for i in range(21)]),
-            PoseHeaderComponent(name="hand_right", format="XYZ", points=[f"rh{i}" for i in range(21)]),
-            PoseHeaderComponent(name="world", format="XYZ", points=[f"w{i}" for i in range(33)]),
+            PoseHeaderComponent(name="pose", dimensions="XYZ", points=[f"p{i}" for i in range(33)]),
+            PoseHeaderComponent(name="face", dimensions="XYZ", points=[f"f{i}" for i in range(478)]),
+            PoseHeaderComponent(name="hand_left", dimensions="XYZ", points=[f"lh{i}" for i in range(21)]),
+            PoseHeaderComponent(name="hand_right", dimensions="XYZ", points=[f"rh{i}" for i in range(21)]),
+            PoseHeaderComponent(name="world", dimensions="XYZ", points=[f"w{i}" for i in range(33)]),
         ]
         header = PoseHeader(version=0.1, components=components)
         print("[HEADER] 🔄 Rebuilt unified 3D header with 5 components (XYZ each)")
