@@ -61,58 +61,54 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         header = ensure_skeleton(header)
 
         def to_tjc(tensor):
-            x = tensor[0]  # remove batch dimension
+            """Convert [B,T,J,C] → [T,J,C] for Pose()."""
+            x = tensor[0]  # remove batch
             if x.ndim == 4 and x.shape[1] == 1:
-                x = x.squeeze(1)  # [T,1,J,C] → [T,J,C]
+                x = x.squeeze(1)
                 print(f"[POSE SAVE] squeezed extra dim → {x.shape}")
-
-            print(f"[POSE SAVE] input shape: {tuple(x.shape)}")
-
-            if x.ndim == 3:
-                if x.shape[-1] == 3:
-                    print("[POSE SAVE] Detected shape [T,J,C]")
-                elif x.shape[-2] == 3:
-                    x = x.permute(2, 0, 1)
-                    print("[POSE SAVE] Permuted [J,C,T] → [T,J,C]")
-                else:
-                    raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
+            if x.ndim != 3:
+                raise ValueError(f"Unexpected tensor shape {x.shape}")
+            if x.shape[-1] == 3:
+                print("[POSE SAVE] Detected shape [T,J,C]")
+            elif x.shape[-2] == 3:
+                x = x.permute(2, 0, 1)
+                print("[POSE SAVE] Permuted [J,C,T] → [T,J,C]")
             else:
-                raise ValueError(f"❌ Unexpected tensor shape {x.shape}: expected 3D [T,J,C].")
-
+                raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
             return x.numpy().astype(np.float32)
 
-        gen_np = to_tjc(gen_btjc_cpu)   # [T, J, C]
-        gt_np  = to_tjc(gt_btjc_cpu)    # [T, J, C]
+        gen_np = to_tjc(gen_btjc_cpu)
+        gt_np  = to_tjc(gt_btjc_cpu)
+
         print(f"[DEBUG] gen_np shape: {gen_np.shape}, gt_np shape: {gt_np.shape}")
         print(f"[DEBUG] header joints: {sum(len(c.points) for c in header.components)}")
         print("\n[DEBUG] Header components detail:")
         for c in header.components:
-            print(f"  - {c.name:15s} | points={len(c.points)}")
-            
-        try:
-            pose_pred = reduce_holistic(pose_pred)
-            pose_gt = reduce_holistic(pose_gt)
-            print("✅ Applied reduce_holistic() before saving pose files.")
-        except Exception as e:
-            print(f"⚠️ Could not reduce holistic for saving: {e}")
+            print(f"  - {c.name:20s} | points={len(c.points)}")
 
+        # --- Split according to header.components ---
         components = header.components
-        total_joints = sum(len(c.points) for c in components)
-        assert gen_np.shape[1] == total_joints, f"Mismatch: got {gen_np.shape[1]} joints, expected {total_joints}"
-
         split_sizes = [len(c.points) for c in components]
         gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
         gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
-        # stack into [T, C, P, J]
-        gen_np_4d = np.stack([x.transpose(0,2,1) for x in gen_split], axis=2)
-        gt_np_4d  = np.stack([x.transpose(0,2,1) for x in gt_split], axis=2)
+        # --- Pad to same joint count across components ---
+        max_joints = max(x.shape[1] for x in gen_split)
+        def pad_to(x, max_len):
+            pad = np.zeros((x.shape[0], max_len - x.shape[1], x.shape[2]), dtype=x.dtype)
+            return np.concatenate([x, pad], axis=1)
 
-        print(f"[POSE SAVE] reshaped gen_np → {gen_np_4d.shape}, gt_np → {gt_np_4d.shape}")
+        gen_split = [pad_to(x, max_joints) for x in gen_split]
+        gt_split  = [pad_to(x, max_joints) for x in gt_split]
+
+        # --- Stack into 4D [T, C, P, J]
+        gen_np_4d = np.stack([x.transpose(0, 2, 1) for x in gen_split], axis=2)
+        gt_np_4d  = np.stack([x.transpose(0, 2, 1) for x in gt_split], axis=2)
+
+        print(f"[POSE SAVE] final shapes: gen_np_4d={gen_np_4d.shape}, gt_np_4d={gt_np_4d.shape}")
 
         pose_pred = Pose(header, gen_np_4d)
         pose_gt   = Pose(header, gt_np_4d)
-
 
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
