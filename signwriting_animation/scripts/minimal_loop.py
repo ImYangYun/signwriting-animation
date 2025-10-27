@@ -13,6 +13,7 @@ from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.generic import reduce_holistic
 from pose_format.utils import holistic
 from pose_format.pose import PoseHeader
+from pose_format.pose_body import PoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
@@ -55,27 +56,24 @@ def ensure_skeleton(header):
 
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
-    """Save predicted and ground-truth pose sequences as .pose files (auto-adapt to header)."""
+    """Save predicted and ground-truth pose sequences as .pose files (component-safe)."""
     import numpy as np
-    from pose_format import Pose
 
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
         def to_tjc(tensor):
-            """Convert [B,T,J,C] → [T,J,C] for Pose()."""
+            """Convert [B,T,J,C] → [T,J,C]."""
             x = tensor[0]
             if x.ndim == 4 and x.shape[1] == 1:
                 x = x.squeeze(1)
-                print(f"[POSE SAVE] squeezed extra dim → {x.shape}")
             if x.ndim != 3:
                 raise ValueError(f"Unexpected tensor shape {x.shape}")
             if x.shape[-1] == 3:
-                print("[POSE SAVE] Detected shape [T,J,C]")
+                pass
             elif x.shape[-2] == 3:
                 x = x.permute(2, 0, 1)
-                print("[POSE SAVE] Permuted [J,C,T] → [T,J,C]")
             else:
                 raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
             return x.numpy().astype(np.float32)
@@ -83,49 +81,23 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
-        total_joints = sum(len(c.points) for c in header.components)
-        print(f"[DEBUG] gen_np shape: {gen_np.shape}, gt_np shape: {gt_np.shape}")
-        print(f"[DEBUG] header joints: {total_joints}")
-        print("\n[DEBUG] Header components detail:")
-        for c in header.components:
-            print(f"  - {c.name:20s} | points={len(c.points)}")
-
         components = header.components
         split_sizes = [len(c.points) for c in components]
+        print(f"[DEBUG] header components: {split_sizes}")
 
-        if len(components) == 1:
-            print("[POSE SAVE] Single-component header detected → saving as [T,C,J]")
-            pose_pred = Pose(header, gen_np.transpose(0, 2, 1))
-            pose_gt   = Pose(header, gt_np.transpose(0, 2, 1))
+        gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
+        gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
-        else:
-            print("[POSE SAVE] Multi-component header detected → reshape to [T,C,P,J]")
-            gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
-            gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
+        # ✅ Use PoseBody.from_components → auto-align per-component joint counts
+        pose_pred = Pose(header, PoseBody.from_components(header, [x.transpose(0, 2, 1) for x in gen_split]))
+        pose_gt   = Pose(header, PoseBody.from_components(header, [x.transpose(0, 2, 1) for x in gt_split]))
 
-            max_joints = max(x.shape[1] for x in gen_split)
-            def pad_to(x, max_len):
-                if x.shape[1] < max_len:
-                    pad = np.zeros((x.shape[0], max_len - x.shape[1], x.shape[2]), dtype=x.dtype)
-                    return np.concatenate([x, pad], axis=1)
-                return x
-
-            gen_split = [pad_to(x, max_joints) for x in gen_split]
-            gt_split  = [pad_to(x, max_joints) for x in gt_split]
-
-            gen_np_4d = np.stack([x.transpose(0, 2, 1) for x in gen_split], axis=2)
-            gt_np_4d  = np.stack([x.transpose(0, 2, 1) for x in gt_split], axis=2)
-            print(f"[POSE SAVE] reshaped gen_np_4d={gen_np_4d.shape}, gt_np_4d={gt_np_4d.shape}")
-            pose_pred = Pose(header, gen_np_4d)
-            pose_gt   = Pose(header, gt_np_4d)
-
-        # ========= Save to disk =========
-        print(f"[POSE SAVE] final Pose shapes: pred={pose_pred.body.data.shape}, gt={pose_gt.body.data.shape}")
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose")
+
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose via PoseBody.from_components()")
         return True
 
     except Exception as e:
