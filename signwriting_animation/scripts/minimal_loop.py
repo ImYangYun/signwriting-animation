@@ -116,7 +116,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
                 body_components.append(arr)
 
             # pad to same joint count
-            max_joints = max(x.shape[-1] for x in body_components)
+            max_joints = sum(len(c.points) for c in header.components)
             for i in range(len(body_components)):
                 if body_components[i].shape[-1] < max_joints:
                     pad = np.zeros((body_components[i].shape[0], body_components[i].shape[1],
