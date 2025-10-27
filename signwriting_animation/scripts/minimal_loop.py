@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from pose_format import Pose
 from pose_format.pose_visualizer import PoseVisualizer
+from pose_format.utils.generic import reduce_holistic
 from pose_format.utils import holistic
 from pose_format.pose import PoseHeader
 from pose_format.torch.masked.collator import zero_pad_collator
@@ -82,6 +83,18 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
         gen_np = to_tjc(gen_btjc_cpu)   # [T, J, C]
         gt_np  = to_tjc(gt_btjc_cpu)    # [T, J, C]
+        print(f"[DEBUG] gen_np shape: {gen_np.shape}, gt_np shape: {gt_np.shape}")
+        print(f"[DEBUG] header joints: {sum(len(c.points) for c in header.components)}")
+        print("\n[DEBUG] Header components detail:")
+        for c in header.components:
+            print(f"  - {c.name:15s} | points={len(c.points)}")
+            
+        try:
+            pose_pred = reduce_holistic(pose_pred)
+            pose_gt = reduce_holistic(pose_gt)
+            print("✅ Applied reduce_holistic() before saving pose files.")
+        except Exception as e:
+            print(f"⚠️ Could not reduce holistic for saving: {e}")
 
         components = header.components
         total_joints = sum(len(c.points) for c in components)
@@ -157,7 +170,7 @@ if __name__ == "__main__":
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     batch_size, num_workers = 2, 2
 
-    train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers, reduce_holistic=True)
+    train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers, reduce_holistic=False)
     val_loader = train_loader
 
     print("\n" + "="*60)
