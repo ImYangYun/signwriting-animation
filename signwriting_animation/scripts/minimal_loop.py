@@ -13,7 +13,7 @@ from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.generic import reduce_holistic
 from pose_format.utils import holistic
 from pose_format.pose import PoseHeader
-from pose_format.pose_body import PoseBody
+from pose_format.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
@@ -57,8 +57,6 @@ def ensure_skeleton(header):
 
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """Save predicted and ground-truth pose sequences as .pose files (component-safe)."""
-    import numpy as np
-
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
@@ -88,21 +86,44 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
         gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
 
-        # ✅ Use PoseBody.from_components → auto-align per-component joint counts
-        pose_pred = Pose(header, PoseBody.from_components(header, [x.transpose(0, 2, 1) for x in gen_split]))
-        pose_gt   = Pose(header, PoseBody.from_components(header, [x.transpose(0, 2, 1) for x in gt_split]))
+        def make_pose_body(header, split_list):
+            body_components = []
+            for i, (component, data) in enumerate(zip(header.components, split_list)):
+                expected_joints = len(component.points)
+                arr = data.transpose(0, 2, 1)  # [T,C,J]
+                if arr.shape[-1] != expected_joints:
+                    # pad or truncate to fit component length
+                    fixed = np.zeros((arr.shape[0], arr.shape[1], expected_joints), dtype=arr.dtype)
+                    fixed[..., :min(expected_joints, arr.shape[-1])] = arr[..., :min(expected_joints, arr.shape[-1])]
+                    arr = fixed
+                body_components.append(arr)
+
+            # concatenate along component dimension → PoseBody expects [T,C,P,J]
+            max_joints = max(x.shape[-1] for x in body_components)
+            for i in range(len(body_components)):
+                if body_components[i].shape[-1] < max_joints:
+                    pad = np.zeros((body_components[i].shape[0], body_components[i].shape[1],
+                                    max_joints - body_components[i].shape[-1]))
+                    body_components[i] = np.concatenate([body_components[i], pad], axis=-1)
+
+            body = np.stack(body_components, axis=2)
+            return NumPyPoseBody(fps=header.fps, data=body)
+
+        pose_pred = Pose(header, make_pose_body(header, gen_split))
+        pose_gt   = Pose(header, make_pose_body(header, gt_split))
 
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose via PoseBody.from_components()")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (NumPyPoseBody)")
         return True
 
     except Exception as e:
         print(f"❌ Failed saving pose files: {e}")
         return False
+
 
 def save_scatter_backup(seq_btjc, save_path, title="PRED"):
     """Fallback visualization if pose saving fails."""
