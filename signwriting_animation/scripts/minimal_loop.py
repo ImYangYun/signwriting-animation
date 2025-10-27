@@ -108,7 +108,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             fps = getattr(header, "fps", 25)  # fallback for old headers
             body = np.stack(body_components, axis=2)
-            confidence = np.ones((body.shape[0], body.shape[2], body.shape[3]), dtype=np.float32)
+            confidence = np.ones((body.shape[0], body.shape[1], body.shape[2], body.shape[3]), dtype=np.float32)
             
             print(f"[POSE SAVE] built NumPyPoseBody: data={body.shape}, confidence={confidence.shape}, fps={fps}")
             return NumPyPoseBody(fps=fps, data=body, confidence=confidence)
