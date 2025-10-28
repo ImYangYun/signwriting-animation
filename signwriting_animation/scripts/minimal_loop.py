@@ -78,24 +78,26 @@ def ensure_skeleton(header):
     return header
 
 
-def save_skeleton_gif(seq_tjc, header, out_path="logs/prediction.gif", fps=10):
+def save_skeleton_frames(seq_tjc, header, prefix="logs/prediction"):
     """
-    Render a T×33×3 pose sequence as a stick-figure GIF.
+    把一个序列 (T, 33, 3) 画成多张PNG帧:
+      logs/prediction_frame_000.png
+      logs/prediction_frame_001.png
+      ...
+    而不是直接拼GIF，避免对 imageio / canvas API 的依赖。
 
-    seq_tjc: [T, 33, 3]  (x,y,z per joint)
-    header: PoseHeader (for skeleton limbs; we'll use header.components[0])
-    out_path: path to GIF
-    fps: frames per second for GIF
+    seq_tjc: [T, 33, 3]
+    header: PoseHeader (拿 limbs 来画骨架)
+    prefix: 文件前缀（不含 _frame_xxx.png）
     """
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    os.makedirs(os.path.dirname(prefix), exist_ok=True)
 
     body_comp = header.components[0]
     limbs = getattr(body_comp, "limbs", [])
-    # limbs: list of (a,b) joint index pairs that define bones/segments.
 
     T, J, C = seq_tjc.shape
 
-    # get consistent axis range across frames so camera doesn't jump
+    # 统一坐标范围，避免每帧缩放不同而抖动
     all_x = seq_tjc[:, :, 0].reshape(-1)
     all_y = seq_tjc[:, :, 1].reshape(-1)
 
@@ -109,23 +111,19 @@ def save_skeleton_gif(seq_tjc, header, out_path="logs/prediction.gif", fps=10):
     y_min -= pad_y
     y_max += pad_y
 
-    frames = []
-
     for t in range(T):
         xs = seq_tjc[t, :, 0]  # [33]
         ys = seq_tjc[t, :, 1]  # [33]
 
         fig, ax = plt.subplots(figsize=(4,4))
 
-        # draw limbs first (stick lines)
+        # 连骨架线
         for (a, b) in limbs:
             if a < len(xs) and b < len(xs):
                 ax.plot([xs[a], xs[b]], [-ys[a], -ys[b]], linewidth=2)
 
-        # draw keypoints
         ax.scatter(xs, -ys, s=10)
 
-        # nice view: flip y so person isn't upside-down
         ax.set_xlim([x_min, x_max])
         ax.set_ylim([-y_max, -y_min])
         ax.set_aspect('equal', adjustable='box')
@@ -133,22 +131,17 @@ def save_skeleton_gif(seq_tjc, header, out_path="logs/prediction.gif", fps=10):
         ax.set_yticks([])
         ax.set_title(f"t={t}")
 
-        fig.canvas.draw()
-        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        out_path = f"{prefix}_frame_{t:03d}.png"
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-        frames.append(frame)
-
-    imageio.mimsave(out_path, frames, fps=fps)
-    print(f"🎞️ Saved skeleton GIF to {out_path}")
+    print(f"🖼️ Saved {T} frames to {prefix}_frame_###.png")
 
 
 def visualize_prediction_vs_gt(gen_btjc_cpu, gt_btjc_cpu, header):
     """
-    High-level wrapper:
-    - Convert the model output and GT into [T, 33, 3]
-    - Save GIF for both
+    - 把预测和GT都规整成 [T,33,3]
+    - 分别画成一堆PNG帧 (prediction_frame_xxx.png / groundtruth_frame_xxx.png)
     """
     try:
         os.makedirs("logs", exist_ok=True)
@@ -156,42 +149,36 @@ def visualize_prediction_vs_gt(gen_btjc_cpu, gt_btjc_cpu, header):
 
         def to_tjc(tensor):
             """
-            Convert model output (shapes like [B,T,J,C], [B,T,1,J,C], [B,J,C,T], etc.)
-            into [T,J,C] numpy float32.
+            把各种形状的模型输出 (B,T,J,C) / (B,T,1,J,C) / (B,J,C,T)...
+            统一成 [T,J,C] 的 numpy float32
             """
             x = tensor
-            if hasattr(x, "tensor"):  # e.g. MaskedTensor
+            if hasattr(x, "tensor"):
                 x = x.tensor
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu()
 
             print(f"[to_tjc] input shape: {x.shape}")
 
-            # Case 5D: [B,T,1,J,C]  -> squeeze that singleton 1
             if x.ndim == 5 and x.shape[2] == 1:
                 print("[to_tjc] Detected dummy dimension at axis=2 -> squeeze it")
-                x = x.squeeze(2)  # now [B,T,J,C]
+                x = x.squeeze(2)  # -> [B,T,J,C]
 
-            # Case 4D
             if x.ndim == 4:
-                # pattern [B,T,J,C]  e.g. [1,20,586,3]
                 if x.shape[1] < 200 and x.shape[2] > 200:
-                    x = x[0]  # -> [T,J,C]
-                # pattern [B,J,C,T]  e.g. [1,586,3,20]
+                    x = x[0]  # [T,J,C]
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
-                    x = x[0].permute(2,0,1)  # -> [T,J,C]
+                    x = x[0].permute(2,0,1)  # [T,J,C]
                 else:
-                    # fallback: still [B,T,J,C] but didn't match above branch
                     if x.shape[0] == 1 and x.shape[2] > 200:
-                        x = x[0]  # -> [T,J,C]
+                        x = x[0]  # [T,J,C]
                     else:
                         raise ValueError(f"Can't infer time axis from 4D {x.shape}")
 
-            # Case 3D
             elif x.ndim == 3:
-                # pattern [J,C,T] -> [T,J,C]
+                # 如果是 [J,C,T] 这种，把时间轴挪到前面
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
-                    x = x.permute(2,0,1)
+                    x = x.permute(2,0,1)  # -> [T,J,C]
 
             else:
                 raise ValueError(f"❌ Unexpected tensor shape {x.shape}")
@@ -203,27 +190,24 @@ def visualize_prediction_vs_gt(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
-        gen_np = to_tjc(gen_btjc_cpu)
-        gt_np  = to_tjc(gt_btjc_cpu)
+        gen_np = to_tjc(gen_btjc_cpu)  # [T,586,3]
+        gt_np  = to_tjc(gt_btjc_cpu)   # [T,586,3]
 
-        # Align frame count (T)
         min_T = min(gen_np.shape[0], gt_np.shape[0])
         if gen_np.shape[0] != gt_np.shape[0]:
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
         gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
-        # Keep only first 33 joints (body/pose)
         J_POSE = 33
         gen_pose_only = gen_np[:, :J_POSE, :]  # [T,33,3]
         gt_pose_only  = gt_np[:,  :J_POSE, :]  # [T,33,3]
 
         print(f"[POSE_ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
 
-        # Save GIFs
-        save_skeleton_gif(gen_pose_only, header, out_path="logs/prediction.gif", fps=10)
-        save_skeleton_gif(gt_pose_only,  header, out_path="logs/groundtruth.gif", fps=10)
+        save_skeleton_frames(gen_pose_only, header, prefix="logs/prediction")
+        save_skeleton_frames(gt_pose_only,  header, prefix="logs/groundtruth")
 
-        print("✅ Saved skeleton GIFs: logs/prediction.gif and logs/groundtruth.gif")
+        print("✅ Saved skeleton frame sequences under logs/prediction_frame_###.png and logs/groundtruth_frame_###.png")
         return True
 
     except Exception as e:
