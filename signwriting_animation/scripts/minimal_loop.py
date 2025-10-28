@@ -79,6 +79,10 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         import copy
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
+
+        # ----------------------
+        # helper: convert model output -> [T, J, C] numpy
+        # ----------------------
         def to_tjc(tensor):
             x = tensor
             if hasattr(x, "tensor"):  # MaskedTensor
@@ -95,14 +99,14 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             # Case 4D
             if x.ndim == 4:
-                # pattern [B,T,J,C]
+                # [B,T,J,C]
                 if x.shape[1] < 200 and x.shape[2] > 200:
                     x = x[0]  # -> [T,J,C]
-                # pattern [B,J,C,T]
+                # [B,J,C,T]
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
                     x = x[0].permute(2,0,1)  # -> [T,J,C]
                 else:
-                    # fallback: still [B,T,J,C] with batch=1
+                    # fallback: still [B,T,J,C] (batch=1)
                     if x.shape[0] == 1 and x.shape[2] > 200:
                         x = x[0]
                     else:
@@ -110,7 +114,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             # Case 3D
             elif x.ndim == 3:
-                # pattern [J,C,T] -> [T,J,C]
+                # [J,C,T] -> [T,J,C]
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
                     x = x.permute(2,0,1)
 
@@ -124,6 +128,9 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
+        # ----------------------
+        # convert pred / gt to [T,586,3]
+        # ----------------------
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
@@ -133,43 +140,68 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
         gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
+        # ----------------------
+        # keep only first 33 joints (body / upper skeleton)
+        # ----------------------
         J_POSE = 33
         gen_pose_only = gen_np[:, :J_POSE, :]  # [T,33,3]
         gt_pose_only  = gt_np[:,  :J_POSE, :]  # [T,33,3]
 
         print(f"[POSE_ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
 
+        # ----------------------
+        # mini_header = copy of original header, but keep only first component
+        # ----------------------
         if hasattr(header, "components") and len(header.components) > 0:
             mini_header = copy.deepcopy(header)
             mini_header.components = [copy.deepcopy(header.components[0])]
+            print("[HEADER_TRIM] using first component from existing header")
         else:
             mini_header = ensure_skeleton(None)
             mini_header.components = [mini_header.components[0]]
+            print("[HEADER_TRIM] fallback header")
 
+        # ----------------------
+        # helper to build NumPyPoseBody for ONE component
+        # ----------------------
         def build_single_body(seq_tjc):
+            """
+            seq_tjc: [T, 33, 3]
+            We build:
+              data:        [T, 3, 1, 33]
+              confidence:  [T, 1, 33]
+              mask:        [T, 1, 33]  (then broadcast across channel dim)
+            """
             # [T,33,3] -> [T,3,33]
             data_tcj = np.transpose(seq_tjc, (0, 2, 1))          # [T,3,33]
-
             # add component dim P=1 -> [T,3,1,33]
             data_tcpj = data_tcj[:, :, np.newaxis, :]            # [T,3,1,33]
 
-            T, C, P, J = data_tcpj.shape  # sanity check
+            T, C, P, J = data_tcpj.shape
+            print(f"[BODY] data_tcpj.shape={data_tcpj.shape} (T,C,P,J)")
+
+            # build mask with shape [T,1,33], then broadcast up to [T,3,1,33]
             mask_tpj = np.zeros((T, P, J), dtype=bool)           # [T,1,33]
+            print(f"[BODY] mask_tpj.shape={mask_tpj.shape} (T,P,J)")
 
             mask_broadcast = mask_tpj[:, np.newaxis, :, :]       # [T,1,1,33]
             mask_broadcast = np.repeat(mask_broadcast, C, axis=1)  # [T,3,1,33]
+            print(f"[BODY] mask_broadcast.shape={mask_broadcast.shape} (T,C,P,J)")
 
             masked_body = ma.masked_array(data_tcpj, mask=mask_broadcast)
 
-            confidence = np.ones((T, P, J), dtype=np.float32)    # [T,1,33]
+            # confidence: [T,1,33]
+            confidence = np.ones((T, P, J), dtype=np.float32)
+            print(f"[BODY] confidence.shape={confidence.shape} (T,P,J)")
 
             fps = getattr(header, "fps", 25)
 
-            return NumPyPoseBody(
+            body_obj = NumPyPoseBody(
                 fps=fps,
                 data=masked_body,
                 confidence=confidence,
             )
+            return body_obj
 
         pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
         pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
