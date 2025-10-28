@@ -46,57 +46,61 @@ def build_holistic_header():
 
 def ensure_skeleton(header):
     """
-    Ensure the PoseHeader exists and includes components compatible
-    with this older pose-format version (using point_format='XYZ').
+    Ensure PoseHeader exists.
+    Try 1️⃣ use existing header;
+    Try 2️⃣ use holistic.holistic_components();
+    Try 3️⃣ build minimal fallback if holistic import fails.
     """
     from pose_format.pose_header import PoseHeader, PoseHeaderComponent
 
+    # Case 1: header already has components and limbs
     if header is not None and getattr(header, "components", None):
         print("ℹ Using existing header with components.")
         return header
 
-    print("[ensure_skeleton] ⚙ Building fallback holistic header (legacy pose-format)")
+    # Case 2: try holistic.py
+    try:
+        components = holistic.holistic_components()
+        header = PoseHeader(components=components)
+        print("✅ Built header from pose_format.utils.holistic (with limbs).")
+        return header
+    except Exception as e:
+        print(f"⚠ holistic import failed ({e}), using minimal fallback.")
 
+    # Case 3: minimal fallback
     components = [
         PoseHeaderComponent(
             name="pose",
             points=[f"p{i}" for i in range(33)],
-            limbs=[],
-            colors=[],
+            limbs=[(11,13), (13,15), (12,14), (14,16), (11,12),
+                   (23,24), (23,25), (24,26), (25,27), (26,28),
+                   (11,23), (12,24)],
+            colors=[(255,0,0)] * 12,
             point_format="XYZ",
         ),
         PoseHeaderComponent(
             name="face",
             points=[f"f{i}" for i in range(478)],
-            limbs=[],
-            colors=[],
-            point_format="XYZ",
+            limbs=[], colors=[], point_format="XYZ",
         ),
         PoseHeaderComponent(
             name="hand_left",
             points=[f"lh{i}" for i in range(21)],
-            limbs=[],
-            colors=[],
-            point_format="XYZ",
+            limbs=[], colors=[], point_format="XYZ",
         ),
         PoseHeaderComponent(
             name="hand_right",
             points=[f"rh{i}" for i in range(21)],
-            limbs=[],
-            colors=[],
-            point_format="XYZ",
+            limbs=[], colors=[], point_format="XYZ",
         ),
         PoseHeaderComponent(
             name="world",
             points=[f"w{i}" for i in range(33)],
-            limbs=[],
-            colors=[],
-            point_format="XYZ",
+            limbs=[], colors=[], point_format="XYZ",
         ),
     ]
-
     header = PoseHeader(version=0.1, components=components)
-    print("[ensure_skeleton] ✅ Built header with 5 components.")
+    print("✅ Built minimal fallback header with basic limbs.")
     return header
 
 
@@ -112,21 +116,48 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
         # convert tensor → numpy [T,J,C]
         def to_tjc(tensor):
-            x = tensor[0]
-            if x.ndim == 4 and x.shape[1] == 1:
-                x = x.squeeze(1)
-            if x.ndim != 3:
-                raise ValueError(f"Unexpected tensor shape {x.shape}")
-            if x.shape[-1] == 3:
-                pass
-            elif x.shape[-2] == 3:
-                x = x.permute(2, 0, 1)
+            """
+            Convert model output (any of [B,T,J,C], [B,J,C,T], [B,J,C]) → [T,J,C].
+            Robust to accidental singleton dimensions.
+            """
+            x = tensor
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu()
+            if hasattr(x, "tensor"):  # MaskedTensor
+                x = x.tensor
+
+            # remove batch dim if present
+            if x.ndim == 4:
+                # guess which axis is time
+                # pattern 1: [B, T, J, C]
+                if x.shape[1] < 200 and x.shape[2] > 200:  
+                    # e.g. (1, 20, 586, 3)
+                    x = x[0]  # -> [T,J,C]
+                # pattern 2: [B, J, C, T]
+                elif x.shape[-1] < 50:  
+                    # e.g. (1,586,3,1) or (1,586,3,20)
+                    x = x[0].permute(2,0,1)  # -> [T,J,C]
+                else:
+                    raise ValueError(f"Can't infer time axis from {x.shape}")
+            elif x.ndim == 3:
+                # [J,C,T] or [T,J,C]
+                if x.shape[0] > 200 and x.shape[-1] <= 10:
+                    x = x.permute(2,0,1)
             else:
-                raise ValueError(f"❌ Unexpected 3D shape {x.shape}: cannot infer coordinate axis.")
+                raise ValueError(f"❌ Unexpected tensor shape {x.shape}")
+
+            x = np.squeeze(x, axis=0) if x.ndim == 4 else np.squeeze(x)
+            if x.ndim != 3:
+                raise ValueError(f"❌ to_tjc failed, got {x.shape}")
             return x.numpy().astype(np.float32)
 
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
+
+        min_T = min(gen_np.shape[0], gt_np.shape[0])
+        if gen_np.shape[0] != gt_np.shape[0]:
+            print(f"⚠️ Length mismatch: trimming to {min_T} frames")
+        gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
         components = header.components
         split_sizes = [len(c.points) for c in components]
