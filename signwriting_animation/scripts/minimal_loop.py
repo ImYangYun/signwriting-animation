@@ -151,24 +151,35 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             mini_header.components = [mini_header.components[0]]
 
         def build_single_body(seq_tjc):
-            # seq_tjc: [T,33,3] -> [T,3,1,33]
-            data_tcj = np.transpose(seq_tjc, (0, 2, 1))       # [T,3,33]
-            data_tcpj = data_tcj[:, :, np.newaxis, :]         # [T,3,1,33]
+            # [T,33,3] -> [T,3,33]
+            data_tcj = np.transpose(seq_tjc, (0, 2, 1))          # [T,3,33]
 
-            mask = np.zeros_like(data_tcpj, dtype=bool)       # same shape
-            masked_body = ma.masked_array(data_tcpj, mask=mask)
+            # add component dim P=1 -> [T,3,1,33]
+            data_tcpj = data_tcj[:, :, np.newaxis, :]            # [T,3,1,33]
 
-            confidence = np.ones(
-                (data_tcpj.shape[0], 1, data_tcpj.shape[3]),
-                dtype=np.float32
-            )  # [T,1,33]
+            T, C, P, J = data_tcpj.shape  # sanity: should be (T,3,1,33)
+
+            # mask for visibility: [T,1,33]  (no joints missing -> all False)
+            mask_tpj = np.zeros((T, P, J), dtype=bool)           # [T,1,33]
+
+            # broadcast mask_tpj to [T,3,1,33] when creating masked_array
+            # We'll expand dims to match data when building the masked array
+            mask_broadcast = mask_tpj[:, np.newaxis, :, :]       # [T,1,1,33]
+            mask_broadcast = np.repeat(mask_broadcast, C, axis=1)  # [T,3,1,33]
+
+            masked_body = ma.masked_array(data_tcpj, mask=mask_broadcast)
+
+            # confidence: [T,1,33] (like visibility per joint)
+            confidence = np.ones((T, P, J), dtype=np.float32)
 
             fps = getattr(header, "fps", 25)
+
             return NumPyPoseBody(
                 fps=fps,
                 data=masked_body,
                 confidence=confidence
             )
+
 
         pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
         pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
