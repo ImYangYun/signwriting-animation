@@ -72,20 +72,15 @@ def ensure_skeleton(header):
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """
     Save predicted and ground-truth pose sequences as .pose files.
-    Compatible with legacy pose-format using NumPyPoseBody.
+    For now we ONLY save the 'pose' (first 33 joints) component so that
+    all arrays have consistent shape and PoseVisualizer can draw limbs.
     """
 
     try:
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
-        # convert tensor → numpy [T,J,C]
         def to_tjc(tensor):
-            """
-            Convert model output (any of [B,T,J,C], [B,J,C,T], [B,J,C],
-            or [B,T,1,J,C]) → [T,J,C].
-            Handles all dummy singleton dimensions safely.
-            """
             x = tensor
             if hasattr(x, "tensor"):  # MaskedTensor
                 x = x.tensor
@@ -94,85 +89,101 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             print(f"[to_tjc] input shape: {x.shape}")
 
-            # ---- Case 5D: [B,T,1,J,C] ----
-            if x.ndim == 5:
-                if x.shape[2] == 1:
-                    print(f"[to_tjc] Detected dummy dimension at axis=2 → squeeze it")
-                    x = x.squeeze(2)  # [B,T,J,C]
-                else:
-                    raise ValueError(f"Unexpected 5D shape {x.shape}")
+            # Case 5D: [B,T,1,J,C]
+            if x.ndim == 5 and x.shape[2] == 1:
+                print("[to_tjc] Detected dummy dimension at axis=2 -> squeeze it")
+                x = x.squeeze(2)  # -> [B,T,J,C]
 
-            # ---- Case 4D ----
+            # Case 4D
             if x.ndim == 4:
-                # pattern: [B, T, J, C]
+                # [B,T,J,C]
                 if x.shape[1] < 200 and x.shape[2] > 200:
-                    x = x[0]  # → [T,J,C]
-                # pattern: [B, J, C, T]
+                    x = x[0]  # -> [T,J,C]
+                # [B,J,C,T]
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
-                    x = x[0].permute(2, 0, 1)  # → [T,J,C]
+                    x = x[0].permute(2,0,1)  # -> [T,J,C]
                 else:
-                    raise ValueError(f"Can't infer time axis from 4D {x.shape}")
+                    # could still be [B,T,J,C] after squeeze
+                    if x.shape[0] == 1 and x.shape[2] > 200:
+                        x = x[0]  # -> [T,J,C]
+                    else:
+                        raise ValueError(f"Can't infer time axis from 4D {x.shape}")
 
-            # ---- Case 3D ----
+            # Case 3D
             elif x.ndim == 3:
+                # [J,C,T] -> [T,J,C]
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
-                    x = x.permute(2, 0, 1)
+                    x = x.permute(2,0,1)
 
             else:
                 raise ValueError(f"❌ Unexpected tensor shape {x.shape}")
 
-            # Final squeeze (only if T=1 remains)
-            if x.ndim == 4 and x.shape[0] == 1:
-                x = x.squeeze(0)
             x = np.array(x)
-
             if x.ndim != 3:
                 raise ValueError(f"❌ to_tjc failed, got {x.shape}")
 
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
-        gen_np = to_tjc(gen_btjc_cpu)
-        gt_np  = to_tjc(gt_btjc_cpu)
-        split_sizes = [len(c.points) for c in header.components]
-        print(f"[CHECK] gen_np.shape={gen_np.shape}, gt_np.shape={gt_np.shape}, header_total_joints={sum(split_sizes)}")
+        # convert pred / gt
+        gen_np = to_tjc(gen_btjc_cpu)  # [T,586,3]
+        gt_np  = to_tjc(gt_btjc_cpu)   # [T,586,3]
 
+        # frame align (T might differ, trim to shortest)
         min_T = min(gen_np.shape[0], gt_np.shape[0])
         if gen_np.shape[0] != gt_np.shape[0]:
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
         gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
-        components = header.components
-        split_sizes = [len(c.points) for c in components]
-        print(f"[DEBUG] header components: {split_sizes}")
+        # ----------------------
+        # now: only take first 33 joints (body/pose)
+        # ----------------------
+        J_POSE = 33
+        gen_pose_only = gen_np[:, :J_POSE, :]  # [T,33,3]
+        gt_pose_only  = gt_np[:,  :J_POSE, :]  # [T,33,3]
 
-        gen_split = np.split(gen_np, np.cumsum(split_sizes)[:-1], axis=1)
-        gt_split  = np.split(gt_np,  np.cumsum(split_sizes)[:-1], axis=1)
+        print(f"[POSE-ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
 
-        # --- combine splits into NumPyPoseBody (masked) ---
-        def make_pose_body(split_list):
-            body_components = []
-            for data in split_list:
-                arr = data.transpose(0, 2, 1)  # [T,C,J]
-                body_components.append(arr)
+        # build a mini header that only has the first component ("pose")
+        # (the header we loaded may have multiple components, but for saving we just
+        #  keep the first one which should correspond to body with limbs)
+        mini_header = None
+        if hasattr(header, "components") and len(header.components) > 0:
+            from pose_format.pose_header import PoseHeader, PoseHeaderComponent
+            pose_comp = header.components[0]  # assume first is body/pose (33 joints)
+            mini_header = PoseHeader(version=getattr(header,"version",0.1),
+                                     components=[pose_comp])
+        else:
+            # fallback: rebuild minimal one
+            mini_header = ensure_skeleton(None)
+            mini_header.components = [mini_header.components[0]]
 
-            body = np.stack(body_components, axis=2)  # [T,C,P,J]
-            mask = np.zeros_like(body, dtype=bool)
-            masked_body = ma.masked_array(body, mask=mask)
-            confidence = np.ones((body.shape[0], body.shape[2], body.shape[3]), dtype=np.float32)
+        # Now wrap into NumPyPoseBody format:
+        # We need [T,C,P,J] masked array with confidence. For single component:
+        #   T = time
+        #   C = coords (3)
+        #   P = 1 component
+        #   J = joints (33)
+        def build_single_body(seq_tjc):
+            # seq_tjc: [T,33,3] -> [T,3,1,33]
+            data_tcj = np.transpose(seq_tjc, (0,2,1))           # [T,3,33]
+            data_tcpj = data_tcj[:, :, np.newaxis, :]           # [T,3,1,33]
+            mask = np.zeros_like(data_tcpj, dtype=bool)
+            masked_body = ma.masked_array(data_tcpj, mask=mask)
+            confidence = np.ones((data_tcpj.shape[0], 1, data_tcpj.shape[3]), dtype=np.float32)
             fps = getattr(header, "fps", 25)
-            print(f"[POSE SAVE] built NumPyPoseBody: data={body.shape}, confidence={confidence.shape}, fps={fps}")
             return NumPyPoseBody(fps=fps, data=masked_body, confidence=confidence)
 
-        pose_pred = Pose(header, make_pose_body(gen_split))
-        pose_gt   = Pose(header, make_pose_body(gt_split))
+        pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
+        pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
 
+        os.makedirs("logs", exist_ok=True)
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
             pose_gt.write(f)
 
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (NumPyPoseBody legacy-safe)")
+        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (POSE-ONLY)")
         return True
 
     except Exception as e:
