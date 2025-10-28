@@ -68,19 +68,17 @@ def ensure_skeleton(header):
     print("✅ Built minimal fallback header with basic limbs.")
     return header
 
-
 def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """
     Save predicted and ground-truth pose sequences as .pose files.
-    For now we ONLY save the 'pose' (first 33 joints) component so that
-    all arrays have consistent shape and PoseVisualizer can draw limbs.
+    We ONLY save the first component (body/pose, first 33 joints),
+    so shapes stay consistent and PoseVisualizer can draw limbs.
     """
 
     try:
         import copy
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
-
         def to_tjc(tensor):
             x = tensor
             if hasattr(x, "tensor"):  # MaskedTensor
@@ -97,14 +95,14 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             # Case 4D
             if x.ndim == 4:
-                # [B,T,J,C]
+                # pattern [B,T,J,C]
                 if x.shape[1] < 200 and x.shape[2] > 200:
                     x = x[0]  # -> [T,J,C]
-                # [B,J,C,T]
+                # pattern [B,J,C,T]
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
                     x = x[0].permute(2,0,1)  # -> [T,J,C]
                 else:
-                    # sometimes still [B,T,J,C] not caught above
+                    # fallback: still [B,T,J,C] with batch=1
                     if x.shape[0] == 1 and x.shape[2] > 200:
                         x = x[0]
                     else:
@@ -112,7 +110,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
 
             # Case 3D
             elif x.ndim == 3:
-                # [J,C,T] -> [T,J,C]
+                # pattern [J,C,T] -> [T,J,C]
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
                     x = x.permute(2,0,1)
 
@@ -129,7 +127,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
-        # frame align (T might differ, trim to shortest)
+        # frame align
         min_T = min(gen_np.shape[0], gt_np.shape[0])
         if gen_np.shape[0] != gt_np.shape[0]:
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
@@ -145,8 +143,6 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             mini_header = copy.deepcopy(header)
             mini_header.components = [copy.deepcopy(header.components[0])]
         else:
-            # fallback: ensure_skeleton(None) returns a synthetic header;
-            # again take only first component.
             mini_header = ensure_skeleton(None)
             mini_header.components = [mini_header.components[0]]
 
@@ -157,29 +153,23 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             # add component dim P=1 -> [T,3,1,33]
             data_tcpj = data_tcj[:, :, np.newaxis, :]            # [T,3,1,33]
 
-            T, C, P, J = data_tcpj.shape  # sanity: should be (T,3,1,33)
-
-            # mask for visibility: [T,1,33]  (no joints missing -> all False)
+            T, C, P, J = data_tcpj.shape  # sanity check
             mask_tpj = np.zeros((T, P, J), dtype=bool)           # [T,1,33]
 
-            # broadcast mask_tpj to [T,3,1,33] when creating masked_array
-            # We'll expand dims to match data when building the masked array
             mask_broadcast = mask_tpj[:, np.newaxis, :, :]       # [T,1,1,33]
             mask_broadcast = np.repeat(mask_broadcast, C, axis=1)  # [T,3,1,33]
 
             masked_body = ma.masked_array(data_tcpj, mask=mask_broadcast)
 
-            # confidence: [T,1,33] (like visibility per joint)
-            confidence = np.ones((T, P, J), dtype=np.float32)
+            confidence = np.ones((T, P, J), dtype=np.float32)    # [T,1,33]
 
             fps = getattr(header, "fps", 25)
 
             return NumPyPoseBody(
                 fps=fps,
                 data=masked_body,
-                confidence=confidence
+                confidence=confidence,
             )
-
 
         pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
         pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
