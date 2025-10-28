@@ -105,9 +105,19 @@ def build_pose_from_sequence(seq_btjc_cpu, header_full, fps=25.0):
     )
     return Pose(header_full, body)
 
-def drop_world_component(pose_obj):
-    # remove the world "ghost person" component
-    return pose_obj.remove_components("POSE_WORLD_LANDMARKS")
+
+def pose_keep_components(pose_obj, keep_names):
+    """
+    Return a new Pose that ONLY keeps the components in keep_names.
+    Example keep_names = ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
+
+    Internally we figure out which components to DROP, then call remove_components(drop_list).
+    """
+    all_names = [c.name for c in pose_obj.header.components]
+    drop_list = [n for n in all_names if n not in keep_names]
+    # remove_components() is defined on Pose objects in pose_format 0.10.x (you confirmed)
+    return pose_obj.remove_components(drop_list)
+
 
 def render_pose_video(pose_obj, out_path, title_prefix="SEQ", fps_override=None):
     """
@@ -309,8 +319,17 @@ if __name__ == "__main__":
         print("✅ wrote logs/groundtruth.pose and logs/prediction.pose")
 
         # Remove POSE_WORLD_LANDMARKS for cleaner render
-        gt_pose_trim   = drop_world_component(gt_pose_full)
-        pred_pose_trim = drop_world_component(pred_pose_full)
+        # 我们想要身体骨架 + 双手，不要 world，不要整张脸
+        KEEP = ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
+
+        gt_pose_trim   = pose_keep_components(gt_pose_full,   KEEP)
+        pred_pose_trim = pose_keep_components(pred_pose_full, KEEP)
+
+        print("[TRIM2] gt  full:",   gt_pose_full.body.data.shape,
+            "-> keep body+hands:", gt_pose_trim.body.data.shape)
+        print("[TRIM2] pred full:", pred_pose_full.body.data.shape,
+            "-> keep body+hands:", pred_pose_trim.body.data.shape)
+
 
         print("[TRIM] gt   full joints:",   gt_pose_full.body.data.shape,
               "-> trimmed:", gt_pose_trim.body.data.shape)
@@ -320,5 +339,4 @@ if __name__ == "__main__":
         # Render MP4/GIF previews with PoseVisualizer
         render_pose_video(gt_pose_trim,   "logs/groundtruth_poseformat.mp4", title_prefix="GT")
         render_pose_video(pred_pose_trim, "logs/prediction_poseformat.mp4", title_prefix="PRED")
-
     print("(END)")
