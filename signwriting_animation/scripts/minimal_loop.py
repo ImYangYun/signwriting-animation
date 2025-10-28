@@ -117,39 +117,47 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         # convert tensor → numpy [T,J,C]
         def to_tjc(tensor):
             """
-            Convert model output (any of [B,T,J,C], [B,J,C,T], [B,J,C]) → [T,J,C].
-            Robust to accidental singleton dimensions.
+            Convert model output (any of [B,T,J,C], [B,J,C,T], [B,J,C],
+            or even [B,T,1,J,C]) → [T,J,C].
+            Robust to singleton dimensions and 5D tensors.
             """
             x = tensor
-            if isinstance(x, torch.Tensor):
-                x = x.detach().cpu()
             if hasattr(x, "tensor"):  # MaskedTensor
                 x = x.tensor
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu()
 
-            # remove batch dim if present
+            # ---- handle 5D case ----
+            if x.ndim == 5:
+                # e.g. [1, 20, 1, 586, 3]
+                print(f"[to_tjc] Detected 5D tensor {x.shape}, squeezing middle dim.")
+                x = x.squeeze(2)  # remove the extra 1
+                # now shape → [1, 20, 586, 3]
+            
+            # ---- handle 4D cases ----
             if x.ndim == 4:
-                # guess which axis is time
-                # pattern 1: [B, T, J, C]
                 if x.shape[1] < 200 and x.shape[2] > 200:  
-                    # e.g. (1, 20, 586, 3)
-                    x = x[0]  # -> [T,J,C]
-                # pattern 2: [B, J, C, T]
+                    # [B, T, J, C]
+                    x = x[0]  # → [T,J,C]
                 elif x.shape[-1] < 50:  
-                    # e.g. (1,586,3,1) or (1,586,3,20)
-                    x = x[0].permute(2,0,1)  # -> [T,J,C]
+                    # [B, J, C, T]
+                    x = x[0].permute(2, 0, 1)  # → [T,J,C]
                 else:
                     raise ValueError(f"Can't infer time axis from {x.shape}")
+
+            # ---- handle 3D fallback ----
             elif x.ndim == 3:
-                # [J,C,T] or [T,J,C]
-                if x.shape[0] > 200 and x.shape[-1] <= 10:
-                    x = x.permute(2,0,1)
+                if x.shape[0] > 200 and x.shape[-1] <= 50:
+                    x = x.permute(2, 0, 1)
+
             else:
                 raise ValueError(f"❌ Unexpected tensor shape {x.shape}")
 
-            x = np.squeeze(x, axis=0) if x.ndim == 4 else np.squeeze(x)
+            x = np.squeeze(x)
             if x.ndim != 3:
                 raise ValueError(f"❌ to_tjc failed, got {x.shape}")
-            return x.numpy().astype(np.float32)
+            return x.astype(np.float32)
+
 
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
