@@ -33,71 +33,36 @@ def _as_dense_cpu_btjc(x):
         x = x.tensor
     return x.detach().cpu()
 
-def build_holistic_header():
-    """Build a full PoseHeader using holistic components"""
-    try:
-        components = holistic.holistic_components()
-        header = PoseHeader(components=components)
-        print(f"✅ Built holistic header with {len(components)} components")
-        return header
-    except Exception as e:
-        print(f"❌ Failed to build header: {e}")
-        return None
-
 def ensure_skeleton(header):
-    """
-    Ensure PoseHeader exists.
-    Try 1️⃣ use existing header;
-    Try 2️⃣ use holistic.holistic_components();
-    Try 3️⃣ build minimal fallback if holistic import fails.
-    """
+    """Ensure PoseHeader exists."""
     from pose_format.pose_header import PoseHeader, PoseHeaderComponent
 
-    # Case 1: header already has components and limbs
     if header is not None and getattr(header, "components", None):
         print("ℹ Using existing header with components.")
         return header
 
-    # Case 2: try holistic.py
     try:
+        from pose_format.utils import holistic
         components = holistic.holistic_components()
         header = PoseHeader(components=components)
-        print("✅ Built header from pose_format.utils.holistic (with limbs).")
+        print("✅ Built header from holistic.py (with limbs).")
         return header
     except Exception as e:
         print(f"⚠ holistic import failed ({e}), using minimal fallback.")
 
-    # Case 3: minimal fallback
     components = [
         PoseHeaderComponent(
             name="pose",
             points=[f"p{i}" for i in range(33)],
-            limbs=[(11,13), (13,15), (12,14), (14,16), (11,12),
-                   (23,24), (23,25), (24,26), (25,27), (26,28),
-                   (11,23), (12,24)],
-            colors=[(255,0,0)] * 12,
+            limbs=[(11,13),(13,15),(12,14),(14,16),(11,12),
+                   (23,24),(23,25),(24,26),(25,27),(26,28),(11,23),(12,24)],
+            colors=[(255,0,0)]*12,
             point_format="XYZ",
         ),
-        PoseHeaderComponent(
-            name="face",
-            points=[f"f{i}" for i in range(478)],
-            limbs=[], colors=[], point_format="XYZ",
-        ),
-        PoseHeaderComponent(
-            name="hand_left",
-            points=[f"lh{i}" for i in range(21)],
-            limbs=[], colors=[], point_format="XYZ",
-        ),
-        PoseHeaderComponent(
-            name="hand_right",
-            points=[f"rh{i}" for i in range(21)],
-            limbs=[], colors=[], point_format="XYZ",
-        ),
-        PoseHeaderComponent(
-            name="world",
-            points=[f"w{i}" for i in range(33)],
-            limbs=[], colors=[], point_format="XYZ",
-        ),
+        PoseHeaderComponent(name="face", points=[f"f{i}" for i in range(478)], point_format="XYZ"),
+        PoseHeaderComponent(name="hand_left", points=[f"lh{i}" for i in range(21)], point_format="XYZ"),
+        PoseHeaderComponent(name="hand_right", points=[f"rh{i}" for i in range(21)], point_format="XYZ"),
+        PoseHeaderComponent(name="world", points=[f"w{i}" for i in range(33)], point_format="XYZ"),
     ]
     header = PoseHeader(version=0.1, components=components)
     print("✅ Built minimal fallback header with basic limbs.")
@@ -118,8 +83,8 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
         def to_tjc(tensor):
             """
             Convert model output (any of [B,T,J,C], [B,J,C,T], [B,J,C],
-            or even [B,T,1,J,C]) → [T,J,C].
-            Robust to singleton dimensions and 5D tensors.
+            or [B,T,1,J,C]) → [T,J,C].
+            Handles all dummy singleton dimensions safely.
             """
             x = tensor
             if hasattr(x, "tensor"):  # MaskedTensor
@@ -127,25 +92,28 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu()
 
-            # ---- handle 5D case ----
+            print(f"[to_tjc] input shape: {x.shape}")
+
+            # ---- Case 5D: [B,T,1,J,C] ----
             if x.ndim == 5:
-                # e.g. [1, 20, 1, 586, 3]
-                print(f"[to_tjc] Detected 5D tensor {x.shape}, squeezing middle dim.")
-                x = x.squeeze(2)  # remove the extra 1
-                # now shape → [1, 20, 586, 3]
-            
-            # ---- handle 4D cases ----
+                if x.shape[2] == 1:
+                    print(f"[to_tjc] Detected dummy dimension at axis=2 → squeeze it")
+                    x = x.squeeze(2)  # [B,T,J,C]
+                else:
+                    raise ValueError(f"Unexpected 5D shape {x.shape}")
+
+            # ---- Case 4D ----
             if x.ndim == 4:
-                if x.shape[1] < 200 and x.shape[2] > 200:  
-                    # [B, T, J, C]
+                # pattern: [B, T, J, C]
+                if x.shape[1] < 200 and x.shape[2] > 200:
                     x = x[0]  # → [T,J,C]
-                elif x.shape[-1] < 50:  
-                    # [B, J, C, T]
+                # pattern: [B, J, C, T]
+                elif x.shape[1] > 200 and x.shape[-1] < 50:
                     x = x[0].permute(2, 0, 1)  # → [T,J,C]
                 else:
-                    raise ValueError(f"Can't infer time axis from {x.shape}")
+                    raise ValueError(f"Can't infer time axis from 4D {x.shape}")
 
-            # ---- handle 3D fallback ----
+            # ---- Case 3D ----
             elif x.ndim == 3:
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
                     x = x.permute(2, 0, 1)
@@ -153,9 +121,15 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             else:
                 raise ValueError(f"❌ Unexpected tensor shape {x.shape}")
 
-            x = np.squeeze(x)
+            # Final squeeze (only if T=1 remains)
+            if x.ndim == 4 and x.shape[0] == 1:
+                x = x.squeeze(0)
+            x = np.array(x)
+
             if x.ndim != 3:
                 raise ValueError(f"❌ to_tjc failed, got {x.shape}")
+
+            print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
 
