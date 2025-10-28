@@ -77,6 +77,7 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
     """
 
     try:
+        import copy
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
@@ -103,9 +104,9 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
                     x = x[0].permute(2,0,1)  # -> [T,J,C]
                 else:
-                    # could still be [B,T,J,C] after squeeze
+                    # sometimes still [B,T,J,C] not caught above
                     if x.shape[0] == 1 and x.shape[2] > 200:
-                        x = x[0]  # -> [T,J,C]
+                        x = x[0]
                     else:
                         raise ValueError(f"Can't infer time axis from 4D {x.shape}")
 
@@ -125,9 +126,8 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
-        # convert pred / gt
-        gen_np = to_tjc(gen_btjc_cpu)  # [T,586,3]
-        gt_np  = to_tjc(gt_btjc_cpu)   # [T,586,3]
+        gen_np = to_tjc(gen_btjc_cpu)
+        gt_np  = to_tjc(gt_btjc_cpu)
 
         # frame align (T might differ, trim to shortest)
         min_T = min(gen_np.shape[0], gt_np.shape[0])
@@ -135,49 +135,44 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
         gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
-        # ----------------------
-        # now: only take first 33 joints (body/pose)
-        # ----------------------
         J_POSE = 33
         gen_pose_only = gen_np[:, :J_POSE, :]  # [T,33,3]
         gt_pose_only  = gt_np[:,  :J_POSE, :]  # [T,33,3]
 
-        print(f"[POSE-ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
+        print(f"[POSE_ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
 
-        # build a mini header that only has the first component ("pose")
-        # (the header we loaded may have multiple components, but for saving we just
-        #  keep the first one which should correspond to body with limbs)
-        mini_header = None
         if hasattr(header, "components") and len(header.components) > 0:
-            from pose_format.pose_header import PoseHeader, PoseHeaderComponent
-            pose_comp = header.components[0]  # assume first is body/pose (33 joints)
-            mini_header = PoseHeader(version=getattr(header,"version",0.1),
-                                     components=[pose_comp])
+            mini_header = copy.deepcopy(header)
+            mini_header.components = [copy.deepcopy(header.components[0])]
         else:
-            # fallback: rebuild minimal one
+            # fallback: ensure_skeleton(None) returns a synthetic header;
+            # again take only first component.
             mini_header = ensure_skeleton(None)
             mini_header.components = [mini_header.components[0]]
 
-        # Now wrap into NumPyPoseBody format:
-        # We need [T,C,P,J] masked array with confidence. For single component:
-        #   T = time
-        #   C = coords (3)
-        #   P = 1 component
-        #   J = joints (33)
         def build_single_body(seq_tjc):
             # seq_tjc: [T,33,3] -> [T,3,1,33]
-            data_tcj = np.transpose(seq_tjc, (0,2,1))           # [T,3,33]
-            data_tcpj = data_tcj[:, :, np.newaxis, :]           # [T,3,1,33]
-            mask = np.zeros_like(data_tcpj, dtype=bool)
+            data_tcj = np.transpose(seq_tjc, (0, 2, 1))       # [T,3,33]
+            data_tcpj = data_tcj[:, :, np.newaxis, :]         # [T,3,1,33]
+
+            mask = np.zeros_like(data_tcpj, dtype=bool)       # same shape
             masked_body = ma.masked_array(data_tcpj, mask=mask)
-            confidence = np.ones((data_tcpj.shape[0], 1, data_tcpj.shape[3]), dtype=np.float32)
+
+            confidence = np.ones(
+                (data_tcpj.shape[0], 1, data_tcpj.shape[3]),
+                dtype=np.float32
+            )  # [T,1,33]
+
             fps = getattr(header, "fps", 25)
-            return NumPyPoseBody(fps=fps, data=masked_body, confidence=confidence)
+            return NumPyPoseBody(
+                fps=fps,
+                data=masked_body,
+                confidence=confidence
+            )
 
         pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
         pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
 
-        os.makedirs("logs", exist_ok=True)
         with open("logs/prediction.pose", "wb") as f:
             pose_pred.write(f)
         with open("logs/groundtruth.pose", "wb") as f:
