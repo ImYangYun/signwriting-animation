@@ -3,18 +3,16 @@ import os
 import random
 import torch
 import numpy as np
-import numpy.ma as ma
 import lightning as pl
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import imageio  # for GIF export
+
 from torch.utils.data import DataLoader
 from pose_format import Pose
-from pose_format.pose_visualizer import PoseVisualizer
-from pose_format.utils.generic import reduce_holistic
 from pose_format.utils import holistic
 from pose_format.pose import PoseHeader
-from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
@@ -22,6 +20,7 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_
 
 
 def _to_plain_tensor(x):
+    """Turn MaskedTensor / custom batch tensor into a plain dense CPU torch.Tensor."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -29,20 +28,28 @@ def _to_plain_tensor(x):
     return x.detach().cpu()
 
 def _as_dense_cpu_btjc(x):
+    """Same idea but do NOT zero_filled if not present; just detach+cpu."""
     if hasattr(x, "tensor"):
         x = x.tensor
     return x.detach().cpu()
 
 def ensure_skeleton(header):
-    """Ensure PoseHeader exists."""
+    """
+    Make sure we have a PoseHeader with limb connectivity so we can draw stick figures.
+    Priority:
+      1) use header we loaded from dataset .pose file if it already has components
+      2) try holistic.holistic_components()
+      3) fallback manual 33-joint body skeleton
+    """
     from pose_format.pose_header import PoseHeader, PoseHeaderComponent
 
+    # Case 1: already have a header with components
     if header is not None and getattr(header, "components", None):
         print("ℹ Using existing header with components.")
         return header
 
+    # Case 2: try holistic from pose_format
     try:
-        from pose_format.utils import holistic
         components = holistic.holistic_components()
         header = PoseHeader(components=components)
         print("✅ Built header from holistic.py (with limbs).")
@@ -50,12 +57,14 @@ def ensure_skeleton(header):
     except Exception as e:
         print(f"⚠ holistic import failed ({e}), using minimal fallback.")
 
+    # Case 3: fallback manually define a body + simple limbs so we can draw
     components = [
         PoseHeaderComponent(
             name="pose",
             points=[f"p{i}" for i in range(33)],
             limbs=[(11,13),(13,15),(12,14),(14,16),(11,12),
-                   (23,24),(23,25),(24,26),(25,27),(26,28),(11,23),(12,24)],
+                   (23,24),(23,25),(24,26),(25,27),(26,28),
+                   (11,23),(12,24)],
             colors=[(255,0,0)]*12,
             point_format="XYZ",
         ),
@@ -68,53 +77,119 @@ def ensure_skeleton(header):
     print("✅ Built minimal fallback header with basic limbs.")
     return header
 
-def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
-    """
-    Save predicted and ground-truth pose sequences as .pose files.
-    We ONLY save the first component (body/pose, first 33 joints),
-    so shapes stay consistent and PoseVisualizer can draw limbs.
-    """
 
+def save_skeleton_gif(seq_tjc, header, out_path="logs/prediction.gif", fps=10):
+    """
+    Render a T×33×3 pose sequence as a stick-figure GIF.
+
+    seq_tjc: [T, 33, 3]  (x,y,z per joint)
+    header: PoseHeader (for skeleton limbs; we'll use header.components[0])
+    out_path: path to GIF
+    fps: frames per second for GIF
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    body_comp = header.components[0]
+    limbs = getattr(body_comp, "limbs", [])
+    # limbs: list of (a,b) joint index pairs that define bones/segments.
+
+    T, J, C = seq_tjc.shape
+
+    # get consistent axis range across frames so camera doesn't jump
+    all_x = seq_tjc[:, :, 0].reshape(-1)
+    all_y = seq_tjc[:, :, 1].reshape(-1)
+
+    x_min, x_max = float(all_x.min()), float(all_x.max())
+    y_min, y_max = float(all_y.min()), float(all_y.max())
+
+    pad_x = (x_max - x_min) * 0.1 + 1e-5
+    pad_y = (y_max - y_min) * 0.1 + 1e-5
+    x_min -= pad_x
+    x_max += pad_x
+    y_min -= pad_y
+    y_max += pad_y
+
+    frames = []
+
+    for t in range(T):
+        xs = seq_tjc[t, :, 0]  # [33]
+        ys = seq_tjc[t, :, 1]  # [33]
+
+        fig, ax = plt.subplots(figsize=(4,4))
+
+        # draw limbs first (stick lines)
+        for (a, b) in limbs:
+            if a < len(xs) and b < len(xs):
+                ax.plot([xs[a], xs[b]], [-ys[a], -ys[b]], linewidth=2)
+
+        # draw keypoints
+        ax.scatter(xs, -ys, s=10)
+
+        # nice view: flip y so person isn't upside-down
+        ax.set_xlim([x_min, x_max])
+        ax.set_ylim([-y_max, -y_min])
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f"t={t}")
+
+        fig.canvas.draw()
+        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        plt.close(fig)
+
+        frames.append(frame)
+
+    imageio.mimsave(out_path, frames, fps=fps)
+    print(f"🎞️ Saved skeleton GIF to {out_path}")
+
+
+def visualize_prediction_vs_gt(gen_btjc_cpu, gt_btjc_cpu, header):
+    """
+    High-level wrapper:
+    - Convert the model output and GT into [T, 33, 3]
+    - Save GIF for both
+    """
     try:
-        import copy
         os.makedirs("logs", exist_ok=True)
         header = ensure_skeleton(header)
 
-        # ----------------------
-        # helper: convert model output -> [T, J, C] numpy
-        # ----------------------
         def to_tjc(tensor):
+            """
+            Convert model output (shapes like [B,T,J,C], [B,T,1,J,C], [B,J,C,T], etc.)
+            into [T,J,C] numpy float32.
+            """
             x = tensor
-            if hasattr(x, "tensor"):  # MaskedTensor
+            if hasattr(x, "tensor"):  # e.g. MaskedTensor
                 x = x.tensor
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu()
 
             print(f"[to_tjc] input shape: {x.shape}")
 
-            # Case 5D: [B,T,1,J,C]
+            # Case 5D: [B,T,1,J,C]  -> squeeze that singleton 1
             if x.ndim == 5 and x.shape[2] == 1:
                 print("[to_tjc] Detected dummy dimension at axis=2 -> squeeze it")
-                x = x.squeeze(2)  # -> [B,T,J,C]
+                x = x.squeeze(2)  # now [B,T,J,C]
 
             # Case 4D
             if x.ndim == 4:
-                # [B,T,J,C]
+                # pattern [B,T,J,C]  e.g. [1,20,586,3]
                 if x.shape[1] < 200 and x.shape[2] > 200:
                     x = x[0]  # -> [T,J,C]
-                # [B,J,C,T]
+                # pattern [B,J,C,T]  e.g. [1,586,3,20]
                 elif x.shape[1] > 200 and x.shape[-1] < 50:
                     x = x[0].permute(2,0,1)  # -> [T,J,C]
                 else:
-                    # fallback: still [B,T,J,C] (batch=1)
+                    # fallback: still [B,T,J,C] but didn't match above branch
                     if x.shape[0] == 1 and x.shape[2] > 200:
-                        x = x[0]
+                        x = x[0]  # -> [T,J,C]
                     else:
                         raise ValueError(f"Can't infer time axis from 4D {x.shape}")
 
             # Case 3D
             elif x.ndim == 3:
-                # [J,C,T] -> [T,J,C]
+                # pattern [J,C,T] -> [T,J,C]
                 if x.shape[0] > 200 and x.shape[-1] <= 50:
                     x = x.permute(2,0,1)
 
@@ -128,101 +203,41 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
-        # ----------------------
-        # convert pred / gt to [T,586,3]
-        # ----------------------
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
 
-        # frame align
+        # Align frame count (T)
         min_T = min(gen_np.shape[0], gt_np.shape[0])
         if gen_np.shape[0] != gt_np.shape[0]:
             print(f"⚠️ Length mismatch: trimming to {min_T} frames")
         gen_np, gt_np = gen_np[:min_T], gt_np[:min_T]
 
-        # ----------------------
-        # keep only first 33 joints (body / upper skeleton)
-        # ----------------------
+        # Keep only first 33 joints (body/pose)
         J_POSE = 33
         gen_pose_only = gen_np[:, :J_POSE, :]  # [T,33,3]
         gt_pose_only  = gt_np[:,  :J_POSE, :]  # [T,33,3]
 
         print(f"[POSE_ONLY] gen_pose_only.shape={gen_pose_only.shape}, gt_pose_only.shape={gt_pose_only.shape}")
 
-        # ----------------------
-        # mini_header = copy of original header, but keep only first component
-        # ----------------------
-        if hasattr(header, "components") and len(header.components) > 0:
-            mini_header = copy.deepcopy(header)
-            mini_header.components = [copy.deepcopy(header.components[0])]
-            print("[HEADER_TRIM] using first component from existing header")
-        else:
-            mini_header = ensure_skeleton(None)
-            mini_header.components = [mini_header.components[0]]
-            print("[HEADER_TRIM] fallback header")
+        # Save GIFs
+        save_skeleton_gif(gen_pose_only, header, out_path="logs/prediction.gif", fps=10)
+        save_skeleton_gif(gt_pose_only,  header, out_path="logs/groundtruth.gif", fps=10)
 
-        # ----------------------
-        # helper to build NumPyPoseBody for ONE component
-        # ----------------------
-        def build_single_body(seq_tjc):
-            """
-            seq_tjc: [T, 33, 3]
-            We build:
-              data:        [T, 3, 1, 33]
-              confidence:  [T, 1, 33]
-              mask:        [T, 1, 33]  (then broadcast across channel dim)
-            """
-            # [T,33,3] -> [T,3,33]
-            data_tcj = np.transpose(seq_tjc, (0, 2, 1))          # [T,3,33]
-            # add component dim P=1 -> [T,3,1,33]
-            data_tcpj = data_tcj[:, :, np.newaxis, :]            # [T,3,1,33]
-
-            T, C, P, J = data_tcpj.shape
-            print(f"[BODY] data_tcpj.shape={data_tcpj.shape} (T,C,P,J)")
-
-            # build mask with shape [T,1,33], then broadcast up to [T,3,1,33]
-            mask_tpj = np.zeros((T, P, J), dtype=bool)           # [T,1,33]
-            print(f"[BODY] mask_tpj.shape={mask_tpj.shape} (T,P,J)")
-
-            mask_broadcast = mask_tpj[:, np.newaxis, :, :]       # [T,1,1,33]
-            mask_broadcast = np.repeat(mask_broadcast, C, axis=1)  # [T,3,1,33]
-            print(f"[BODY] mask_broadcast.shape={mask_broadcast.shape} (T,C,P,J)")
-
-            masked_body = ma.masked_array(data_tcpj, mask=mask_broadcast)
-
-            # confidence: [T,1,33]
-            confidence = np.ones((T, P, J), dtype=np.float32)
-            print(f"[BODY] confidence.shape={confidence.shape} (T,P,J)")
-
-            fps = getattr(header, "fps", 25)
-
-            body_obj = NumPyPoseBody(
-                fps=fps,
-                data=masked_body,
-                confidence=confidence,
-            )
-            return body_obj
-
-        pose_pred = Pose(mini_header, build_single_body(gen_pose_only))
-        pose_gt   = Pose(mini_header, build_single_body(gt_pose_only))
-
-        with open("logs/prediction.pose", "wb") as f:
-            pose_pred.write(f)
-        with open("logs/groundtruth.pose", "wb") as f:
-            pose_gt.write(f)
-
-        print("✅ Saved logs/prediction.pose & logs/groundtruth.pose (POSE-ONLY)")
+        print("✅ Saved skeleton GIFs: logs/prediction.gif and logs/groundtruth.gif")
         return True
 
     except Exception as e:
-        print(f"❌ Failed saving pose files: {e}")
+        print(f"❌ visualize_prediction_vs_gt failed: {e}")
         return False
 
 def save_scatter_backup(seq_btjc, save_path, title="PRED"):
-    """Fallback visualization if pose saving fails."""
+    """
+    Fallback quick plot if visualization totally fails.
+    Just scatter some joints for ~20 frames.
+    """
     if save_path.endswith(".gif"):
         save_path = save_path.replace(".gif", ".png")
-    seq = _to_plain_tensor(seq_btjc)[0]
+    seq = _to_plain_tensor(seq_btjc)[0]  # first in batch
     T, J, C = seq.shape
     plt.figure(figsize=(5, 5))
     for t in range(0, T, max(1, T // 20)):
@@ -241,7 +256,7 @@ def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_h
         num_future_frames=20,
         with_metadata=True,
         split=split,
-        reduce_holistic=reduce_holistic,  # ✅ 透传
+        reduce_holistic=reduce_holistic,  # we keep full holistic joints
     )
     loader = DataLoader(
         dataset,
@@ -262,7 +277,14 @@ if __name__ == "__main__":
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     batch_size, num_workers = 2, 2
 
-    train_loader = make_loader(data_dir, csv_path, "train", bs=batch_size, num_workers=num_workers, reduce_holistic=False)
+    train_loader = make_loader(
+        data_dir, csv_path,
+        split="train",
+        bs=batch_size,
+        num_workers=num_workers,
+        reduce_holistic=False
+    )
+    # you're reusing train_loader as val_loader; fine for debugging
     val_loader = train_loader
 
     print("\n" + "="*60)
@@ -273,9 +295,8 @@ if __name__ == "__main__":
     print(f"  input_pose.shape  = {batch['conditions']['input_pose'].shape}")
     print("="*60 + "\n")
 
-    # quick GT motion sanity check
-    gt = _to_plain_tensor(batch["data"][0]).numpy()
-    frame_diff = np.abs(gt[1:] - gt[:-1]).mean()
+    gt0 = _to_plain_tensor(batch["data"][0]).numpy()  # first element in batch
+    frame_diff = np.abs(gt0[1:] - gt0[:-1]).mean()
     print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
 
     model = LitMinimal(log_dir="logs")
@@ -292,15 +313,14 @@ if __name__ == "__main__":
     )
     trainer.fit(model, train_loader, val_loader)
 
-    # --- Generate
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
         cond  = batch["conditions"]
 
-        past_btjc = cond["input_pose"][:1].to(model.device)
-        sign_img  = cond["sign_image"][:1].to(model.device)
-        fut_gt    = batch["data"][:1].to(model.device)
+        past_btjc = cond["input_pose"][:1].to(model.device)   # [1, Tp, J, C] masked-ish
+        sign_img  = cond["sign_image"][:1].to(model.device)   # conditioning image(s)
+        fut_gt    = batch["data"][:1].to(model.device)        # [1, Tf, J, C] future GT
 
         print("[GEN] Generating full sequence...")
         gen_btjc = model.generate_full_sequence(past_btjc, sign_img, target_len=20)
@@ -309,10 +329,21 @@ if __name__ == "__main__":
         fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)
 
         def frame_disp(x_btjc):
+            # x_btjc expected ~ [B,T,J,C] OR [B,J,C,T] after our pipeline; we use [0] and diff in XY
             x = x_btjc[0]
-            return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item() if x.size(0) > 1 else 0.0
+            # guess "time" is dim 0; if time is not 0 we still just use indexing consistent
+            # with how we computed mean|ΔGT| above (which also assumed time dim first).
+            if x.dim() == 4 and x.shape[1] < 200 and x.shape[2] > 200:
+                # [1,T,J,C]? then x is [T,J,C] after x = x_btjc[0], so already handled
+                pass
+            if x.size(0) > 1:
+                return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item()
+            else:
+                return 0.0
 
-        print(f"[GEN] Tf={gen_btjc_cpu.size(1)}, mean|Δpred|={frame_disp(gen_btjc_cpu):.6f}, mean|Δgt|={frame_disp(fut_gt_cpu):.6f}")
+        print(f"[GEN] Tf={gen_btjc_cpu.size(1) if gen_btjc_cpu.dim()>=2 else '??'}, "
+              f"mean|Δpred|={frame_disp(gen_btjc_cpu):.6f}, "
+              f"mean|Δgt|={frame_disp(fut_gt_cpu):.6f}")
 
         try:
             mask_for_eval = torch.ones(1, gen_btjc.size(1), device=gen_btjc.device)
@@ -321,15 +352,17 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[EVAL] DTW failed: {e}")
 
-        # save and visualize
+        # ------------------
+        # Load any header we can find from dataset pose files
+        # ------------------
         header = None
         for root, _, files in os.walk(data_dir):
             for name in files:
                 if name.endswith(".pose"):
                     try:
                         with open(os.path.join(root, name), "rb") as f:
-                            pose = Pose.read(f)
-                            header = pose.header
+                            pose_file = Pose.read(f)
+                            header = pose_file.header
                             print(f"[HEADER] ✅ Loaded header from {name}")
                             break
                     except Exception:
@@ -338,8 +371,10 @@ if __name__ == "__main__":
                 break
 
         header = ensure_skeleton(header)
-        pose_saved = save_pose_files(gen_btjc_cpu, fut_gt_cpu, header)
+        viz_ok = visualize_prediction_vs_gt(gen_btjc_cpu, fut_gt_cpu, header)
 
-        if not pose_saved:
+        if not viz_ok:
+            # absolute fallback: simple scatter
             save_scatter_backup(gen_btjc_cpu, "logs/scatter_pred.png", "PRED")
-            save_scatter_backup(fut_gt_cpu, "logs/scatter_gt.png", "GT")
+            save_scatter_backup(fut_gt_cpu,  "logs/scatter_gt.png",   "GT")
+
