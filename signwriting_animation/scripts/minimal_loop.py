@@ -4,14 +4,14 @@ import torch
 import numpy as np
 import lightning as pl
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 from matplotlib import animation
 
 from torch.utils.data import DataLoader
+
 from pose_format import Pose
 from pose_format.pose import PoseHeader
-from pose_format.pose_header import PoseHeaderComponent
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
@@ -21,6 +21,9 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 def _to_plain_tensor(x):
+    """
+    Convert possibly masked/lightning batch tensor to plain CPU tensor.
+    """
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -28,11 +31,23 @@ def _to_plain_tensor(x):
     return x.detach().cpu()
 
 def _as_dense_cpu_btjc(x):
+    """
+    Just detach+cpu, keep shape info.
+    """
     if hasattr(x, "tensor"):
         x = x.tensor
     return x.detach().cpu()
 
 def to_tjc_anyshape(tensor_like):
+    """
+    Normalize model/GT sequence to [T, J, C] float32.
+    Handles:
+      [1,T,J,C]
+      [1,T,1,J,C]
+      [1,J,C,T]
+      [T,J,C]
+    Assumes J ~ 586, C=3.
+    """
     x = tensor_like
     if hasattr(x, "tensor"):
         x = x.tensor
@@ -48,86 +63,57 @@ def to_tjc_anyshape(tensor_like):
     elif x.ndim == 5 and x.shape[0] == 1 and x.shape[2] == 1:
         x = x[0, :, 0, :, :]  # -> [T,J,C]
 
-    # [1,J,C,T]  (1,586,3,20)
+    # [1,J,C,T] (e.g. 1,586,3,20)
     elif x.ndim == 4 and x.shape[0] == 1 and x.shape[1] > 200 and x.shape[-1] < 100:
-        x = np.transpose(x[0], (2,0,1))  # -> [T,J,C]
+        x = np.transpose(x[0], (2, 0, 1))  # -> [T,J,C]
 
     # already [T,J,C]
     elif x.ndim == 3 and x.shape[0] < 300 and x.shape[1] > 200:
         pass
+
     else:
         raise ValueError(f"[to_tjc_anyshape] Unexpected shape {x.shape}")
 
     if x.ndim != 3:
         raise ValueError(f"[to_tjc_anyshape] Final shape must be [T,J,C], got {x.shape}")
-
     return x.astype(np.float32)  # [T,J,C]
 
 
 def ensure_full_header(header_from_dataset):
     """
-    We want a header that contains body, face, L/R hands, world... basically holistic.
-    1. Prefer header we loaded from dataset (.pose)
-    2. Otherwise fallback to holistic.holistic_components()
+    We want a holistic header with components:
+    POSE_LANDMARKS (33), FACE_LANDMARKS (478),
+    LEFT_HAND_LANDMARKS (21), RIGHT_HAND_LANDMARKS (21),
+    POSE_WORLD_LANDMARKS (33).
+
+    Priority:
+    1. header_from_dataset if available
+    2. fallback to holistic.holistic_components()
     """
     if header_from_dataset is not None and getattr(header_from_dataset, "components", None):
         print("ℹ Using existing header with components from dataset.")
         return header_from_dataset
 
-    try:
-        comps = holistic.holistic_components()
-        hdr = PoseHeader(components=comps)
-        print("✅ Built header via holistic.holistic_components()")
-        return hdr
-    except Exception as e:
-        raise RuntimeError(f"Failed to build holistic header: {e}")
-
-
-def drop_world_component(pose_obj):
-    """
-    Advisor said: drop POSE_WORLD_LANDMARKS (the 'ghost' person in corner).
-    We assume last component is that world body (33 joints).
-    We'll build a new Pose with only first N-1 components.
-    """
-    old_header = pose_obj.header
-    comps = old_header.components
-    sizes = [len(c.points) for c in comps]
-
-    # Keep all except the last one
-    keep_comps = comps[:-1]
-    keep_sizes = sizes[:-1]
-    keep_J = sum(keep_sizes)
-
-    new_header = PoseHeader(
-        version=old_header.version,
-        components=keep_comps
-    )
-
-    body = pose_obj.body  # NumPyPoseBody or similar
-    data_ma   = body.data            # masked array or ndarray (T,P,V,C)
-    conf      = body.confidence      # (T,P,V)
-    data_trim = data_ma[:, :, :keep_J, :]
-    conf_trim = conf[:, :, :keep_J]
-
-    new_body = NumPyPoseBody(
-        fps=body.fps,
-        data=data_trim,
-        confidence=conf_trim
-    )
-    return Pose(new_header, new_body)
+    # fallback
+    comps = holistic.holistic_components()
+    hdr = PoseHeader(components=comps)
+    print("✅ Built header via holistic.holistic_components() fallback")
+    return hdr
 
 
 def build_pose_from_sequence(seq_btjc_cpu, header_full, fps=25.0):
     """
-    seq_btjc_cpu: output or GT sequence (Torch tensor-ish)
-    header_full:  PoseHeader (preferably from dataset)
-    returns: Pose(header_full, NumPyPoseBody(...))
+    seq_btjc_cpu: model output or GT (torch-like)
+    header_full: PoseHeader
+    return: Pose(header_full, NumPyPoseBody(...))
+    Body shape in PoseFormat is (T, P, V, C) with P=1.
+    Confidence is (T, P, V).
     """
     tjc = to_tjc_anyshape(seq_btjc_cpu)  # [T,J,C]
     T, J, C = tjc.shape
     print(f"[build_pose_from_sequence] tjc.shape={tjc.shape} (T,J,C)")
 
-    data_TPJC = tjc[:, np.newaxis, :, :]        # (T,1,J,C)
+    data_TPJC = tjc[:, np.newaxis, :, :]          # (T,1,J,C)
     confidence = np.ones((T, 1, J), dtype=np.float32)  # (T,1,J)
 
     body = NumPyPoseBody(
@@ -135,26 +121,30 @@ def build_pose_from_sequence(seq_btjc_cpu, header_full, fps=25.0):
         data=data_TPJC,
         confidence=confidence
     )
+
     return Pose(header_full, body)
 
 
 def render_pose_video(pose_obj, out_path, title_prefix="SEQ", fps_override=None):
     """
-    Use PoseVisualizer to draw the body/face/hands with nice colors, unnormalized.
-    We call PoseVisualizer.draw(ax, frame_id=i) per frame and animate via matplotlib.
+    Render the given Pose with PoseVisualizer.draw(frame)
+    into an MP4 (or GIF fallback).
+    We do NOT normalize coordinates. We keep true scale.
+    World component should already be removed before calling this.
     """
     viz = PoseVisualizer(pose_obj)
     T = pose_obj.body.data.shape[0]
 
-    # figure global XY limits so camera doesn't jump
-    data_np = pose_obj.body.data.filled(np.nan)  # (T,1,J,C)
+    # Figure stable axis limits from all frames
+    data_np = pose_obj.body.data.filled(np.nan)  # (T,1,J,C) masked->np
     xy = data_np[..., :2]                        # (T,1,J,2)
-    x_min = np.nanmin(xy[...,0])
-    x_max = np.nanmax(xy[...,0])
-    y_min = np.nanmin(xy[...,1])
-    y_max = np.nanmax(xy[...,1])
-    pad_x = (x_max - x_min)*0.1 + 1e-5
-    pad_y = (y_max - y_min)*0.1 + 1e-5
+    x_min = np.nanmin(xy[..., 0])
+    x_max = np.nanmax(xy[..., 0])
+    y_min = np.nanmin(xy[..., 1])
+    y_max = np.nanmax(xy[..., 1])
+
+    pad_x = (x_max - x_min) * 0.1 + 1e-5
+    pad_y = (y_max - y_min) * 0.1 + 1e-5
     x_min -= pad_x; x_max += pad_x
     y_min -= pad_y; y_max += pad_y
 
@@ -185,7 +175,7 @@ def render_pose_video(pose_obj, out_path, title_prefix="SEQ", fps_override=None)
         update,
         init_func=init,
         frames=T,
-        interval=200,  # ms between frames (~5fps visual pacing)
+        interval=200,  # ms per frame (~5 fps visually)
         blit=False
     )
 
@@ -198,17 +188,24 @@ def render_pose_video(pose_obj, out_path, title_prefix="SEQ", fps_override=None)
 
     try:
         Writer = animation.writers['ffmpeg']
-        writer = Writer(fps=int(round(fps)), metadata=dict(artist='pose_format'), bitrate=2400)
+        writer = Writer(fps=int(round(fps)),
+                        metadata=dict(artist='pose_format'),
+                        bitrate=2400)
         anim.save(out_path, writer=writer)
         print(f"✅ Saved MP4: {out_path}")
     except Exception as e:
+        # fallback to GIF if ffmpeg missing
         gif_path = os.path.splitext(out_path)[0] + ".gif"
         anim.save(gif_path, writer='pillow', fps=int(round(fps)))
         print(f"⚠ ffmpeg failed ({e}), saved GIF instead: {gif_path}")
+
     plt.close(fig)
 
 
 def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_holistic=False):
+    """
+    reduce_holistic=False means: keep ALL joints (586 total).
+    """
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -216,7 +213,7 @@ def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_h
         num_future_frames=20,
         with_metadata=True,
         split=split,
-        reduce_holistic=reduce_holistic,  # keep FULL holistic
+        reduce_holistic=reduce_holistic,
     )
     loader = DataLoader(
         dataset,
@@ -238,13 +235,14 @@ if __name__ == "__main__":
     batch_size, num_workers = 2, 2
 
     train_loader = make_loader(
-        data_dir, csv_path,
+        data_dir,
+        csv_path,
         split="train",
         bs=batch_size,
         num_workers=num_workers,
-        reduce_holistic=False
+        reduce_holistic=False  # keep full holistic (586 joints)
     )
-    val_loader = train_loader  # quick sanity
+    val_loader = train_loader  # mini sanity only, no real validation now
 
     print("\n" + "="*60)
     batch = next(iter(train_loader))
@@ -254,10 +252,12 @@ if __name__ == "__main__":
     print(f"  input_pose.shape  = {batch['conditions']['input_pose'].shape}")
     print("="*60 + "\n")
 
+    # basic GT motion sanity
     gt0 = _to_plain_tensor(batch["data"][0]).numpy()
     frame_diff = np.abs(gt0[1:] - gt0[:-1]).mean() if gt0.shape[0] > 1 else 0.0
     print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
 
+    # --- tiny training loop ---
     model = LitMinimal(log_dir="logs")
     trainer = pl.Trainer(
         max_steps=500,
@@ -272,14 +272,13 @@ if __name__ == "__main__":
     )
     trainer.fit(model, train_loader, val_loader)
 
-    # generate one sample
     model.eval()
     with torch.no_grad():
         batch = next(iter(train_loader))
         cond  = batch["conditions"]
 
-        past_btjc = cond["input_pose"][:1].to(model.device)  # past seq
-        sign_img  = cond["sign_image"][:1].to(model.device)  # gloss img
+        past_btjc = cond["input_pose"][:1].to(model.device)  # past motion
+        sign_img  = cond["sign_image"][:1].to(model.device)  # sign image cond
         fut_gt    = batch["data"][:1].to(model.device)       # future GT
 
         print("[GEN] Generating future sequence...")
@@ -290,11 +289,14 @@ if __name__ == "__main__":
 
         def frame_disp_est(x_btjc):
             x = x_btjc[0]
-            return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item() if (x.dim()>=3 and x.size(0)>1) else 0.0
+            if x.dim() >= 3 and x.size(0) > 1:
+                return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item()
+            return 0.0
 
         print(f"[GEN] mean|Δpred|={frame_disp_est(gen_btjc_cpu):.6f}, "
               f"mean|Δgt|={frame_disp_est(fut_gt_cpu):.6f}")
 
+        # DTW score (sanity)
         try:
             mask_for_eval = torch.ones(1, gen_btjc.size(1), device=gen_btjc.device)
             dtw_val = masked_dtw(gen_btjc, fut_gt.to(gen_btjc.device), mask_for_eval).item()
@@ -319,15 +321,21 @@ if __name__ == "__main__":
 
         header_full = ensure_full_header(header_loaded)
 
-        # ---- build Pose() objects (full holistic) ----
         pred_pose_full = build_pose_from_sequence(gen_btjc_cpu, header_full, fps=25.0)
         gt_pose_full   = build_pose_from_sequence(fut_gt_cpu,  header_full, fps=25.0)
 
-        # ---- drop 'world' component for viz (advisor requested) ----
-        pred_pose_trim = drop_world_component(pred_pose_full)
-        gt_pose_trim   = drop_world_component(gt_pose_full)
+        pred_pose_trim = pred_pose_full.remove_components("POSE_WORLD_LANDMARKS")
+        gt_pose_trim   = gt_pose_full.remove_components("POSE_WORLD_LANDMARKS")
 
-        # ---- write .pose files (full holistic BEFORE drop) for reproducibility ----
+        print("[TRIM] pred full joints:",
+              pred_pose_full.body.data.shape,
+              "-> trimmed:",
+              pred_pose_trim.body.data.shape)
+        print("[TRIM] gt   full joints:",
+              gt_pose_full.body.data.shape,
+              "-> trimmed:",
+              gt_pose_trim.body.data.shape)
+
         os.makedirs("logs", exist_ok=True)
         with open("logs/prediction.pose", "wb") as f:
             pred_pose_full.write(f)
@@ -335,7 +343,6 @@ if __name__ == "__main__":
             gt_pose_full.write(f)
         print("✅ wrote logs/prediction.pose and logs/groundtruth.pose")
 
-        # ---- render mp4/gif using pose_format visualizer (trimmed = no ghost body) ----
         render_pose_video(gt_pose_trim,   "logs/groundtruth_poseformat.mp4", title_prefix="GT")
         render_pose_video(pred_pose_trim, "logs/prediction_poseformat.mp4", title_prefix="PRED")
 
