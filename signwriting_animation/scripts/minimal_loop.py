@@ -132,9 +132,10 @@ def save_pose_files(gen_btjc_cpu, gt_btjc_cpu, header):
             print(f"[to_tjc] output shape: {x.shape}")
             return x.astype(np.float32)
 
-
         gen_np = to_tjc(gen_btjc_cpu)
         gt_np  = to_tjc(gt_btjc_cpu)
+        split_sizes = [len(c.points) for c in header.components]
+        print(f"[CHECK] gen_np.shape={gen_np.shape}, gt_np.shape={gt_np.shape}, header_total_joints={sum(split_sizes)}")
 
         min_T = min(gen_np.shape[0], gt_np.shape[0])
         if gen_np.shape[0] != gt_np.shape[0]:
