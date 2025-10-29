@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Subset
 
 # --- pose-format imports ---
 from pose_format import Pose
-from pose_format.pose import PoseHeader
+from pose_format.pose_header import PoseHeader, PoseHeaderDimensions
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.holistic import holistic_components
@@ -137,7 +137,7 @@ if __name__ == "__main__":
         # --- Construct holistic header ---
         header = PoseHeader(
             version=1,
-            dimensions=np.array([3], dtype=np.uint32),  # <-- 必须为 array, 不是 int
+            dimensions=PoseHeaderDimensions(width=3, height=1, depth=1),
             components=holistic_components()
         )
         print(f"[INFO] Holistic header with {sum(len(c.limbs) for c in header.components)} limbs")
