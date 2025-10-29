@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
-"""
-Minimal FluentPose-style loop for quick visualization & pose export
-Author: yayun
-"""
 import os
 import torch
 import numpy as np
 import lightning as pl
 from torch.utils.data import DataLoader, Subset
 
+# --- pose-format imports ---
 from pose_format import Pose
 from pose_format.pose import PoseHeader
-from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.numpy.pose_body import NumPyPoseBody
+from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.holistic import holistic_components
 from pose_format.torch.masked.collator import zero_pad_collator
 
+# --- project imports ---
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 
+# ---------------------- Utility Functions ----------------------
 def to_tjc_anyshape(x):
-    """Convert tensor to [T,J,C] np.float32 (handles multiple possible shapes)."""
+    """Ensure input is [T,J,C] np.float32."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "detach"):
@@ -40,18 +39,8 @@ def to_tjc_anyshape(x):
     return x.astype(np.float32)
 
 
-def ensure_header(dataset):
-    """Prefer dataset header if it has limbs, else fallback to holistic_components()."""
-    header = getattr(dataset, "pose_header", None)
-    if header is not None and any(len(c.limbs) > 0 for c in header.components):
-        print("✅ Using header from dataset (with limbs).")
-        return header
-    print("⚠️ Dataset header missing or limbs empty — using holistic_components().")
-    return PoseHeader(components=holistic_components())
-
-
 def build_pose(btjc, header, fps=25.0):
-    """Convert model/GT tensor to Pose() with proper shape."""
+    """Convert tensor [1,T,J,C] to Pose()"""
     tjc = to_tjc_anyshape(btjc)
     T, J, C = tjc.shape
     body = NumPyPoseBody(
@@ -63,22 +52,22 @@ def build_pose(btjc, header, fps=25.0):
 
 
 def save_pose_and_video(pose_obj, out_prefix):
-    """Save both .pose and .mp4 video using PoseVisualizer."""
+    """Save both .pose and .mp4"""
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
     pose_path = out_prefix + ".pose"
     with open(pose_path, "wb") as f:
         pose_obj.write(f)
-    print(f"💾 Saved pose file: {pose_path}")
+    print(f"Saved: {pose_path}")
 
     mp4_path = out_prefix + ".mp4"
     viz = PoseVisualizer(pose_obj)
     viz.save_video(mp4_path)
-    print(f"🎥 Saved video: {mp4_path}")
+    print(f"Saved: {mp4_path}")
 
 
-# ---------------------- dataloader ----------------------
+# ---------------------- Data Loader ----------------------
 def make_small_loader(data_dir, csv_path, n_samples=8, bs=2):
-    """Load a small subset for quick testing."""
+    """Small subset loader for quick testing"""
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -96,38 +85,38 @@ def make_small_loader(data_dir, csv_path, n_samples=8, bs=2):
         num_workers=0,
         collate_fn=zero_pad_collator,
     )
-    print(f"[INFO] Loaded {len(subset)} samples for quick test.")
+    print(f"[INFO] Loaded {len(subset)} samples.")
     return loader
 
 
-# ---------------------- main loop ----------------------
+# ---------------------- Main ----------------------
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
 
     data_dir = "/data/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
-    out_dir = "/data/yayun/signwriting-animation-fork/logs/test"
+    out_dir = "logs/test"
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- Data ---
+    # --- Load data ---
     loader = make_small_loader(data_dir, csv_path, n_samples=8, bs=2)
     batch = next(iter(loader))
     print(f"[INFO] Batch shape: {batch['data'].shape}")
 
-    # --- Tiny train (quiet) ---
+    # --- Train small model ---
     model = LitMinimal(log_dir=out_dir)
     trainer = pl.Trainer(
-        max_steps=50,
+        max_steps=100,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        log_every_n_steps=25,
-        limit_train_batches=5,
+        log_every_n_steps=20,
         enable_checkpointing=False,
         enable_progress_bar=True,
         deterministic=True,
+        num_sanity_val_steps=0,  # no validation loop
     )
-    trainer.fit(model, loader, loader)
+    trainer.fit(model, loader)
 
     # --- Inference ---
     model.eval()
@@ -140,17 +129,19 @@ if __name__ == "__main__":
         print("[GEN] Generating future motion...")
         pred = model.generate_full_sequence(past, sign_img, target_len=20)
 
-        # --- Evaluation ---
         mask = torch.ones(1, pred.size(1), device=pred.device)
         dtw_val = masked_dtw(pred, gt, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # --- Pose export ---
-        header = ensure_header(loader.dataset)
+        # --- Use holistic header directly ---
+        header = PoseHeader(components=holistic_components())
+        print(f"[INFO] Holistic header with {sum(len(c.limbs) for c in header.components)} limbs")
+
+        # --- Build and Save ---
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
         save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
 
-    print("\n✅ Finished. Results saved in:", os.path.abspath(out_dir))
+    print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
