@@ -142,6 +142,14 @@ if __name__ == "__main__":
         pred_pose = build_pose(pred, header)
 
         save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
+        print("✅ Groundtruth saved OK")
+
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
+        print("✅ Prediction saved OK")
+
+        print("GT has NaN?", np.isnan(gt_pose.body.data.filled(np.nan)).all())
+        print("Pred has NaN?", np.isnan(pred_pose.body.data.filled(np.nan)).all())
+
+        print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
 
     print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
