@@ -134,7 +134,7 @@ if __name__ == "__main__":
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
         # --- Use holistic header directly ---
-        header = PoseHeader(components=holistic_components())
+        header = PoseHeader(version=1, dimensions=3, components=holistic_components())
         print(f"[INFO] Holistic header with {sum(len(c.limbs) for c in header.components)} limbs")
 
         # --- Build and Save ---
