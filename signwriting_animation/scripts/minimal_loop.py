@@ -14,9 +14,11 @@ from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.pose import PoseHeader, PoseHeaderDimensions
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.holistic import holistic_components
+from pose_format.torch.masked.collator import zero_pad_collator  # ✅ 必须导入
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
+
 
 # --------------------- Print buffer fix ---------------------
 try:
@@ -26,6 +28,7 @@ except Exception:
 
 
 def _to_plain_tensor(x):
+    """Convert possibly masked/lightning tensor to plain CPU tensor."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -34,7 +37,7 @@ def _to_plain_tensor(x):
 
 
 def build_pose(tensor_btjc, header):
-    """Convert [1,T,J,C] tensor to Pose object"""
+    """Convert [1,T,J,C] tensor to Pose object."""
     arr = _to_plain_tensor(tensor_btjc)[0].numpy()  # [T,J,C]
     body = NumPyPoseBody(fps=25, data=arr)
     return Pose(header=header, body=body)
@@ -54,7 +57,7 @@ def save_pose_and_video(pose_obj, out_prefix):
         pose_obj = pose_obj.remove_components([
             c.name for c in pose_obj.header.components if c.name != "POSE_LANDMARKS"
         ])
-        print(f"[CLEAN] Components after filtering: {[c.name for c in pose_obj.header.components]}")
+        print(f"[CLEAN] Components kept: {[c.name for c in pose_obj.header.components]}")
     except Exception as e:
         print(f"[WARN] Could not remove components: {e}")
 
@@ -67,7 +70,7 @@ def save_pose_and_video(pose_obj, out_prefix):
     try:
         viz = PoseVisualizer(pose_obj)
         T = pose_obj.body.data.shape[0]
-        viz.save_video(mp4_path, frames=range(T))
+        viz.save_video(mp4_path, frames=range(T), fps=25)  # ✅ 加上 fps
         print(f"🎞️ Saved video: {mp4_path}")
     except Exception as e:
         print(f"⚠️ Failed to save video: {e}")
@@ -81,22 +84,25 @@ if __name__ == "__main__":
 
     print("[DATA] Loading dataset...")
     dataset = DynamicPosePredictionDataset(
-        data_dir="/data/yayun/pose_data", 
-        csv_path="/data/yayun/signwriting-animation/data_fixed.csv",  # 对应的 CSV
+        data_dir="/data/yayun/pose_data",
+        csv_path="/data/yayun/signwriting-animation/data_fixed.csv",
         num_past_frames=40,
         num_future_frames=20,
         with_metadata=True,
-        split="test",              # 或 "train"/"dev"，按你需要
-        reduce_holistic=False      # True 可加速（少点 joints）
+        split="test",
+        reduce_holistic=False
     )
-    loader = DataLoader(dataset, batch_size=1, collate_fn=None, shuffle=False)
+
+    # ✅ 使用 zero_pad_collator，修复 MaskedTensor 报错
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
 
     batch = next(iter(loader))
-    print(f"[INFO] Loaded {len(batch['data'])} samples")
+    print(f"[INFO] Loaded batch successfully. Keys: {list(batch.keys())}")
 
     print("[MODEL] Initializing model...")
     model = LitMinimal.load_from_checkpoint("checkpoints/latest.ckpt", strict=False)
     model.eval()
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Inference ---
     with torch.no_grad():
@@ -112,21 +118,27 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, gt, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # --- Header (3D) ---
+        # ✅ Header fix: use correct PoseHeaderDimensions
         comps = holistic_components()
         header = PoseHeader(
             version=1,
-            dimensions=PoseHeaderDimensions(width=3, height=1, depth=1),
+            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),  # 3D last axis
             components=comps
         )
-        print(f"[INFO] Initial header with {sum(len(c.limbs) for c in header.components)} limbs")
+        print(f"[INFO] Holistic header built with {sum(len(c.limbs) for c in header.components)} limbs")
 
         # --- Build poses ---
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
+
+        # --- Sanity checks ---
+        print(f"GT data range: [{np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}]")
+        print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
+        print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
 
         # --- Save and visualize ---
         save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
 
         print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
+        print(f"Output files: {os.listdir(out_dir)}")
