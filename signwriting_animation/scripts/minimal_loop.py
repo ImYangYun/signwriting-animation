@@ -81,11 +81,13 @@ if __name__ == "__main__":
 
     print("[DATA] Loading dataset...")
     dataset = DynamicPosePredictionDataset(
-        data_csv="data.csv",
-        num_samples=8,  # small test
-        window_min=40,
-        window_max=60,
-        random_window=True,
+        data_dir="/data/yayun/pose_data", 
+        csv_path="/data/yayun/signwriting-animation/data_fixed.csv",  # 对应的 CSV
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split="test",              # 或 "train"/"dev"，按你需要
+        reduce_holistic=False      # True 可加速（少点 joints）
     )
     loader = DataLoader(dataset, batch_size=1, collate_fn=None, shuffle=False)
 
