@@ -118,7 +118,7 @@ if __name__ == "__main__":
     )
     trainer.fit(model, loader)
 
-    # --- Inference ---
+       # --- Inference ---
     model.eval()
     with torch.no_grad():
         cond = batch["conditions"]
@@ -129,30 +129,34 @@ if __name__ == "__main__":
         print("[GEN] Generating future motion...")
         pred = model.generate_full_sequence(past, sign_img, target_len=20)
 
+        # --- Evaluation ---
         mask = torch.ones(1, pred.size(1), device=pred.device)
         dtw_val = masked_dtw(pred, gt, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # --- Use holistic header directly ---
-        header = PoseHeader(version=1, dimensions=3, components=holistic_components())
+        # --- Construct holistic header ---
+        header = PoseHeader(
+            version=1,
+            dimensions=np.array([3], dtype=np.uint32),  # <-- 必须为 array, 不是 int
+            components=holistic_components()
+        )
         print(f"[INFO] Holistic header with {sum(len(c.limbs) for c in header.components)} limbs")
 
-        # --- Build and Save ---
+        # --- Build Pose objects ---
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
+        # --- Save pose & video ---
         save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
         print("✅ Groundtruth saved OK")
 
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
         print("✅ Prediction saved OK")
 
-        # Debug checks (all aligned at same indent)
+        # --- Debug info ---
         print("GT has NaN?", np.isnan(gt_pose.body.data.filled(np.nan)).all())
         print("Pred has NaN?", np.isnan(pred_pose.body.data.filled(np.nan)).all())
 
-        print(f"GT NaN check: {np.isnan(gt_pose.body.data.filled(np.nan)).all()}")
-        print(f"Pred NaN check: {np.isnan(pred_pose.body.data.filled(np.nan)).all()}")
         print(f"GT data range: {np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}")
         print(f"Pred data range: {np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}")
 
