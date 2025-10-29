@@ -100,7 +100,7 @@ if __name__ == "__main__":
     print(f"[INFO] Loaded batch successfully. Keys: {list(batch.keys())}")
 
     print("[MODEL] Initializing model...")
-    model = LitMinimal.load_from_checkpoint("checkpoints/latest.ckpt", strict=False)
+    model = LitMinimal(num_keypoints=586, num_dims=3)
     model.eval()
     model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
