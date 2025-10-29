@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+"""
+Minimal loop with proper pose visualization & pose file export (FluentPose-style)
+Author: yayun
+"""
 import os
 import torch
 import numpy as np
@@ -7,184 +11,126 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import animation
-
 from torch.utils.data import DataLoader
 
+# pose_format imports
 from pose_format import Pose
 from pose_format.pose import PoseHeader
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.torch.masked.collator import zero_pad_collator
-from pose_format.utils import holistic
+from pose_format.utils.holistic import holistic_components
 
+# project imports
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 
+# ---------------------- utility helpers ----------------------
 def _to_plain_tensor(x):
+    """convert masked or lightning tensors to plain cpu tensor"""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     return x.detach().cpu()
 
-def _as_dense_cpu_btjc(x):
-    if hasattr(x, "tensor"):
-        x = x.tensor
-    return x.detach().cpu()
 
-def to_tjc_anyshape(tensor_like):
-    """
-    Normalize model/GT sequence to [T, J, C] float32.
-    Accepts common shapes we saw in this project.
-    """
-    x = tensor_like
+def to_tjc_anyshape(x):
+    """convert tensor to [T,J,C] np.float32 (accept various shapes)"""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "detach"):
         x = x.detach().cpu()
     x = np.array(x)
 
-    # Case A: [1,T,J,C]
-    if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] < 300 and x.shape[2] > 200:
-        # e.g. (1,20,586,3)
-        x = x[0]  # -> [T,J,C]
-
-    # Case B: [1,T,1,J,C]
-    elif x.ndim == 5 and x.shape[0] == 1 and x.shape[2] == 1:
-        # e.g. (1,20,1,586,3)
-        x = x[0, :, 0, :, :]  # -> [T,J,C]
-
-    # Case C: [1,J,C,T]
-    elif x.ndim == 4 and x.shape[0] == 1 and x.shape[1] > 200 and x.shape[-1] < 300:
-        # e.g. (1,586,3,20)
-        x = np.transpose(x[0], (2, 0, 1))  # -> [T,J,C]
-
-    # Case D: [T,J,C] already
-    elif x.ndim == 3 and x.shape[0] < 300 and x.shape[1] > 200:
+    if x.ndim == 5:        # [1,T,1,J,C]
+        x = x[0, :, 0, :, :]
+    elif x.ndim == 4:
+        if x.shape[0] == 1:      # [1,T,J,C]
+            x = x[0]
+        elif x.shape[-1] < 300:  # [1,J,C,T]
+            x = np.transpose(x[0], (2, 0, 1))
+    elif x.ndim == 3:
         pass
-
     else:
-        raise ValueError(f"[to_tjc_anyshape] Unexpected shape {x.shape}")
+        raise ValueError(f"[to_tjc_anyshape] unexpected shape {x.shape}")
 
     if x.ndim != 3:
-        raise ValueError(f"[to_tjc_anyshape] Final shape must be [T,J,C], got {x.shape}")
+        raise ValueError(f"[to_tjc_anyshape] final shape must be [T,J,C], got {x.shape}")
     return x.astype(np.float32)
 
-def ensure_full_header(header_from_dataset):
-    """
-    Prefer header from dataset pose file (with limbs),
-    else fallback to holistic.holistic_components().
-    """
-    if header_from_dataset is not None and getattr(header_from_dataset, "components", None):
-        print("ℹ Using existing header with components from dataset.")
-        return header_from_dataset
 
-    comps = holistic.holistic_components()
-    hdr = PoseHeader(components=comps)
-    print("✅ Built header via holistic.holistic_components() fallback")
-    return hdr
+# ---------------------- pose reconstruction ----------------------
+def ensure_header_from_dataset(dataset, fallback=True):
+    """优先用 dataset.pose_header，若不存在再 fallback holistic_components()"""
+    header = getattr(dataset, "pose_header", None)
+    if header is not None:
+        print("✅ Using header from dataset (matches joints & limbs)")
+        return header
+    if fallback:
+        hdr = PoseHeader(components=holistic_components())
+        print("⚠️ Dataset header missing, using fallback holistic_components()")
+        return hdr
+    raise ValueError("No header found in dataset and fallback=False")
 
-def build_pose_from_sequence(seq_btjc_cpu, header_full, fps=25.0):
-    """
-    seq_btjc_cpu: torch-ish model output / GT
-    header_full: PoseHeader with correct 586-point topology
-    returns Pose(...)
-    """
-    tjc = to_tjc_anyshape(seq_btjc_cpu)  # [T,J,C]
+
+def build_pose_from_btjc(btjc, header, fps=25.0):
+    """convert model/GT tensor to Pose()"""
+    tjc = to_tjc_anyshape(btjc)
     T, J, C = tjc.shape
-    print(f"[build_pose_from_sequence] tjc.shape={tjc.shape} (T,J,C)")
-
-    data_TPJC = tjc[:, np.newaxis, :, :]             # (T,1,J,C)
-    confidence = np.ones((T, 1, J), dtype=np.float32)  # (T,1,J)
-
-    body = NumPyPoseBody(
-        fps=fps,
-        data=data_TPJC,
-        confidence=confidence
-    )
-    return Pose(header_full, body)
+    data = tjc[:, np.newaxis, :, :]
+    conf = np.ones((T, 1, J), dtype=np.float32)
+    body = NumPyPoseBody(fps=fps, data=data, confidence=conf)
+    return Pose(header, body)
 
 
-def pose_keep_components(pose_obj, keep_names):
-    """
-    Return a new Pose that ONLY keeps the components in keep_names.
-    Example keep_names = ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
-
-    Internally we figure out which components to DROP, then call remove_components(drop_list).
-    """
-    all_names = [c.name for c in pose_obj.header.components]
-    drop_list = [n for n in all_names if n not in keep_names]
-    # remove_components() is defined on Pose objects in pose_format 0.10.x (you confirmed)
-    return pose_obj.remove_components(drop_list)
-
-
-def render_pose_video(pose_obj, out_path, title_prefix="SEQ", fps_override=None):
-    """
-    Uses PoseVisualizer to draw skeleton with limbs from header.
-    Keeps coordinates as-is (no extra normalization).
-    """
-    data_np = pose_obj.body.data.filled(np.nan)  # (T,1,J,3)
-    if np.isnan(data_np).all():
-        print(f"⚠ All NaN in pose for {title_prefix}, skip rendering.")
+def render_pose_video(pose_obj, out_path, title="SEQ"):
+    """render pose video with proper bounds and limbs"""
+    data = pose_obj.body.data.filled(np.nan)
+    if np.isnan(data).all():
+        print("⚠ all-NaN pose, skip render")
         return
 
-    T = data_np.shape[0]
-
-    # get 2D bounds for stable camera
-    xy = data_np[..., :2]  # (T,1,J,2)
-    x_min = np.nanmin(xy[..., 0]); x_max = np.nanmax(xy[..., 0])
-    y_min = np.nanmin(xy[..., 1]); y_max = np.nanmax(xy[..., 1])
-
-    pad_x = (x_max - x_min) * 0.1 + 1e-5
-    pad_y = (y_max - y_min) * 0.1 + 1e-5
-    x_min -= pad_x; x_max += pad_x
-    y_min -= pad_y; y_max += pad_y
+    xy = data[..., :2]
+    x_min, x_max = np.nanmin(xy[..., 0]), np.nanmax(xy[..., 0])
+    y_min, y_max = np.nanmin(xy[..., 1]), np.nanmax(xy[..., 1])
+    pad_x, pad_y = (x_max - x_min) * 0.1 + 1e-5, (y_max - y_min) * 0.1 + 1e-5
 
     viz = PoseVisualizer(pose_obj)
+    fig, ax = plt.subplots(figsize=(5, 5))
 
-    fig, ax = plt.subplots(figsize=(5,5))
-
-    def draw_frame(i):
+    def draw(i):
         ax.cla()
-        ax.set_aspect("equal","box")
-        ax.set_xlim([x_min, x_max])
-        ax.set_ylim([y_min, y_max])
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim([x_min - pad_x, x_max + pad_x])
+        ax.set_ylim([y_min - pad_y, y_max + pad_y])
+        ax.set_aspect("equal", "box")
+        ax.axis("off")
         viz.draw(ax, frame_id=i)
-        ax.set_title(f"{title_prefix} t={i}")
-        return ax,
+        ax.set_title(f"{title} | frame {i}")
 
-    anim = animation.FuncAnimation(
-        fig,
-        draw_frame,
-        frames=T,
-        interval=200,
-        blit=False
-    )
-
-    # pick fps
-    fps = fps_override
-    if fps is None:
-        fps_attr = getattr(pose_obj.body, "fps", None)
-        fps = fps_attr if (fps_attr is not None and fps_attr > 0) else 5
-
+    anim = animation.FuncAnimation(fig, draw, frames=data.shape[0], interval=100)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     try:
-        Writer = animation.writers['ffmpeg']
-        writer = Writer(fps=int(round(fps)),
-                        metadata=dict(artist='pose_format'),
-                        bitrate=2400)
-        anim.save(out_path, writer=writer)
-        print(f"✅ Saved MP4: {out_path}")
+        anim.save(out_path, writer="ffmpeg", fps=int(pose_obj.body.fps))
+        print(f"✅ Saved video: {out_path}")
     except Exception as e:
-        gif_path = os.path.splitext(out_path)[0] + ".gif"
-        anim.save(gif_path, writer='pillow', fps=int(round(fps)))
+        gif_path = out_path.replace(".mp4", ".gif")
+        anim.save(gif_path, writer="pillow", fps=int(pose_obj.body.fps))
         print(f"⚠ ffmpeg failed ({e}), saved GIF instead: {gif_path}")
-
     plt.close(fig)
 
 
-def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_holistic=False):
+def save_pose_file(pose_obj, out_path):
+    """save Pose object to .pose file"""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        pose_obj.write(f)
+    print(f"💾 Saved pose file: {out_path}")
+
+
+# ---------------------- dataloader ----------------------
+def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2):
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -192,151 +138,78 @@ def make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2, reduce_h
         num_future_frames=20,
         with_metadata=True,
         split=split,
-        reduce_holistic=reduce_holistic,
+        reduce_holistic=False,
     )
     loader = DataLoader(
         dataset,
         batch_size=bs,
         shuffle=True,
-        collate_fn=zero_pad_collator,
         num_workers=num_workers,
         pin_memory=False,
+        collate_fn=zero_pad_collator,
     )
     return loader
 
 
-# ---------- main pipeline ----------
+# ---------------------- main loop ----------------------
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     torch.set_default_dtype(torch.float32)
 
     data_dir = "/data/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
-    batch_size, num_workers = 2, 2
+    out_dir = "logs/minimal_viz"
+    os.makedirs(out_dir, exist_ok=True)
 
-    os.makedirs("logs", exist_ok=True)
+    # --- Data ---
+    train_loader = make_loader(data_dir, csv_path, split="train", bs=2, num_workers=2)
+    batch = next(iter(train_loader))
+    print(f"[INFO] batch data shape: {batch['data'].shape}")
 
-    # WARNING: this call is what was blowing memory on the login node.
-    # On a compute node it's fine. On login, you may comment everything
-    # below this point and just run viz on pre-saved pose files.
-    train_loader = make_loader(
-        data_dir,
-        csv_path,
-        split="train",
-        bs=batch_size,
-        num_workers=num_workers,
-        reduce_holistic=False
-    )
-    val_loader = train_loader
-
-    # grab ONE batch up front, reuse it later so we don't call next(...) twice
-    first_batch = next(iter(train_loader))
-
-    print("\n" + "="*60)
-    print("[DATA DEBUG]")
-    print(f"  data.shape        = {first_batch['data'].shape}")
-    print(f"  target_mask.shape = {first_batch['conditions']['target_mask'].shape}")
-    print(f"  input_pose.shape  = {first_batch['conditions']['input_pose'].shape}")
-    print("="*60 + "\n")
-
-    gt0 = _to_plain_tensor(first_batch["data"][0]).numpy()
-    frame_diff = np.abs(gt0[1:] - gt0[:-1]).mean() if gt0.shape[0] > 1 else 0.0
-    print(f"[DATA CHECK] mean|ΔGT| = {frame_diff:.6f}")
-
-    # tiny "training"
-    model = LitMinimal(log_dir="logs")
+    # --- Train tiny model ---
+    model = LitMinimal(log_dir=out_dir)
     trainer = pl.Trainer(
         max_steps=500,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        log_every_n_steps=5,
+        log_every_n_steps=10,
         limit_train_batches=10,
-        limit_val_batches=5,
-        deterministic=True,
-        num_sanity_val_steps=0,
         enable_checkpointing=False,
+        deterministic=True,
     )
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, train_loader)
 
-    # inference using the cached batch
+    # --- Inference ---
     model.eval()
     with torch.no_grad():
-        cond  = first_batch["conditions"]
+        cond = batch["conditions"]
+        past = cond["input_pose"][:1].to(model.device)
+        sign_img = cond["sign_image"][:1].to(model.device)
+        gt = batch["data"][:1].to(model.device)
 
-        past_btjc = cond["input_pose"][:1].to(model.device)
-        sign_img  = cond["sign_image"][:1].to(model.device)
-        fut_gt    = first_batch["data"][:1].to(model.device)
+        print("[GEN] generating...")
+        pred = model.generate_full_sequence(past, sign_img, target_len=20)
 
-        print("[GEN] Generating future sequence...")
-        gen_btjc = model.generate_full_sequence(past_btjc, sign_img, target_len=20)
+        # --- Evaluation ---
+        mask = torch.ones(1, pred.size(1), device=pred.device)
+        dtw_val = masked_dtw(pred, gt, mask).item()
+        print(f"[EVAL] masked_dtw={dtw_val:.4f}")
 
-        gen_btjc_cpu = _as_dense_cpu_btjc(gen_btjc)
-        fut_gt_cpu   = _as_dense_cpu_btjc(fut_gt)
+        # --- Pose reconstruction & export ---
+        header = ensure_header_from_dataset(train_loader.dataset)
+        gt_pose = build_pose_from_btjc(gt, header)
+        pred_pose = build_pose_from_btjc(pred, header)
 
-        def frame_disp_est(x_btjc):
-            x = x_btjc[0]
-            if x.dim() >= 3 and x.size(0) > 1:
-                return (x[1:, :, :2] - x[:-1, :, :2]).abs().mean().item()
-            return 0.0
+        # pose file outputs
+        gt_pose_path = os.path.join(out_dir, "groundtruth.pose")
+        pred_pose_path = os.path.join(out_dir, "prediction.pose")
+        save_pose_file(gt_pose, gt_pose_path)
+        save_pose_file(pred_pose, pred_pose_path)
 
-        print(f"[GEN] mean|Δpred|={frame_disp_est(gen_btjc_cpu):.6f}, "
-              f"mean|Δgt|={frame_disp_est(fut_gt_cpu):.6f}")
+        # video previews
+        gt_vid_path = os.path.join(out_dir, "groundtruth.mp4")
+        pred_vid_path = os.path.join(out_dir, "prediction.mp4")
+        render_pose_video(gt_pose, gt_vid_path, title="Ground Truth")
+        render_pose_video(pred_pose, pred_vid_path, title="Prediction")
 
-        try:
-            mask_for_eval = torch.ones(1, gen_btjc.size(1), device=gen_btjc.device)
-            dtw_val = masked_dtw(gen_btjc, fut_gt.to(gen_btjc.device), mask_for_eval).item()
-            print(f"[EVAL] DTW (pred vs GT): {dtw_val:.4f}")
-        except Exception as e:
-            print(f"[EVAL] DTW failed: {e}")
-
-        # load header once from dataset pose files on disk
-        header_loaded = None
-        for root, _, files in os.walk(data_dir):
-            for name in files:
-                if name.endswith(".pose"):
-                    try:
-                        with open(os.path.join(root, name), "rb") as f:
-                            pose_file = Pose.read(f)
-                            header_loaded = pose_file.header
-                            print(f"[HEADER] ✅ Loaded header from {name}")
-                            break
-                    except Exception:
-                        continue
-            if header_loaded:
-                break
-
-        header_full = ensure_full_header(header_loaded)
-
-        # Build Pose objects for GT and Pred in pose_format
-        gt_pose_full   = build_pose_from_sequence(fut_gt_cpu,  header_full, fps=25.0)
-        pred_pose_full = build_pose_from_sequence(gen_btjc_cpu, header_full, fps=25.0)
-
-        # Save .pose files (for sign.mt / offline inspection)
-        with open("logs/groundtruth.pose", "wb") as f:
-            gt_pose_full.write(f)
-        with open("logs/prediction.pose", "wb") as f:
-            pred_pose_full.write(f)
-        print("✅ wrote logs/groundtruth.pose and logs/prediction.pose")
-
-        # Remove POSE_WORLD_LANDMARKS for cleaner render
-        # 我们想要身体骨架 + 双手，不要 world，不要整张脸
-        KEEP = ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
-
-        gt_pose_trim   = pose_keep_components(gt_pose_full,   KEEP)
-        pred_pose_trim = pose_keep_components(pred_pose_full, KEEP)
-
-        print("[TRIM2] gt  full:",   gt_pose_full.body.data.shape,
-            "-> keep body+hands:", gt_pose_trim.body.data.shape)
-        print("[TRIM2] pred full:", pred_pose_full.body.data.shape,
-            "-> keep body+hands:", pred_pose_trim.body.data.shape)
-
-
-        print("[TRIM] gt   full joints:",   gt_pose_full.body.data.shape,
-              "-> trimmed:", gt_pose_trim.body.data.shape)
-        print("[TRIM] pred full joints:", pred_pose_full.body.data.shape,
-              "-> trimmed:", pred_pose_trim.body.data.shape)
-
-        # Render MP4/GIF previews with PoseVisualizer
-        render_pose_video(gt_pose_trim,   "logs/groundtruth_poseformat.mp4", title_prefix="GT")
-        render_pose_video(pred_pose_trim, "logs/prediction_poseformat.mp4", title_prefix="PRED")
-    print("(END)")
+    print("\n✅ Finished. Pose files and videos saved in:", os.path.abspath(out_dir))
