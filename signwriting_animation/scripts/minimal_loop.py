@@ -39,7 +39,8 @@ def _to_plain_tensor(x):
 def build_pose(tensor_btjc, header):
     """Convert [1,T,J,C] tensor to Pose object."""
     arr = _to_plain_tensor(tensor_btjc)[0].numpy()  # [T,J,C]
-    conf = np.ones_like(arr[..., :1], dtype=np.float32)  # [T, J, 1] 全部置信度=1
+    arr = arr[:, None, :, :]  # ✅ add person dimension → [T,1,J,C]
+    conf = np.ones_like(arr[..., :1], dtype=np.float32)  # [T,1,J,1]
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
