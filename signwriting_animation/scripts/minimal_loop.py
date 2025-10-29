@@ -147,9 +147,14 @@ if __name__ == "__main__":
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
         print("✅ Prediction saved OK")
 
+        # Debug checks (all aligned at same indent)
         print("GT has NaN?", np.isnan(gt_pose.body.data.filled(np.nan)).all())
         print("Pred has NaN?", np.isnan(pred_pose.body.data.filled(np.nan)).all())
 
-        print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
+        print(f"GT NaN check: {np.isnan(gt_pose.body.data.filled(np.nan)).all()}")
+        print(f"Pred NaN check: {np.isnan(pred_pose.body.data.filled(np.nan)).all()}")
+        print(f"GT data range: {np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}")
+        print(f"Pred data range: {np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}")
 
-    print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
+        print(f"\nFiles in output dir ({out_dir}):", os.listdir(out_dir))
+        print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
