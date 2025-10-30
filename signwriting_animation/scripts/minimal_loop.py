@@ -80,6 +80,7 @@ def build_pose(tensor_btjc, header):
 
     print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}, dtype={arr.dtype}")
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
+    print(f"[DEBUG] build_pose → body.data.shape={body.data.shape}, header.num_dims={header.num_dims()}")
     return Pose(header=header, body=body)
 
 
@@ -89,7 +90,12 @@ def save_pose_and_video(pose_obj, out_prefix):
     pose_path = out_prefix + ".pose"
     mp4_path = out_prefix + ".mp4"
 
+    pose_obj.header.dimensions = PoseHeaderDimensions(width=1, height=1, depth=3)
     pose_obj.header = ensure_header_matches_body(pose_obj.header, pose_obj.body.data)
+
+    print("Header dimensions:", pose_obj.header.dimensions)
+    print("Header num_dims:", pose_obj.header.num_dims())
+    print("Body data shape:", pose_obj.body.data.shape)
 
     try:
         with open(pose_path, "wb") as f:
@@ -162,13 +168,17 @@ if __name__ == "__main__":
             print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
 
         comps = holistic_components()
+        comps = [
+            c for c in comps
+            if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
+        ]
+
         header = PoseHeader(
             version=1,
-            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
+            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),  # 定义 3D 空间范围
             components=comps,
         )
 
-        # ✅ Step 3: 如果 joint 数不匹配，自动 fallback
         header = ensure_header_matches_body(header, _to_plain_tensor(gt))
 
         gt_pose = build_pose(gt, header)
