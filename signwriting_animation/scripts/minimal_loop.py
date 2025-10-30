@@ -173,17 +173,21 @@ if __name__ == "__main__":
             if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
         ]
 
+        for c in comps:
+            c.point_format = "x y z"
+
         header = PoseHeader(
             version=1,
-            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),  # 定义 3D 空间范围
+            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
             components=comps,
         )
-
         header = ensure_header_matches_body(header, _to_plain_tensor(gt))
 
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
+        print("Header num_dims after fix:", pose_obj.header.num_dims())
+        print("Body data last dim:", pose_obj.body.data.shape[-1])
         print(f"GT data range: [{np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}]")
         print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
         print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
