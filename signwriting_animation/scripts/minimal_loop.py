@@ -34,10 +34,9 @@ def _to_plain_tensor(x):
         x = x.zero_filled()
     return x.detach().cpu()
 
-
 def build_pose(tensor_btjc, header):
     """
-    Convert [B,T,J,C] or [B,T,1,J,C] → Pose object with full validity check.
+    Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape and dtype.
     """
     arr = _to_plain_tensor(tensor_btjc)
     if arr.dim() == 5:  # [B,T,1,J,C]
@@ -47,10 +46,17 @@ def build_pose(tensor_btjc, header):
     if arr.dim() != 3:
         raise ValueError(f"[build_pose] Unexpected tensor shape: {arr.shape}")
 
-    # [T,1,J,C] expected by pose_format
-    arr = arr[:, None, :, :].astype(np.float32)
+    # Convert to numpy float32 contiguous array
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+
+    # Pose format expects [T, P, J, C]
+    arr = arr[:, None, :, :]  # Add person dimension P=1
+
+    # Build confidence with identical shape except last dim = 1
     conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)
+
     assert arr.shape[:3] == conf.shape[:3], "data/conf mismatch"
+    print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}, dtype={arr.dtype}")
 
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
