@@ -98,15 +98,17 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="test",
-        reduce_holistic=True,   # ✅ 已启用精简骨架
+        reduce_holistic=True,
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
 
     batch = next(iter(loader))
     print(f"[INFO] Batch keys: {list(batch.keys())}")
+    B, T, J, C = batch["data"].shape
+    print(f"[INFO] Detected {J} joints, {C} dims")
 
     print("[MODEL] Initializing model...")
-    model = LitMinimal(num_keypoints=586, num_dims=3)
+    model = LitMinimal(num_keypoints=J, num_dims=C)
     model.eval()
     model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
