@@ -184,7 +184,7 @@ def main():
         num_future_frames=20,
         with_metadata=True,
         split="train",
-        reduce_holistic=False,  # turn on to speed up testing
+        reduce_holistic=True,  # turn on to speed up testing
     )
     loader = DataLoader(
         dataset,
