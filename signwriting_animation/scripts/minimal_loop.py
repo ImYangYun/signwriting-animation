@@ -11,10 +11,11 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
-from pose_format.pose import PoseHeader, PoseHeaderDimensions
+from pose_format.pose import PoseHeader, PoseHeaderDimensions, PoseHeaderComponent
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.holistic import holistic_components
 from pose_format.torch.masked.collator import zero_pad_collator
+from pose_anonymization.data.normalization import unnormalize_mean_std
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
@@ -34,49 +35,37 @@ def _to_plain_tensor(x):
         x = x.zero_filled()
     return x.detach().cpu()
 
-def make_reduced_header(num_joints: int, num_dims: int = 3):
-    """
-    Dynamically create a PoseHeader matching the reduced holistic output (e.g. 178 joints).
-    Ensures header and body dimensions are consistent with the reduced dataset.
-    """
-    points = [f"joint_{i}" for i in range(num_joints)]
-    limbs = [(i, i + 1) for i in range(num_joints - 1)]  # simple chain for visualization
-    colors = [(255, 255, 255)] * len(limbs)
-    components = [
-        {
-            "name": "pose",
-            "points": points,
-            "limbs": limbs,
-            "colors": colors,
-            "point_format": "x y z" if num_dims == 3 else "x y",
-        }
-    ]
 
+def make_reduced_header(num_joints: int, num_dims: int = 3):
+    """Fallback: create simplified header when holistic skeleton mismatched."""
+    points = [f"joint_{i}" for i in range(num_joints)]
+    limbs = [(i, i + 1) for i in range(num_joints - 1)]
+    colors = [(255, 255, 255)] * len(limbs)
+    component = PoseHeaderComponent(
+        name="pose",
+        points=points,
+        limbs=limbs,
+        colors=colors,
+        point_format="x y z" if num_dims == 3 else "x y"
+    )
     dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
-    return PoseHeader(version=1, dimensions=dims, components=components)
+    return PoseHeader(version=1, dimensions=dims, components=[component])
 
 
 def ensure_header_matches_body(header, body_array):
-    """
-    Verify header-body consistency; rebuild header if mismatch in joint count.
-    """
-    from pose_format.pose_header import PoseHeader
+    """Verify header-body consistency; rebuild header if mismatch."""
     J = body_array.shape[2]
     total_joints = sum(len(c.points) for c in header.components)
-
     if total_joints != J:
         print(f"[WARN] Header joints ({total_joints}) != data joints ({J}) → rebuilding header")
         header = make_reduced_header(num_joints=J, num_dims=body_array.shape[-1])
     else:
         print(f"[INFO] Header matches {J} joints ✓")
-
     return header
 
 
 def build_pose(tensor_btjc, header):
-    """
-    Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape and dtype.
-    """
+    """Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape."""
     arr = _to_plain_tensor(tensor_btjc)
     if arr.dim() == 5:  # [B,T,1,J,C]
         arr = arr[:, :, 0, :, :]
@@ -85,49 +74,31 @@ def build_pose(tensor_btjc, header):
     if arr.dim() != 3:
         raise ValueError(f"[build_pose] Unexpected tensor shape: {arr.shape}")
 
-    # Convert to numpy float32 contiguous array
     arr = np.ascontiguousarray(arr, dtype=np.float32)
-
-    # Pose format expects [T, P, J, C]
-    arr = arr[:, None, :, :]  # Add person dimension P=1
-
-    # Build confidence with identical shape except last dim = 1
+    arr = arr[:, None, :, :]  # [T, P=1, J, C]
     conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)
 
-    assert arr.shape[:3] == conf.shape[:3], "data/conf mismatch"
     print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}, dtype={arr.dtype}")
-
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
 
 def save_pose_and_video(pose_obj, out_prefix):
-    """
-    Robust save: ensures valid data dims and skips invalid components.
-    """
+    """Save pose (.pose) and visualization (.mp4)."""
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
     pose_path = out_prefix + ".pose"
     mp4_path = out_prefix + ".mp4"
 
+    pose_obj.header = ensure_header_matches_body(pose_obj.header, pose_obj.body.data)
+
     try:
-        # sanitize before saving
-        pose_obj = pose_obj.remove_components([
-            c.name for c in pose_obj.header.components if c.name != "POSE_LANDMARKS"
-        ])
+        with open(pose_path, "wb") as f:
+            pose_obj.write(f)
+        print(f"💾 Saved pose: {pose_path} | shape={pose_obj.body.data.shape}")
     except Exception as e:
-        print(f"[WARN] Could not filter components: {e}")
+        print(f"❌ Failed to save pose: {e}")
+        return
 
-    # verify data structure
-    data = pose_obj.body.data
-    if not isinstance(data, np.ndarray) or data.ndim != 4:
-        raise ValueError(f"[save_pose] Invalid body.data shape: {getattr(data, 'shape', data)}")
-
-    # save .pose
-    with open(pose_path, "wb") as f:
-        pose_obj.write(f)
-    print(f"💾 Saved valid pose: {pose_path} | shape={pose_obj.body.data.shape}")
-
-    # try to save .mp4
     try:
         viz = PoseVisualizer(pose_obj)
         T = pose_obj.body.data.shape[0]
@@ -137,7 +108,6 @@ def save_pose_and_video(pose_obj, out_prefix):
         print(f"⚠️ Failed to save video: {e}")
 
 
-# --------------------- Main ---------------------
 if __name__ == "__main__":
     pl.seed_everything(42)
     out_dir = "logs/test"
@@ -151,12 +121,11 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="test",
-        reduce_holistic=True,   # ✅ use reduced joints for visual stability
+        reduce_holistic=True,  # ✅ reduce face for visualization stability
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
     batch = next(iter(loader))
 
-    # auto-detect dimension (handles [B,T,1,J,C] or [B,T,J,C])
     shape = batch["data"].shape
     print(f"[INFO] batch['data'].shape = {shape}")
     if len(shape) == 5:
@@ -185,6 +154,13 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, gt, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
+        try:
+            gt = unnormalize_mean_std(gt)
+            pred = unnormalize_mean_std(pred)
+            print("[INFO] Unnormalized pose data for visualization.")
+        except Exception as e:
+            print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
+
         comps = holistic_components()
         header = PoseHeader(
             version=1,
@@ -192,6 +168,7 @@ if __name__ == "__main__":
             components=comps,
         )
 
+        # ✅ Step 3: 如果 joint 数不匹配，自动 fallback
         header = ensure_header_matches_body(header, _to_plain_tensor(gt))
 
         gt_pose = build_pose(gt, header)
