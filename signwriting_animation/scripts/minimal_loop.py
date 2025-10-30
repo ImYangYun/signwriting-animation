@@ -34,6 +34,44 @@ def _to_plain_tensor(x):
         x = x.zero_filled()
     return x.detach().cpu()
 
+def make_reduced_header(num_joints: int, num_dims: int = 3):
+    """
+    Dynamically create a PoseHeader matching the reduced holistic output (e.g. 178 joints).
+    Ensures header and body dimensions are consistent.
+    """
+    from pose_format.pose_header import PoseHeader
+    points = [f"joint_{i}" for i in range(num_joints)]
+    limbs = [(i, i + 1) for i in range(num_joints - 1)]  # simple chain for visualization
+    colors = [(255, 255, 255)] * len(limbs)
+    components = [
+        {
+            "name": "pose",
+            "points": points,
+            "limbs": limbs,
+            "colors": colors,
+            "point_format": "x y z" if num_dims == 3 else "x y",
+        }
+    ]
+    return PoseHeader(version=1, components=components)
+
+
+def ensure_header_matches_body(header, body_array):
+    """
+    Verify header-body consistency; rebuild header if mismatch in joint count.
+    """
+    from pose_format.pose_header import PoseHeader
+    J = body_array.shape[2]
+    total_joints = sum(len(c.points) for c in header.components)
+
+    if total_joints != J:
+        print(f"[WARN] Header joints ({total_joints}) != data joints ({J}) → rebuilding header")
+        header = make_reduced_header(num_joints=J, num_dims=body_array.shape[-1])
+    else:
+        print(f"[INFO] Header matches {J} joints ✓")
+
+    return header
+
+
 def build_pose(tensor_btjc, header):
     """
     Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape and dtype.
@@ -152,7 +190,8 @@ if __name__ == "__main__":
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
             components=comps,
         )
-        print(f"[INFO] Holistic header built with {sum(len(c.limbs) for c in header.components)} limbs")
+
+        header = ensure_header_matches_body(header, _to_plain_tensor(gt))
 
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
