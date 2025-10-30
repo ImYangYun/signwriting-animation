@@ -37,9 +37,8 @@ def _to_plain_tensor(x):
 def make_reduced_header(num_joints: int, num_dims: int = 3):
     """
     Dynamically create a PoseHeader matching the reduced holistic output (e.g. 178 joints).
-    Ensures header and body dimensions are consistent.
+    Ensures header and body dimensions are consistent with the reduced dataset.
     """
-    from pose_format.pose_header import PoseHeader
     points = [f"joint_{i}" for i in range(num_joints)]
     limbs = [(i, i + 1) for i in range(num_joints - 1)]  # simple chain for visualization
     colors = [(255, 255, 255)] * len(limbs)
@@ -52,7 +51,9 @@ def make_reduced_header(num_joints: int, num_dims: int = 3):
             "point_format": "x y z" if num_dims == 3 else "x y",
         }
     ]
-    return PoseHeader(version=1, components=components)
+
+    dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
+    return PoseHeader(version=1, dimensions=dims, components=components)
 
 
 def ensure_header_matches_body(header, body_array):
