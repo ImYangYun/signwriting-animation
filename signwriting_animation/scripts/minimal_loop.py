@@ -22,12 +22,10 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
 
-# --------------------- Tensor utilities ---------------------
 def _to_plain_tensor(x):
     """Convert possibly masked/lightning tensor to plain CPU tensor."""
     if hasattr(x, "tensor"):
@@ -38,36 +36,39 @@ def _to_plain_tensor(x):
 
 
 def build_pose(tensor_btjc, header):
-    """
-    Convert model output [1,T,J,C] → Pose(header, body)
-    Creates confidence channel [T,1,J].
-    """
+    """Convert model output [B,T,J,C] or [B,T,1,J,C] → Pose object."""
     arr = _to_plain_tensor(tensor_btjc)
-    if arr.dim() == 5:  # [B,1,T,J,C]
-        arr = arr[0, 0]
-    elif arr.dim() == 4:  # [B,T,J,C]
+    if arr.dim() == 5:  # [B,T,1,J,C]
+        arr = arr[:, :, 0, :, :]
+    if arr.dim() == 4:  # [B,T,J,C]
         arr = arr[0]
-    elif arr.dim() == 3:
+    elif arr.dim() == 3:  # [T,J,C]
         pass
     else:
-        raise ValueError(f"Unexpected tensor shape: {arr.shape}")
+        raise ValueError(f"Unexpected pose tensor shape: {arr.shape}")
 
-    # [T,J,C] → [T,1,J,C]
-    data = arr.unsqueeze(1).numpy()
-    conf = np.ones((data.shape[0], 1, data.shape[2]), dtype=np.float32)
-    body = NumPyPoseBody(fps=25, data=data, confidence=conf)
+    # [T,1,J,C] for Pose format
+    arr = arr[:, None, :, :]
+    conf = np.ones_like(arr[..., :1], dtype=np.float32)  # confidence = 1
+    body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
 
 def save_pose_and_video(pose_obj, out_prefix):
-    """
-    Save both .pose file and .mp4 video.
-    No fps arg (for old pose_format API).
-    """
+    """Save .pose + try to save .mp4 visual."""
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
     pose_path = out_prefix + ".pose"
-    mp4_path  = out_prefix + ".mp4"
+    mp4_path = out_prefix + ".mp4"
 
+    try:
+        pose_obj = pose_obj.remove_components([
+            c.name for c in pose_obj.header.components if c.name != "POSE_LANDMARKS"
+        ])
+        print(f"[CLEAN] Components kept: {[c.name for c in pose_obj.header.components]}")
+    except Exception as e:
+        print(f"[WARN] Could not filter components: {e}")
+
+    # Save .pose
     with open(pose_path, "wb") as f:
         pose_obj.write(f)
     print(f"💾 Saved pose: {pose_path}")
@@ -75,13 +76,10 @@ def save_pose_and_video(pose_obj, out_prefix):
     try:
         viz = PoseVisualizer(pose_obj)
         T = pose_obj.body.data.shape[0]
-        viz.save_video(mp4_path, frames=range(T))
+        viz.save_video(mp4_path, frames=range(T))  # removed 'fps' to avoid TypeError
         print(f"🎞️ Saved video: {mp4_path}")
     except Exception as e:
         print(f"⚠️ Failed to save video: {e}")
-
-    print(f"[INFO] Pose data shape: {pose_obj.body.data.shape}, "
-          f"range=({pose_obj.body.data.min():.3f}, {pose_obj.body.data.max():.3f})")
 
 
 # --------------------- Main ---------------------
@@ -98,13 +96,20 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="test",
-        reduce_holistic=True,
+        reduce_holistic=True,   # ✅ use reduced joints for visual stability
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
-
     batch = next(iter(loader))
-    print(f"[INFO] Batch keys: {list(batch.keys())}")
-    B, T, J, C = batch["data"].shape
+
+    # auto-detect dimension (handles [B,T,1,J,C] or [B,T,J,C])
+    shape = batch["data"].shape
+    print(f"[INFO] batch['data'].shape = {shape}")
+    if len(shape) == 5:
+        B, T, P, J, C = shape
+    elif len(shape) == 4:
+        B, T, J, C = shape
+    else:
+        raise ValueError(f"Unexpected data shape: {shape}")
     print(f"[INFO] Detected {J} joints, {C} dims")
 
     print("[MODEL] Initializing model...")
@@ -129,20 +134,17 @@ if __name__ == "__main__":
         header = PoseHeader(
             version=1,
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
-            components=comps
+            components=comps,
         )
-        print(f"[INFO] Holistic header built with {sum(len(c.limbs) for c in comps)} limbs")
+        print(f"[INFO] Holistic header built with {sum(len(c.limbs) for c in header.components)} limbs")
 
-        # Build poses
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
-        # Sanity stats
-        print(f"GT range: ({np.nanmin(gt_pose.body.data):.3f}, {np.nanmax(gt_pose.body.data):.3f})")
-        print(f"Pred range: ({np.nanmin(pred_pose.body.data):.3f}, {np.nanmax(pred_pose.body.data):.3f})")
+        print(f"GT data range: [{np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}]")
+        print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
         print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
 
-        # Save results
         save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
         save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
 
