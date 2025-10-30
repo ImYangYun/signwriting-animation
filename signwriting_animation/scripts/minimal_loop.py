@@ -36,47 +36,57 @@ def _to_plain_tensor(x):
 
 
 def build_pose(tensor_btjc, header):
-    """Convert model output [B,T,J,C] or [B,T,1,J,C] → Pose object."""
+    """
+    Convert [B,T,J,C] or [B,T,1,J,C] → Pose object with full validity check.
+    """
     arr = _to_plain_tensor(tensor_btjc)
     if arr.dim() == 5:  # [B,T,1,J,C]
         arr = arr[:, :, 0, :, :]
     if arr.dim() == 4:  # [B,T,J,C]
         arr = arr[0]
-    elif arr.dim() == 3:  # [T,J,C]
-        pass
-    else:
-        raise ValueError(f"Unexpected pose tensor shape: {arr.shape}")
+    if arr.dim() != 3:
+        raise ValueError(f"[build_pose] Unexpected tensor shape: {arr.shape}")
 
-    # [T,1,J,C] for Pose format
-    arr = arr[:, None, :, :]
-    conf = np.ones_like(arr[..., :1], dtype=np.float32)  # confidence = 1
+    # [T,1,J,C] expected by pose_format
+    arr = arr[:, None, :, :].astype(np.float32)
+    conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)
+    assert arr.shape[:3] == conf.shape[:3], "data/conf mismatch"
+
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
 
 def save_pose_and_video(pose_obj, out_prefix):
-    """Save .pose + try to save .mp4 visual."""
+    """
+    Robust save: ensures valid data dims and skips invalid components.
+    """
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
     pose_path = out_prefix + ".pose"
     mp4_path = out_prefix + ".mp4"
 
     try:
+        # sanitize before saving
         pose_obj = pose_obj.remove_components([
             c.name for c in pose_obj.header.components if c.name != "POSE_LANDMARKS"
         ])
-        print(f"[CLEAN] Components kept: {[c.name for c in pose_obj.header.components]}")
     except Exception as e:
         print(f"[WARN] Could not filter components: {e}")
 
-    # Save .pose
+    # verify data structure
+    data = pose_obj.body.data
+    if not isinstance(data, np.ndarray) or data.ndim != 4:
+        raise ValueError(f"[save_pose] Invalid body.data shape: {getattr(data, 'shape', data)}")
+
+    # save .pose
     with open(pose_path, "wb") as f:
         pose_obj.write(f)
-    print(f"💾 Saved pose: {pose_path}")
+    print(f"💾 Saved valid pose: {pose_path} | shape={pose_obj.body.data.shape}")
 
+    # try to save .mp4
     try:
         viz = PoseVisualizer(pose_obj)
         T = pose_obj.body.data.shape[0]
-        viz.save_video(mp4_path, frames=range(T))  # removed 'fps' to avoid TypeError
+        viz.save_video(mp4_path, frames=range(T))
         print(f"🎞️ Saved video: {mp4_path}")
     except Exception as e:
         print(f"⚠️ Failed to save video: {e}")
