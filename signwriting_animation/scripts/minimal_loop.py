@@ -186,8 +186,6 @@ if __name__ == "__main__":
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
-        print("Header num_dims after fix:", pose_obj.header.num_dims())
-        print("Body data last dim:", pose_obj.body.data.shape[-1])
         print(f"GT data range: [{np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}]")
         print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
         print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
