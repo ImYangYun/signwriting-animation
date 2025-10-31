@@ -85,33 +85,28 @@ def build_pose(tensor_btjc, header):
 
 
 def save_pose_and_video(pose_obj, out_prefix):
-    """Save pose (.pose) and visualization (.mp4)."""
     os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
     pose_path = out_prefix + ".pose"
     mp4_path = out_prefix + ".mp4"
 
-    pose_obj.header.dimensions = PoseHeaderDimensions(width=1, height=1, depth=3)
-    pose_obj.header = ensure_header_matches_body(pose_obj.header, pose_obj.body.data)
+    body = pose_obj.body.data
+    header_joint_count = sum(len(c.points) for c in pose_obj.header.components)
+    body_joint_count = body.shape[2]
+    if header_joint_count != body_joint_count:
+        print(f"[WARN] header {header_joint_count} joints != body {body_joint_count} → rebuilding header")
+        from pose_format.pose import PoseHeaderDimensions, PoseHeaderComponent, PoseHeader
+        points = [f"joint_{i}" for i in range(body_joint_count)]
+        limbs = [(i, i+1) for i in range(body_joint_count-1)]
+        component = PoseHeaderComponent(name="POSE_LANDMARKS", points=points, limbs=limbs, colors=[(255,255,255)]*len(limbs), point_format="x y z")
+        pose_obj.header = PoseHeader(version=1, dimensions=PoseHeaderDimensions(width=1,height=1,depth=3), components=[component])
 
-    print("Header dimensions:", pose_obj.header.dimensions)
-    print("Header num_dims:", pose_obj.header.num_dims())
-    print("Body data shape:", pose_obj.body.data.shape)
-
+    # --- save .pose ---
     try:
         with open(pose_path, "wb") as f:
             pose_obj.write(f)
-        print(f"💾 Saved pose: {pose_path} | shape={pose_obj.body.data.shape}")
+        print(f"💾 Saved valid pose: {pose_path} | shape={pose_obj.body.data.shape}")
     except Exception as e:
         print(f"❌ Failed to save pose: {e}")
-        return
-
-    try:
-        viz = PoseVisualizer(pose_obj)
-        T = pose_obj.body.data.shape[0]
-        viz.save_video(mp4_path, frames=range(T))
-        print(f"🎞️ Saved video: {mp4_path}")
-    except Exception as e:
-        print(f"⚠️ Failed to save video: {e}")
 
 
 if __name__ == "__main__":
