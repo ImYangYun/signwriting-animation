@@ -49,7 +49,8 @@ def make_reduced_header(num_joints: int, num_dims: int = 3):
         points=points,
         limbs=limbs,
         colors=colors,
-        point_format=point_format,  # ✅
+        point_format="x y z" if num_dims == 3 else "x y",
+        has_confidence=False,
     )
 
     dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
@@ -130,7 +131,8 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
             points=points,
             limbs=limbs,
             colors=colors,
-            point_format=pfmt,
+            point_format="x y z",
+            has_confidence=False,
         )
 
         new_header = PoseHeader(
