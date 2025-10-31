@@ -37,24 +37,22 @@ def _to_plain_tensor(x):
 
 
 def make_reduced_header(num_joints: int, num_dims: int = 3):
-    """Fallback: create simplified header when holistic skeleton mismatched."""
     points = [f"joint_{i}" for i in range(num_joints)]
     limbs = [(i, i + 1) for i in range(num_joints - 1)]
     colors = [(255, 255, 255)] * len(limbs)
-
-    point_format = "x y z" if num_dims == 3 else "x y"
 
     component = PoseHeaderComponent(
         name="pose",
         points=points,
         limbs=limbs,
         colors=colors,
-        point_format="x y z" if num_dims == 3 else "x y",
-        has_confidence=False,
+        point_format="x y z" if num_dims == 3 else "x y"
     )
 
     dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
-    return PoseHeader(version=1, dimensions=dims, components=[component])
+    header = PoseHeader(version=1, dimensions=dims, components=[component])
+    header.num_dims = lambda: num_dims
+    return header
 
 
 def ensure_header_matches_body(header, body_array):
@@ -140,6 +138,7 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=C),
             components=[component],
         )
+        new_header.num_dims = lambda: C
         pose_obj = Pose(header=new_header, body=pose_obj.body)
 
         print(f"[FIX] Rebuilt header → {J} joints, depth={C}, header.num_dims={pose_obj.header.num_dims()}")
