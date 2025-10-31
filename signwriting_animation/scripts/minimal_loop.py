@@ -84,27 +84,44 @@ def build_pose(tensor_btjc, header):
     return Pose(header=header, body=body)
 
 
-def save_pose_and_video(pose_obj, out_prefix):
-    os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
-    pose_path = out_prefix + ".pose"
-    mp4_path = out_prefix + ".mp4"
-
+def safe_save_pose(pose_obj, out_path):
+    import numpy as np, os
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     body = pose_obj.body.data
-    header_joint_count = sum(len(c.points) for c in pose_obj.header.components)
-    body_joint_count = body.shape[2]
-    if header_joint_count != body_joint_count:
-        print(f"[WARN] header {header_joint_count} joints != body {body_joint_count} → rebuilding header")
-        from pose_format.pose import PoseHeaderDimensions, PoseHeaderComponent, PoseHeader
-        points = [f"joint_{i}" for i in range(body_joint_count)]
-        limbs = [(i, i+1) for i in range(body_joint_count-1)]
-        component = PoseHeaderComponent(name="POSE_LANDMARKS", points=points, limbs=limbs, colors=[(255,255,255)]*len(limbs), point_format="x y z")
-        pose_obj.header = PoseHeader(version=1, dimensions=PoseHeaderDimensions(width=1,height=1,depth=3), components=[component])
+    T, P, J, C = body.shape
 
-    # --- save .pose ---
+    header_joint_count = sum(len(c.points) for c in pose_obj.header.components)
+    print(f"[CHECK] Before save → header joints={header_joint_count}, body joints={J}")
+    print(f"[CHECK] Header dimensions: {pose_obj.header.dimensions}")
+    print(f"[CHECK] Header num_dims={pose_obj.header.num_dims()}, Body num_dims={C}")
+
+    if header_joint_count != J or pose_obj.header.num_dims() != C:
+        print(f"[WARN] header ({header_joint_count} joints, {pose_obj.header.num_dims()} dims)"
+              f" != body ({J} joints, {C} dims) → rebuilding header")
+
+        points = [f"joint_{i}" for i in range(J)]
+        limbs = [(i, i+1) for i in range(J-1)]
+        colors = [(255, 255, 255)] * len(limbs)
+        component = PoseHeaderComponent(
+            name="POSE_LANDMARKS",
+            points=points,
+            limbs=limbs,
+            colors=colors,
+            point_format="x y z" if C == 3 else "x y"
+        )
+        new_header = PoseHeader(
+            version=1,
+            dimensions=PoseHeaderDimensions(width=1, height=1, depth=C),
+            components=[component],
+        )
+        pose_obj = Pose(header=new_header, body=pose_obj.body)
+
+        print(f"[FIX] Rebuilt header → {J} joints, depth={C}, header.num_dims={pose_obj.header.num_dims()}")
+
     try:
-        with open(pose_path, "wb") as f:
+        with open(out_path, "wb") as f:
             pose_obj.write(f)
-        print(f"💾 Saved valid pose: {pose_path} | shape={pose_obj.body.data.shape}")
+        print(f"💾 Saved valid pose: {out_path} | shape={body.shape}")
     except Exception as e:
         print(f"❌ Failed to save pose: {e}")
 
@@ -180,8 +197,8 @@ if __name__ == "__main__":
         print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
         print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
 
-        save_pose_and_video(gt_pose, os.path.join(out_dir, "groundtruth"))
-        save_pose_and_video(pred_pose, os.path.join(out_dir, "prediction"))
+        safe_save_pose(gt_pose, "logs/test/groundtruth.pose")
+        safe_save_pose(pred_pose, "logs/test/prediction.pose")
 
         print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
         print(f"Output files: {os.listdir(out_dir)}")
