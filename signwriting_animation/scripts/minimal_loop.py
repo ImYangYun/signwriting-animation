@@ -41,13 +41,18 @@ def make_reduced_header(num_joints: int, num_dims: int = 3):
     points = [f"joint_{i}" for i in range(num_joints)]
     limbs = [(i, i + 1) for i in range(num_joints - 1)]
     colors = [(255, 255, 255)] * len(limbs)
+
+    # ✅ 关键修复：point_format 一定要带上 c，否则 header.num_dims() 会变 4
+    point_format = "x y z c" if num_dims == 3 else "x y c"
+
     component = PoseHeaderComponent(
         name="pose",
         points=points,
         limbs=limbs,
         colors=colors,
-        point_format="x y z" if num_dims == 3 else "x y"
+        point_format=point_format,  # ✅
     )
+
     dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
     return PoseHeader(version=1, dimensions=dims, components=[component])
 
