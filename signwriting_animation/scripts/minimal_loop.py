@@ -26,6 +26,12 @@ try:
 except Exception:
     pass
 
+def _patched_num_dims(self):
+    """Override buggy num_dims(): force match to PoseHeaderDimensions.depth"""
+    return self.dimensions.depth
+
+PoseHeader.num_dims = _patched_num_dims
+print("[PATCH] PoseHeader.num_dims() overridden to use dimensions.depth only")
 
 def _to_plain_tensor(x):
     """Convert possibly masked/lightning tensor to plain CPU tensor."""
