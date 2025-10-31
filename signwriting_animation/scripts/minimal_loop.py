@@ -53,12 +53,12 @@ def make_reduced_header(num_joints: int, num_dims: int = 3):
 
 
 def ensure_header_matches_body(header, body_array):
-    """Verify header-body consistency; rebuild header if mismatch."""
     J = body_array.shape[2]
     total_joints = sum(len(c.points) for c in header.components)
     if total_joints != J:
-        print(f"[WARN] Header joints ({total_joints}) != data joints ({J}) → rebuilding header")
-        header = make_reduced_header(num_joints=J, num_dims=body_array.shape[-1])
+        print(f"[WARN] Header joints ({total_joints}) != data joints ({J}) → rebuilding header skipped")
+        header.components[0].points = [f"joint_{i}" for i in range(J)]
+        header.components[0].limbs = [(i, i + 1) for i in range(J - 1)]
     else:
         print(f"[INFO] Header matches {J} joints ✓")
     return header
@@ -168,11 +168,7 @@ if __name__ == "__main__":
             print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
 
         comps = holistic_components()
-        comps = [
-            c for c in comps
-            if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]
-        ]
-
+        comps = [c for c in comps if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
         for c in comps:
             c.point_format = "x y z"
 
@@ -181,7 +177,6 @@ if __name__ == "__main__":
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
             components=comps,
         )
-        header = ensure_header_matches_body(header, _to_plain_tensor(gt))
 
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
