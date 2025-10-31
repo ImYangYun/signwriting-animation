@@ -213,8 +213,8 @@ if __name__ == "__main__":
         print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
         print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
 
-        safe_save_pose_verified(gt_pose, "logs/test/groundtruth.pose", dataset_header=dataset.pose_header)
-        safe_save_pose_verified(pred_pose, "logs/test/prediction.pose", dataset_header=dataset.pose_header)
+        safe_save_pose_verified(gt_pose, "logs/test/groundtruth.pose", dataset_header=header)
+        safe_save_pose_verified(pred_pose, "logs/test/prediction.pose", dataset_header=header)
 
         print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
         print(f"Output files: {os.listdir(out_dir)}")
