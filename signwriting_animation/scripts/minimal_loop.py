@@ -36,39 +36,10 @@ def _to_plain_tensor(x):
     return x.detach().cpu()
 
 
-def make_reduced_header(num_joints: int, num_dims: int = 3):
-    points = [f"joint_{i}" for i in range(num_joints)]
-    limbs = [(i, i + 1) for i in range(num_joints - 1)]
-    colors = [(255, 255, 255)] * len(limbs)
-
-    component = PoseHeaderComponent(
-        name="pose",
-        points=points,
-        limbs=limbs,
-        colors=colors,
-        point_format="x y z" if num_dims == 3 else "x y"
-    )
-
-    dims = PoseHeaderDimensions(width=1, height=1, depth=num_dims)
-    header = PoseHeader(version=1, dimensions=dims, components=[component])
-    header.num_dims = lambda: num_dims
-    return header
-
-
-def ensure_header_matches_body(header, body_array):
-    J = body_array.shape[2]
-    total_joints = sum(len(c.points) for c in header.components)
-    if total_joints != J:
-        print(f"[WARN] Header joints ({total_joints}) != data joints ({J}) → rebuilding header skipped")
-        header.components[0].points = [f"joint_{i}" for i in range(J)]
-        header.components[0].limbs = [(i, i + 1) for i in range(J - 1)]
-    else:
-        print(f"[INFO] Header matches {J} joints ✓")
-    return header
-
-
 def build_pose(tensor_btjc, header):
-    """Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape."""
+    """
+    Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape.
+    """
     arr = _to_plain_tensor(tensor_btjc)
     if arr.dim() == 5:  # [B,T,1,J,C]
         arr = arr[:, :, 0, :, :]
@@ -81,76 +52,28 @@ def build_pose(tensor_btjc, header):
     arr = arr[:, None, :, :]  # [T, P=1, J, C]
     conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)
 
-    print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}, dtype={arr.dtype}")
+    print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}")
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-    print(f"[DEBUG] build_pose → body.data.shape={body.data.shape}, header.num_dims={header.num_dims()}")
     return Pose(header=header, body=body)
 
 
-def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
+def safe_save_pose(pose_obj, out_path):
     """
-    Safely save a Pose object (.pose file) with automatic header validation and repair.
-    Fixes the 'Header has 4 dimensions, but body has 3' issue by forcing exact dimensional sync.
+    Save pose safely with validation (Fluent-Pose compatible).
     """
-
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    if not isinstance(pose_obj, Pose):
-        print(f"[ERROR] Provided object is not a Pose instance: {type(pose_obj)}")
-        return
-
     body = pose_obj.body.data
-    if not isinstance(body, np.ndarray):
-        body = np.asarray(body)
-    if body.ndim != 4:
-        print(f"[ERROR] Unexpected body shape {body.shape} (expected [T, P, J, C])")
-        return
-
     T, P, J, C = body.shape
-    header = dataset_header if dataset_header is not None else pose_obj.header
+    hdr = pose_obj.header
 
-    header_joint_count = sum(len(c.points) for c in header.components)
-    header_dims = header.num_dims()
-    print(f"[CHECK] Before save → header joints={header_joint_count}, body joints={J}")
-    print(f"[CHECK] Header num_dims={header_dims}, Body num_dims={C}")
+    print(f"[SAVE] header.num_dims()={hdr.num_dims()} | depth={hdr.dimensions.depth} | body.C={C}")
+    if hdr.dimensions.depth != C:
+        print(f"[WARN] Header depth mismatch → forcing depth={C}")
+        hdr.dimensions.depth = C
 
-    if header_joint_count != J or pose_obj.header.num_dims() != C:
-        print(f"[WARN] header ({header_joint_count} joints, {pose_obj.header.num_dims()} dims)"
-            f" != body ({J} joints, {C} dims) → rebuilding header")
-
-        points = [f"joint_{i}" for i in range(J)]
-        limbs = [(i, i+1) for i in range(J-1)]
-        colors = [(255, 255, 255)] * len(limbs)
-
-        pfmt = "x y z" if C == 3 else "x y"
-
-        component = PoseHeaderComponent(
-            name="POSE_LANDMARKS",
-            points=points,
-            limbs=limbs,
-            colors=colors,
-            point_format="x y z",
-            has_confidence=False,
-        )
-
-        new_header = PoseHeader(
-            version=1,
-            dimensions=PoseHeaderDimensions(width=1, height=1, depth=C),
-            components=[component],
-        )
-        new_header.num_dims = lambda: C
-        pose_obj = Pose(header=new_header, body=pose_obj.body)
-
-        print(f"[FIX] Rebuilt header → {J} joints, depth={C}, header.num_dims={pose_obj.header.num_dims()}")
-
-    try:
-        with open(out_path, "wb") as f:
-            pose_obj.write(f)
-        with open(out_path, "rb") as f_check:
-            Pose.read(f_check.read())
-        print(f"💾 Saved + verified successfully: {out_path} | shape={body.shape}")
-    except Exception as e:
-        print(f"❌ Failed to save pose: {e}")
+    with open(out_path, "wb") as f:
+        pose_obj.write(f)
+    print(f"💾 Saved pose: {out_path} | shape={body.shape}")
 
 
 if __name__ == "__main__":
@@ -181,6 +104,7 @@ if __name__ == "__main__":
         raise ValueError(f"Unexpected data shape: {shape}")
     print(f"[INFO] Detected {J} joints, {C} dims")
 
+    # ----------------------- Init model -----------------------
     print("[MODEL] Initializing model...")
     model = LitMinimal(num_keypoints=J, num_dims=C)
     model.eval()
@@ -206,10 +130,11 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
 
-        comps = holistic_components()
-        comps = [c for c in comps if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
+        # ----------------------- Build header (Fluent-Pose style) -----------------------
+        comps = [c for c in holistic_components()
+                 if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
         for c in comps:
-            c.point_format = "x y z "
+            c.format = "x y z"  # ✅ 最新 pose_format 要用 format，不是 point_format
 
         header = PoseHeader(
             version=1,
@@ -220,12 +145,21 @@ if __name__ == "__main__":
         gt_pose = build_pose(gt, header)
         pred_pose = build_pose(pred, header)
 
-        print(f"GT data range: [{np.nanmin(gt_pose.body.data)}, {np.nanmax(gt_pose.body.data)}]")
-        print(f"Pred data range: [{np.nanmin(pred_pose.body.data)}, {np.nanmax(pred_pose.body.data)}]")
-        print(f"GT NaN: {np.isnan(gt_pose.body.data).any()}, Pred NaN: {np.isnan(pred_pose.body.data).any()}")
+        print(f"GT range: [{np.nanmin(gt_pose.body.data):.4f}, {np.nanmax(gt_pose.body.data):.4f}]")
+        print(f"Pred range: [{np.nanmin(pred_pose.body.data):.4f}, {np.nanmax(pred_pose.body.data):.4f}]")
 
-        safe_save_pose_verified(gt_pose, "logs/test/groundtruth.pose", dataset_header=header)
-        safe_save_pose_verified(pred_pose, "logs/test/prediction.pose", dataset_header=header)
+        # ----------------------- Save -----------------------
+        safe_save_pose(gt_pose, os.path.join(out_dir, "groundtruth.pose"))
+        safe_save_pose(pred_pose, os.path.join(out_dir, "prediction.pose"))
+
+        try:
+            viz = PoseVisualizer(gt_pose)
+            viz.save_video(os.path.join(out_dir, "groundtruth.mp4"), fps=25)
+            viz = PoseVisualizer(pred_pose)
+            viz.save_video(os.path.join(out_dir, "prediction.mp4"), fps=25)
+            print("🎞️ Saved pose videos successfully.")
+        except Exception as e:
+            print(f"[WARN] Could not render video: {e}")
 
         print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
         print(f"Output files: {os.listdir(out_dir)}")
