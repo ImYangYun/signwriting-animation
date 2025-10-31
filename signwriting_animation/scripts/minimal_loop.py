@@ -116,25 +116,31 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
     print(f"[CHECK] Before save → header joints={header_joint_count}, body joints={J}")
     print(f"[CHECK] Header num_dims={header_dims}, Body num_dims={C}")
 
-    if header_joint_count != J or header_dims != C:
-        print(f"[WARN] Header ({header_joint_count} joints, {header_dims} dims) != body ({J}, {C}) → rebuilding header")
+    if header_joint_count != J or pose_obj.header.num_dims() != C:
+        print(f"[WARN] header ({header_joint_count} joints, {pose_obj.header.num_dims()} dims)"
+            f" != body ({J} joints, {C} dims) → rebuilding header")
+
         points = [f"joint_{i}" for i in range(J)]
-        limbs = [(i, i + 1) for i in range(J - 1)]
+        limbs = [(i, i+1) for i in range(J-1)]
         colors = [(255, 255, 255)] * len(limbs)
+
+        pfmt = "x y z c" if C == 3 else "x y c"
+
         component = PoseHeaderComponent(
             name="POSE_LANDMARKS",
             points=points,
             limbs=limbs,
             colors=colors,
-            point_format=" ".join(["x", "y", "z"][:C])
+            point_format=pfmt,
         )
 
-        header = PoseHeader(
+        new_header = PoseHeader(
             version=1,
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=C),
             components=[component],
         )
-        pose_obj = Pose(header=header, body=pose_obj.body)
+        pose_obj = Pose(header=new_header, body=pose_obj.body)
+
         print(f"[FIX] Rebuilt header → {J} joints, depth={C}, header.num_dims={pose_obj.header.num_dims()}")
 
     try:
@@ -203,7 +209,7 @@ if __name__ == "__main__":
         comps = holistic_components()
         comps = [c for c in comps if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
         for c in comps:
-            c.point_format = "x y z"
+            c.point_format = "x y z c"
 
         header = PoseHeader(
             version=1,
