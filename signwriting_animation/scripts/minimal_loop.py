@@ -65,21 +65,37 @@ def build_pose(tensor_btjc, header):
 
 def safe_save_pose(pose_obj, out_path):
     """
-    Save pose safely with validation (Fluent-Pose compatible).
+    Robustly save Pose object and print debugging info about header/body dimensions.
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     body = pose_obj.body.data
-    T, P, J, C = body.shape
-    hdr = pose_obj.header
 
-    print(f"[SAVE] header.num_dims()={hdr.num_dims()} | depth={hdr.dimensions.depth} | body.C={C}")
-    if hdr.dimensions.depth != C:
-        print(f"[WARN] Header depth mismatch → forcing depth={C}")
-        hdr.dimensions.depth = C
+    print(f"[DEBUG SAVE] body.shape={body.shape}")
+    print(f"[DEBUG SAVE] header.num_dims()={pose_obj.header.num_dims()} | "
+          f"header.depth={pose_obj.header.dimensions.depth}")
 
-    with open(out_path, "wb") as f:
-        pose_obj.write(f)
-    print(f"💾 Saved pose: {out_path} | shape={body.shape}")
+    if body.size == 0 or body.shape[0] == 0:
+        print(f"[SKIP] Empty pose, skip saving: {out_path}")
+        return
+    if np.isnan(body).any():
+        print(f"[SKIP] Pose contains NaN, skip saving: {out_path}")
+        return
+
+    header_dims = pose_obj.header.num_dims()
+    body_dims = body.shape[-1]
+    if header_dims != body_dims:
+        print(f"[WARN] Header depth ({header_dims}) != body channels ({body_dims}) → fixing header")
+        pose_obj.header.dimensions.depth = body_dims
+
+    print(f"[SAVE] header.num_dims()={pose_obj.header.num_dims()} | "
+          f"depth={pose_obj.header.dimensions.depth} | body.C={body.shape[-1]}")
+
+    try:
+        with open(out_path, "wb") as f:
+            pose_obj.write(f)
+        print(f"💾 Saved successfully: {out_path}")
+    except Exception as e:
+        print(f"❌ Failed to save pose: {e}")
 
 
 if __name__ == "__main__":
@@ -95,7 +111,7 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="test",
-        reduce_holistic=True,  # ✅ reduce face for visualization stability
+        reduce_holistic=True,
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
     batch = next(iter(loader))
@@ -140,7 +156,7 @@ if __name__ == "__main__":
         comps = [c for c in holistic_components()
                  if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
         for c in comps:
-            c.format = "x y z"  # ✅ 最新 pose_format 要用 format，不是 point_format
+            c.format = "x y z"
 
         header = PoseHeader(
             version=1,
