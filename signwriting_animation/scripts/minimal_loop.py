@@ -87,16 +87,8 @@ def build_pose(tensor_btjc, header):
 def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
     """
     Safely save a Pose object (.pose file) with automatic header validation and repair.
-    Includes full consistency checks for joints, dims, and readability.
-    Args:
-        pose_obj: Pose object to save.
-        out_path: Target path for the .pose file.
-        dataset_header: Optional PoseHeader (preferably from dataset.pose_header).
+    Fixes the 'Header has 4 dimensions, but body has 3' issue by forcing exact dimensional sync.
     """
-    import os
-    from pose_format import Pose
-    from pose_format.pose import PoseHeader, PoseHeaderComponent, PoseHeaderDimensions
-    import numpy as np
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -107,26 +99,20 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
     body = pose_obj.body.data
     if not isinstance(body, np.ndarray):
         body = np.asarray(body)
-
     if body.ndim != 4:
         print(f"[ERROR] Unexpected body shape {body.shape} (expected [T, P, J, C])")
         return
 
     T, P, J, C = body.shape
-    header = pose_obj.header
-
-    if dataset_header is not None:
-        print("[INFO] Using dataset.pose_header as reference")
-        header = dataset_header
+    header = dataset_header if dataset_header is not None else pose_obj.header
 
     header_joint_count = sum(len(c.points) for c in header.components)
     header_dims = header.num_dims()
-    print(f"[CHECK] header joints={header_joint_count}, body joints={J}")
-    print(f"[CHECK] header.num_dims={header_dims}, body dims={C}")
-    print(f"[CHECK] header.dimensions={header.dimensions}")
+    print(f"[CHECK] Before save → header joints={header_joint_count}, body joints={J}")
+    print(f"[CHECK] Header num_dims={header_dims}, Body num_dims={C}")
 
     if header_joint_count != J or header_dims != C:
-        print(f"[WARN] Header mismatch → rebuilding header for {J} joints, {C} dims")
+        print(f"[WARN] Header ({header_joint_count} joints, {header_dims} dims) != body ({J}, {C}) → rebuilding header")
         points = [f"joint_{i}" for i in range(J)]
         limbs = [(i, i + 1) for i in range(J - 1)]
         colors = [(255, 255, 255)] * len(limbs)
@@ -135,8 +121,9 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
             points=points,
             limbs=limbs,
             colors=colors,
-            point_format="x y z" if C == 3 else "x y"
+            point_format=" ".join(["x", "y", "z"][:C])
         )
+
         header = PoseHeader(
             version=1,
             dimensions=PoseHeaderDimensions(width=1, height=1, depth=C),
@@ -148,12 +135,11 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
     try:
         with open(out_path, "wb") as f:
             pose_obj.write(f)
-        # read-back check
         with open(out_path, "rb") as f_check:
             Pose.read(f_check.read())
         print(f"💾 Saved + verified successfully: {out_path} | shape={body.shape}")
     except Exception as e:
-        print(f"❌ Failed to save or verify pose: {e}")
+        print(f"❌ Failed to save pose: {e}")
 
 
 if __name__ == "__main__":
