@@ -4,16 +4,10 @@ import sys
 import torch
 import numpy as np
 import lightning as pl
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from torch.utils.data import DataLoader
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
-from pose_format.pose import PoseHeader, PoseHeaderDimensions, PoseHeaderComponent
 from pose_format.pose_visualizer import PoseVisualizer
-from pose_format.utils.holistic import holistic_components
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unnormalize_mean_std
 
@@ -26,15 +20,9 @@ try:
 except Exception:
     pass
 
-def _patched_num_dims(self):
-    """Override buggy num_dims(): force match to PoseHeaderDimensions.depth"""
-    return self.dimensions.depth
-
-PoseHeader.num_dims = _patched_num_dims
-print("[PATCH] PoseHeader.num_dims() overridden to use dimensions.depth only")
 
 def _to_plain_tensor(x):
-    """Convert possibly masked/lightning tensor to plain CPU tensor."""
+    """Convert MaskedTensor or Lightning tensor to plain CPU tensor."""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
@@ -42,71 +30,19 @@ def _to_plain_tensor(x):
     return x.detach().cpu()
 
 
-def build_pose(tensor_btjc, header):
-    """
-    Convert [B,T,J,C] or [B,T,1,J,C] tensor to Pose object with verified shape.
-    """
-    arr = _to_plain_tensor(tensor_btjc)
-    if arr.dim() == 5:  # [B,T,1,J,C]
-        arr = arr[:, :, 0, :, :]
-    if arr.dim() == 4:  # [B,T,J,C]
-        arr = arr[0]
-    if arr.dim() != 3:
-        raise ValueError(f"[build_pose] Unexpected tensor shape: {arr.shape}")
-
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
-    arr = arr[:, None, :, :]  # [T, P=1, J, C]
-    conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)
-
-    print(f"[build_pose] Final data shape={arr.shape}, conf shape={conf.shape}")
-    body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-    return Pose(header=header, body=body)
-
-
-def safe_save_pose(pose_obj, out_path):
-    """
-    Robustly save Pose object and print debugging info about header/body dimensions.
-    """
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    body = pose_obj.body.data
-
-    print(f"[DEBUG SAVE] body.shape={body.shape}")
-    print(f"[DEBUG SAVE] header.num_dims()={pose_obj.header.num_dims()} | "
-          f"header.depth={pose_obj.header.dimensions.depth}")
-
-    if body.size == 0 or body.shape[0] == 0:
-        print(f"[SKIP] Empty pose, skip saving: {out_path}")
-        return
-    if np.isnan(body).any():
-        print(f"[SKIP] Pose contains NaN, skip saving: {out_path}")
-        return
-
-    header_dims = pose_obj.header.num_dims()
-    body_dims = body.shape[-1]
-    if header_dims != body_dims:
-        print(f"[WARN] Header depth ({header_dims}) != body channels ({body_dims}) → fixing header")
-        pose_obj.header.dimensions.depth = body_dims
-
-    print(f"[SAVE] header.num_dims()={pose_obj.header.num_dims()} | "
-          f"depth={pose_obj.header.dimensions.depth} | body.C={body.shape[-1]}")
-
-    try:
-        with open(out_path, "wb") as f:
-            pose_obj.write(f)
-        print(f"💾 Saved successfully: {out_path}")
-    except Exception as e:
-        print(f"❌ Failed to save pose: {e}")
-
-
-if __name__ == "__main__":
+def main():
     pl.seed_everything(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Using device: {device}")
+
+    data_dir = "/data/yayun/pose_data"
+    csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     out_dir = "logs/test"
     os.makedirs(out_dir, exist_ok=True)
 
-    print("[DATA] Loading dataset...")
     dataset = DynamicPosePredictionDataset(
-        data_dir="/data/yayun/pose_data",
-        csv_path="/data/yayun/signwriting-animation/data_fixed.csv",
+        data_dir=data_dir,
+        csv_path=csv_path,
         num_past_frames=40,
         num_future_frames=20,
         with_metadata=True,
@@ -115,73 +51,74 @@ if __name__ == "__main__":
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
     batch = next(iter(loader))
+    print(f"[INFO] Loaded one batch with shape: {batch['data'].shape}")
 
-    shape = batch["data"].shape
-    print(f"[INFO] batch['data'].shape = {shape}")
-    if len(shape) == 5:
-        B, T, P, J, C = shape
-    elif len(shape) == 4:
-        B, T, J, C = shape
-    else:
-        raise ValueError(f"Unexpected data shape: {shape}")
-    print(f"[INFO] Detected {J} joints, {C} dims")
+    first_pose_path = os.path.join(data_dir, dataset.records[0]["pose"])
+    if not first_pose_path.endswith(".pose"):
+        first_pose_path += ".pose"
+    with open(first_pose_path, "rb") as f:
+        header = Pose.read(f).header
+    print(f"[INFO] Header loaded from {first_pose_path}")
 
-    # ----------------------- Init model -----------------------
-    print("[MODEL] Initializing model...")
+    B, T, P, J, C = batch["conditions"]["input_pose"].shape
+    print(f"[MODEL] Initializing with num_keypoints={J}, num_dims={C}")
     model = LitMinimal(num_keypoints=J, num_dims=C)
-    model.eval()
-    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(device)
+
+    cond = batch["conditions"]
+    past = cond["input_pose"][:1].to(device)
+    sign_img = cond["sign_image"][:1].to(device)
+    gt = batch["data"][:1].to(device)
 
     with torch.no_grad():
-        cond = batch["conditions"]
-        past = cond["input_pose"][:1].to(model.device)
-        sign_img = cond["sign_image"][:1].to(model.device)
-        gt = batch["data"][:1].to(model.device)
-
-        print("[GEN] Generating future motion...")
         pred = model.generate_full_sequence(past, sign_img, target_len=20)
 
-        mask = torch.ones(1, pred.size(1), device=pred.device)
-        dtw_val = masked_dtw(pred, gt, mask).item()
-        print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
+    mask = torch.ones(1, pred.size(1), device=pred.device)
+    dtw_val = masked_dtw(pred, gt, mask).item()
+    print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        try:
-            gt = unnormalize_mean_std(gt)
-            pred = unnormalize_mean_std(pred)
-            print("[INFO] Unnormalized pose data for visualization.")
-        except Exception as e:
-            print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
 
-        # ----------------------- Build header (Fluent-Pose style) -----------------------
-        comps = [c for c in holistic_components()
-                 if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
-        for c in comps:
-            c.format = "x y z"
+    try:
+        gt = unnormalize_mean_std(gt)
+        pred = unnormalize_mean_std(pred)
+        print("[INFO] Unnormalized pose data for visualization.")
+    except Exception as e:
+        print(f"[WARN] Could not unnormalize (likely already unscaled): {e}")
 
-        header = PoseHeader(
-            version=1,
-            dimensions=PoseHeaderDimensions(width=1, height=1, depth=3),
-            components=comps,
-        )
+    gt_np = _to_plain_tensor(gt)[0].numpy()
+    pred_np = _to_plain_tensor(pred)[0].numpy()
 
-        gt_pose = build_pose(gt, header)
-        pred_pose = build_pose(pred, header)
+    gt_pose = Pose(
+        header=header,
+        body=NumPyPoseBody(fps=25, data=gt_np, confidence=np.ones_like(gt_np[..., :1], np.float32))
+    )
+    pred_pose = Pose(
+        header=header,
+        body=NumPyPoseBody(fps=25, data=pred_np, confidence=np.ones_like(pred_np[..., :1], np.float32))
+    )
 
-        print(f"GT range: [{np.nanmin(gt_pose.body.data):.4f}, {np.nanmax(gt_pose.body.data):.4f}]")
-        print(f"Pred range: [{np.nanmin(pred_pose.body.data):.4f}, {np.nanmax(pred_pose.body.data):.4f}]")
+    try:
+        with open(os.path.join(out_dir, "groundtruth.pose"), "wb") as f:
+            gt_pose.write(f)
+        with open(os.path.join(out_dir, "prediction.pose"), "wb") as f:
+            pred_pose.write(f)
+        print(f"💾 Saved .pose files to {out_dir}")
+    except Exception as e:
+        print(f"[WARN] Could not save pose files: {e}")
 
-        # ----------------------- Save -----------------------
-        safe_save_pose(gt_pose, os.path.join(out_dir, "groundtruth.pose"))
-        safe_save_pose(pred_pose, os.path.join(out_dir, "prediction.pose"))
+    np.save(os.path.join(out_dir, "gt.npy"), gt_np)
+    np.save(os.path.join(out_dir, "pred.npy"), pred_np)
+    print("💾 Saved .npy arrays")
 
-        try:
-            viz = PoseVisualizer(gt_pose)
-            viz.save_video(os.path.join(out_dir, "groundtruth.mp4"), fps=25)
-            viz = PoseVisualizer(pred_pose)
-            viz.save_video(os.path.join(out_dir, "prediction.mp4"), fps=25)
-            print("🎞️ Saved pose videos successfully.")
-        except Exception as e:
-            print(f"[WARN] Could not render video: {e}")
+    try:
+        visualizer = PoseVisualizer(header)
+        visualizer.save_animation(pred_pose.body.data, os.path.join(out_dir, "prediction.mp4"))
+        print("🎥 Saved animation: prediction.mp4")
+    except Exception as e:
+        print(f"[WARN] Visualization failed: {e}")
 
-        print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
-        print(f"Output files: {os.listdir(out_dir)}")
+    print(f"\n✅ Finished. Results saved in {os.path.abspath(out_dir)}")
+
+
+if __name__ == "__main__":
+    main()
