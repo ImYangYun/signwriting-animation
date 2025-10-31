@@ -42,8 +42,7 @@ def make_reduced_header(num_joints: int, num_dims: int = 3):
     limbs = [(i, i + 1) for i in range(num_joints - 1)]
     colors = [(255, 255, 255)] * len(limbs)
 
-    # ✅ 关键修复：point_format 一定要带上 c，否则 header.num_dims() 会变 4
-    point_format = "x y z c" if num_dims == 3 else "x y c"
+    point_format = "x y z" if num_dims == 3 else "x y"
 
     component = PoseHeaderComponent(
         name="pose",
@@ -124,7 +123,7 @@ def safe_save_pose_verified(pose_obj, out_path, dataset_header=None):
         limbs = [(i, i+1) for i in range(J-1)]
         colors = [(255, 255, 255)] * len(limbs)
 
-        pfmt = "x y z c" if C == 3 else "x y c"
+        pfmt = "x y z" if C == 3 else "x y"
 
         component = PoseHeaderComponent(
             name="POSE_LANDMARKS",
@@ -209,7 +208,7 @@ if __name__ == "__main__":
         comps = holistic_components()
         comps = [c for c in comps if c.name in ["POSE_LANDMARKS", "LEFT_HAND_LANDMARKS", "RIGHT_HAND_LANDMARKS"]]
         for c in comps:
-            c.point_format = "x y z c"
+            c.point_format = "x y z "
 
         header = PoseHeader(
             version=1,
