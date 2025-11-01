@@ -123,6 +123,7 @@ if __name__ == "__main__":
     print(f"[TRAIN] Overfitting on 4 samples × {J} joints × {C} dims")
     trainer.fit(model, loader, loader)
 
+
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -133,56 +134,85 @@ if __name__ == "__main__":
         mask = cond["target_mask"][:1].to(model.device)
 
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
-        print(f"[GEN] pred shape: {tuple(pred.shape)}, fut shape: {tuple(fut.shape)}")
-
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
+        # ========== Unnormalize ==========
         try:
-            # 尝试对 Pose 对象/标准结构使用官方 unnormalize
             fut_un  = unnormalize_mean_std(fut)
             pred_un = unnormalize_mean_std(pred)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
+            print(f"[UNNORM RANGE] fut=({fut_un.min():.3f},{fut_un.max():.3f}), "
+                  f"pred=({pred_un.min():.3f},{pred_un.max():.3f})")
         except Exception as e:
-            print(f"[WARN] Unnormalize fallback (tensor only): {e}")
+            print("[WARN] Unnormalize failed, fallback to raw tensor:", e)
+            fut_un, pred_un = fut.detach().cpu(), pred.detach().cpu()
 
-            fut_un  = fut.tensor if hasattr(fut, "tensor") else fut
-            pred_un = pred.tensor if hasattr(pred, "tensor") else pred
+    # ========== 坐标平移 + 缩放中心化 ==========
+    def center_and_scale_pose(tensor, scale=400, offset=(500, 500, 0)):
+        """平移到屏幕中心并放大，适配 PoseViewer"""
+        if tensor.dim() == 4:
+            tensor = tensor[0]
+        center = tensor.mean(dim=1, keepdim=True)
+        tensor = (tensor - center) * scale
+        tensor[..., 0] += offset[0]
+        tensor[..., 1] += offset[1]
+        return tensor
 
-            fut_un  = fut_un.detach().cpu()
-            pred_un = pred_un.detach().cpu()
+    fut_un  = center_and_scale_pose(fut_un)
+    pred_un = center_and_scale_pose(pred_un)
+    print(f"[REMAP] Centered + scaled → min={pred_un.min():.2f}, max={pred_un.max():.2f}")
 
-            scale = 200.0
-            fut_un  = fut_un * scale
-            pred_un = pred_un * scale
-            print(f"[SCALE] multiplied coordinates by {scale}")
+    # ========== 时间平滑，减少闪烁 ==========
+    import torch.nn.functional as F
+    def temporal_smooth(x, k=5):
+        """简单滑动平均滤波去抖动"""
+        if x.dim() == 4:  # [B,T,J,C]
+            x = x[0]
+        x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
+        x = F.avg_pool1d(x, kernel_size=k, stride=1, padding=k//2)
+        return x.squeeze(0).permute(2, 1, 0)
 
-        print(f"[UNNORM] fut range=({fut_un.min():.3f},{fut_un.max():.3f}) pred range=({pred_un.min():.3f},{pred_un.max():.3f})")
+    pred_un = temporal_smooth(pred_un)
+    print("[SMOOTH] Temporal smoothing applied ✅")
 
-
+    # ========== 生成 Pose 对象并保存 ==========
     ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
-
-    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS", "FACE_LANDMARKS"])
+    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     ref_pose_reduced = reduce_holistic(ref_pose)
     header = ref_pose_reduced.header
 
+    # Debug: 打印 limb 信息
+    print("[HEADER] limb counts:", [len(c.limbs) for c in header.components])
+
+    def tensor_to_pose(t_btjc, header):
+        """将 [T,J,C] 或 [B,T,J,C] tensor 转为 Pose 对象"""
+        t = t_btjc
+        if t.dim() == 4: t = t[0]
+        arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
+        conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+        body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
+        return Pose(header=header, body=body)
+
     gt_pose   = tensor_to_pose(fut_un,  header)
     pred_pose = tensor_to_pose(pred_un, header)
-    print(f"[POSE] gt shape={gt_pose.body.data.shape}, pred shape={pred_pose.body.data.shape}")
 
     out_gt, out_pred = os.path.join(out_dir, "gt_178.pose"), os.path.join(out_dir, "pred_178.pose")
     with open(out_gt, "wb") as f: gt_pose.write(f)
     with open(out_pred, "wb") as f: pred_pose.write(f)
     print(f"[SAVE] Reduced 178-joint pose files written → {out_dir}")
 
+    # ✅ 验证结构
     try:
-        _ = Pose.read(open(out_pred, "rb"))
-        print("[CHECK] Pose file verified: structure OK ✅")
+        p = Pose.read(open(out_pred, "rb"))
+        print("[CHECK] Pose OK ✅ limbs:", [len(c.limbs) for c in p.header.components])
     except Exception as e:
-        print(f"[ERROR] Pose read-back failed: {e}")
+        print(f"[ERROR] Pose verification failed: {e}")
 
-    visualize_pose(gt_pose,   os.path.join(out_dir, "gt.mp4"),   "Ground Truth")
-    visualize_pose(pred_pose, os.path.join(out_dir, "pred.mp4"), "Prediction")
-    print("✅ Done! Overfit sanity check (178 joints) complete.")
+    # ========== 可视化输出 ==========
+    viz = PoseVisualizer(header)
+    viz.save_video(gt_pose.body, os.path.join(out_dir, "gt.mp4"), fps=25)
+    viz.save_video(pred_pose.body, os.path.join(out_dir, "pred.mp4"), fps=25)
+    print("✅ Visualization videos saved successfully!")
