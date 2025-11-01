@@ -108,6 +108,7 @@ if __name__ == "__main__":
         B, T, J, C = shape
         print(f"[INFO] Overfit set: {B}×{T} frames | J={J}, C={C}")
 
+    model = LitMinimal(num_keypoints=J, num_dims=C, lr=1e-3, log_dir=out_dir)
     trainer = pl.Trainer(
         max_epochs=200,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
