@@ -108,19 +108,12 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 class LitMinimal(pl.LightningModule):
     """
-    Minimal PyTorch Lightning module for SignWriting-to-Pose training.
-    Features:
-        - Dynamic-window training (no fixed segment length)
-        - Masked MSE and velocity-based auxiliary loss
-        - One-shot full-sequence prediction during inference
-        - On-fit metric logging to CSV
-    Args:
-        num_keypoints (int): Number of body keypoints in pose representation.
-        num_dims (int): Number of spatial dimensions per keypoint (e.g. 3 for x,y,z).
-        lr (float): Learning rate for AdamW optimizer.
-        log_dir (str): Directory to save training metrics.
+    Minimal Lightning module with global mean/std normalization.
+    Uses precomputed global statistics for consistent scale across samples.
     """
-    def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs"):
+
+    def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs",
+                 stats_path="/data/yayun/pose_data/mean_std.pt"):  # 🟩 NEW
         super().__init__()
         self.save_hyperparameters()
 
@@ -131,8 +124,8 @@ class LitMinimal(pl.LightningModule):
         print("[WHERE MODELS.PY] ", M.__file__, flush=True)
         print("[HAS time_proj?] ", hasattr(self.model, "future_time_proj"), flush=True)
         print("[FUTURE_PROJ PARAMS] ",
-            [n for n, _ in self.model.named_parameters() if "future_time_proj" in n],
-            flush=True)
+              [n for n, _ in self.model.named_parameters() if "future_time_proj" in n],
+              flush=True)
 
         self.lr = lr
         self.log_dir = log_dir
@@ -140,102 +133,72 @@ class LitMinimal(pl.LightningModule):
 
         print("[LitMinimal] full-sequence training (zeros query) + velocity loss ✅")
 
+        if os.path.exists(stats_path):
+            stats = torch.load(stats_path, map_location="cpu")
+            mean, std = stats["mean"].float(), stats["std"].float()
+            self.register_buffer("mean_pose", mean)
+            self.register_buffer("std_pose", std)
+            print(f"[Loaded mean/std] mean={mean.mean():.4f}, std={std.mean():.4f}")
+        else:
+            print(f"[WARN] stats not found: {stats_path}, using identity normalization")
+            self.register_buffer("mean_pose", torch.zeros(num_dims))
+            self.register_buffer("std_pose", torch.ones(num_dims))
+
+    def normalize_pose(self, x_btjc):
+        """Normalize tensor [B,T,J,C] using global mean/std."""
+        return (x_btjc - self.mean_pose) / self.std_pose
+
+    def unnormalize_pose(self, x_btjc):
+        """Unnormalize tensor [B,T,J,C] using global mean/std."""
+        return x_btjc * self.std_pose + self.mean_pose
+
+
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
-        """Forward pass through diffusion model (batch-first format)."""
         x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
         past_bjct = btjc_to_bjct(sanitize_btjc(past_btjc))
         if timesteps.dtype != torch.long:
             timesteps = timesteps.long()
         out_bjct  = self.model.forward(x_bjct, timesteps, past_bjct, sign_img)
-        pred_btjc = bjct_to_btjc(out_bjct)  # [B,T,J,C]
+        pred_btjc = bjct_to_btjc(out_bjct)
         return pred_btjc
 
-    def _make_mask_bt(self, raw_mask):
-        mask = raw_mask.float()
-        if mask.dim() == 5:   # [B,T,P,J,C] -> [B,T]
-            mask = (mask.abs().sum(dim=(2, 3, 4)) > 0).float()
-        elif mask.dim() == 4: # [B,T,J,C] -> [B,T]
-            mask = (mask.abs().sum(dim=(2, 3)) > 0).float()
-        elif mask.dim() == 3: # [B,T,C]   -> [B,T]
-            mask = (mask.abs().sum(dim=2) > 0).float()
-        return mask
-    def _time_ramp(self, T, device):
-        return torch.linspace(0, 1, steps=T, device=device).view(1, T, 1, 1)
-
     def training_step(self, batch, _):
-        if self.global_step == 0:
-            import signwriting_animation.diffusion.lightning_module as lm
-            print(f"[USING FILE] {lm.__file__}")
-
         cond = batch["conditions"]
-        fut  = sanitize_btjc(batch["data"])              # [B,Tf,J,C] (Tf dynamic)
-        past = sanitize_btjc(cond["input_pose"])         # [B,Tp,J,C]
-        mask = self._make_mask_bt(cond["target_mask"])   # [B,Tf]
+        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))      # 🟩 normalized
+        past = self.normalize_pose(sanitize_btjc(cond["input_pose"])) # 🟩 normalized
+        mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        
-        T = fut.size(1)
-        t_ramp = self._time_ramp(T, fut.device)
-        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp 
-        pred = self.forward(in_seq, ts, past, sign)      # [B,Tf,J,C]
 
+        T = fut.size(1)
+        t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp
+
+        pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
+
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
             loss = loss_pos + 2.0 * loss_vel
         else:
             loss = loss_pos
-        # ======================= DEBUG PATCH BEGIN ==========================
-        if batch is not None and "conditions" in batch:
-            x = batch["conditions"]["input_pose"]
-            if hasattr(x, "tensor"):
-                x = x.tensor
-            x = x.detach().float()
-            if torch.isnan(x).any():
-                print("[NaN DETECTED] input_pose has NaN")
-            print(f"[CHECK INPUT] mean={x.mean().item():.4f}, std={x.std().item():.4f}, "
-                f"min={x.min().item():.4f}, max={x.max().item():.4f}, shape={tuple(x.shape)}")
-
-        # 检查参数是否有 NaN
-        for name, p in self.named_parameters():
-            if torch.isnan(p).any():
-                print(f"[NaN PARAM] {name}")
-
-        # 检查输出是否异常
-        if torch.isnan(pred).any():
-            print("[NaN DETECTED] model output (pred) has NaN")
-        else:
-            print(f"[CHECK OUTPUT] mean={pred.mean().item():.4f}, std={pred.std().item():.4f}, "
-                f"min={pred.min().item():.4f}, max={pred.max().item():.4f}, shape={tuple(pred.shape)}")
-        # ======================= DEBUG PATCH END ==========================
-
-        if self.global_step == 0:
-            with torch.no_grad():
-                mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
-                print(f"[Sanity] mean |Δpred| (train) = {mv:.6f}")
-
-        if self.global_step % 100 == 0 and self.global_step > 0:
-            with torch.no_grad():
-                mv = (pred[:,1:]-pred[:,:-1]).abs().mean().item()
-                print(f"[Step {self.global_step}] mean |Δpred| = {mv:.6f}")
 
         self.train_losses.append(loss.item())
         self.log("train/loss", loss, prog_bar=True, on_step=True)
         return loss
 
+
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = sanitize_btjc(batch["data"])
-        past = sanitize_btjc(cond["input_pose"])
-        mask = self._make_mask_bt(cond["target_mask"])
+        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
+        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
+        mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        T = fut.size(1)
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(int(torch.randint(0, 10_000_000, (1,)).item()))
-            in_seq = 0.05 * torch.randn_like(fut) + 1.0 * self._time_ramp(T, fut.device)
 
+        T = fut.size(1)
+        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
@@ -246,27 +209,20 @@ class LitMinimal(pl.LightningModule):
         else:
             loss = loss_pos
 
-        dtw  = masked_dtw(pred, fut, mask)
-
-        with torch.no_grad():
-            delta_mean = (pred[:,1:]-pred[:,:-1]).abs().mean().item() if fut.size(1) > 1 else 0.0
-            tstd = pred.std(dim=1).mean().item()
-            print(f"[DBG/val] mean|Δpred|={delta_mean:.6f}, time-std={tstd:.6f}", flush=True)
+        dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)  # 🟩 unnormalized for metric
 
         self.val_losses.append(loss.item())
         self.val_dtws.append(dtw.item())
         self.log("val/loss", loss, prog_bar=True)
-        self.log("val/dtw",  dtw,  prog_bar=False)
+        self.log("val/dtw", dtw, prog_bar=False)
+        return {"val_loss": loss, "val_dtw": dtw}
+
 
     @torch.no_grad()
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
-        """
-        Predict the entire future segment in one forward pass (per sample length).
-        Now supports time-varying generation to avoid static outputs.
-        """
         print("[GEN/full] ENTER generate_full_sequence", flush=True)
         self.eval()
-        ctx  = sanitize_btjc(past_btjc).to(self.device)  # [B,Tp,J,C]
+        ctx  = self.normalize_pose(sanitize_btjc(past_btjc)).to(self.device)  # 🟩 normalize context
         sign = sign_img.to(self.device)
         B, _, J, C = ctx.shape
 
@@ -279,7 +235,7 @@ class LitMinimal(pl.LightningModule):
                 tf_list = [int(x) for x in target_len]
         else:
             assert target_mask is not None, "Need target_len or target_mask"
-            mask_bt = self._make_mask_bt(target_mask).to(self.device)
+            mask_bt = (target_mask.float().sum(dim=(2,3)) > 0).float() if target_mask.dim() == 4 else target_mask.float()
             tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()
 
         outs = []
@@ -291,27 +247,10 @@ class LitMinimal(pl.LightningModule):
                 x_query = 0.05 * torch.randn((1, 1, J, C), device=self.device)
                 pred_t = self.forward(x_query, t_norm, ctx[b:b+1], sign[b:b+1])
                 preds.append(pred_t)
-            pred_seq = torch.cat(preds, dim=1)  # [1, Tf, J, C]
+            pred_seq = torch.cat(preds, dim=1)
             outs.append(pred_seq)
-
-            delta_mean = float((pred_seq[:, 1:, :, :2] - pred_seq[:, :-1, :, :2]).abs().mean())
-            print(f"[GEN/full] sample {b}: Tf={Tf}, mean|Δpred|={delta_mean:.6f}", flush=True)
-
-        return torch.cat(outs, dim=0)
-
-    def on_fit_end(self):
-        os.makedirs(self.log_dir, exist_ok=True)
-        csv_path = os.path.join(self.log_dir, "minimal_metrics.csv")
-        with open(csv_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["step", "train_loss", "val_loss", "val_dtw"])
-            max_len = max(len(self.train_losses), len(self.val_losses), len(self.val_dtws))
-            for i in range(max_len):
-                tr  = self.train_losses[i] if i < len(self.train_losses) else ""
-                vl  = self.val_losses[i]  if i < len(self.val_losses)  else ""
-                dv  = self.val_dtws[i]    if i < len(self.val_dtws)    else ""
-                w.writerow([i + 1, tr, vl, dv])
-        print(f"[on_fit_end] metrics saved to {csv_path}")
+        out = torch.cat(outs, dim=0)
+        return self.unnormalize_pose(out)  # 🟩 restore to real coordinates
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
