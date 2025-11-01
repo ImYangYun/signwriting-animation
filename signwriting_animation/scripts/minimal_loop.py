@@ -144,9 +144,14 @@ if __name__ == "__main__":
             pred_un = unnormalize_mean_std(pred)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
         except Exception as e:
-            # 若输入为 Tensor，则直接 fallback + 手动放大
             print(f"[WARN] Unnormalize fallback (tensor only): {e}")
-            fut_un, pred_un = fut.detach().cpu(), pred.detach().cpu()
+
+            fut_un  = fut.tensor if hasattr(fut, "tensor") else fut
+            pred_un = pred.tensor if hasattr(pred, "tensor") else pred
+
+            fut_un  = fut_un.detach().cpu()
+            pred_un = pred_un.detach().cpu()
+
             scale = 200.0
             fut_un  = fut_un * scale
             pred_un = pred_un * scale
