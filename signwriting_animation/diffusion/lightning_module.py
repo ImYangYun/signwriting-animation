@@ -113,36 +113,53 @@ class LitMinimal(pl.LightningModule):
     """
 
     def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs",
-                 stats_path="/data/yayun/pose_data/mean_std.pt"):  # 🟩 NEW
+                stats_path="/data/yayun/pose_data/mean_std.pt",
+                data_dir="/data/yayun/pose_data",
+                csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):  # 🟩 新增路径参数
         super().__init__()
         self.save_hyperparameters()
 
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints, num_dims_per_keypoint=num_dims
         )
-        import signwriting_animation.diffusion.core.models as M
-        print("[WHERE MODELS.PY] ", M.__file__, flush=True)
-        print("[HAS time_proj?] ", hasattr(self.model, "future_time_proj"), flush=True)
-        print("[FUTURE_PROJ PARAMS] ",
-              [n for n, _ in self.model.named_parameters() if "future_time_proj" in n],
-              flush=True)
 
         self.lr = lr
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
 
-        print("[LitMinimal] full-sequence training (zeros query) + velocity loss ✅")
-
+        # 🟩 自动加载或计算 mean/std
         if os.path.exists(stats_path):
             stats = torch.load(stats_path, map_location="cpu")
             mean, std = stats["mean"].float(), stats["std"].float()
-            self.register_buffer("mean_pose", mean)
-            self.register_buffer("std_pose", std)
             print(f"[Loaded mean/std] mean={mean.mean():.4f}, std={std.mean():.4f}")
         else:
-            print(f"[WARN] stats not found: {stats_path}, using identity normalization")
-            self.register_buffer("mean_pose", torch.zeros(num_dims))
-            self.register_buffer("std_pose", torch.ones(num_dims))
+            print(f"[WARN] stats not found → computing global mean/std from {csv_path}")
+            from pose_format import Pose
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            df = df[df["split"] == "train"].reset_index(drop=True)
+
+            sum_all, sum_sq_all, count = 0.0, 0.0, 0
+            for rec in df.to_dict(orient="records"):
+                pose_path = os.path.join(data_dir, rec["pose"])
+                if not os.path.exists(pose_path):
+                    continue
+                with open(pose_path, "rb") as f:
+                    p = Pose.read(f)
+                    arr = torch.tensor(p.body.data, dtype=torch.float32)  # [T,P,J,C]
+                    arr = arr.view(-1, arr.shape[-1])  # [T*P*J, C]
+                    sum_all += arr.sum(dim=0)
+                    sum_sq_all += (arr ** 2).sum(dim=0)
+                    count += arr.shape[0]
+            mean = sum_all / count
+            std = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
+            torch.save({"mean": mean, "std": std}, stats_path)
+            print(f"[Saved new mean/std] → {stats_path}")
+
+        # register buffer
+        self.register_buffer("mean_pose", mean)
+        self.register_buffer("std_pose", std)
+        print(f"[LitMinimal] Using mean={mean.tolist()} std={std.tolist()}")
 
     def normalize_pose(self, x_btjc):
         """Normalize tensor [B,T,J,C] using global mean/std."""
