@@ -48,7 +48,8 @@ def _to_plain(x):
 def tensor_to_pose(t_btjc, header):
     t = _to_plain(t_btjc)
     if t.dim() == 5: t = t[:, :, 0, :, :]
-    if t.dim() == 4: t = t[0]
+    if t.dim() == 4:  # [B,T,J,C]
+        t = t[0]
     arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
@@ -57,19 +58,15 @@ def tensor_to_pose(t_btjc, header):
 def visualize_pose(pose_obj, out_mp4, title="Motion"):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     viz = PoseVisualizer(pose_obj.header)
-    viz.save_video(pose_obj.body, out_mp4, title=title, fps=15)
+    viz.save_video(pose_obj.body, out_mp4, title=title, fps=25)
     print(f"[VIZ] Saved → {out_mp4}")
 
 def get_reduced_header(ref_pose_path):
-    """读取原始 .pose 文件 header，去掉 world 并 reduce 到 178 joints"""
     with open(ref_pose_path, "rb") as f:
         pose = Pose.read(f)
-    # 移除 world 坐标
     if any(c.name == "POSE_WORLD_LANDMARKS" for c in pose.header.components):
         pose = pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    # reduce 到 178 joints
     pose = reduce_holistic(pose)
-    pose = normalize_mean_std(pose)
     return pose.header
 
 
@@ -81,7 +78,6 @@ if __name__ == "__main__":
     out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1️⃣ 加载 dataset 并选 4 条样本
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -89,12 +85,19 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,   # ✅ 保证是178 joints
+        reduce_holistic=True,
     )
-    small_ds = FilteredSmallDataset(base_ds, num_samples=4)
-    loader = DataLoader(small_ds, batch_size=4, shuffle=True, collate_fn=zero_pad_collator)
 
-    # 2️⃣ 初始化模型
+    small_ds = torch.utils.data.Subset(base_ds, list(range(min(4, len(base_ds)))))
+    print(f"[DEBUG] Using subset of {len(small_ds)} samples for overfit test")
+
+    loader = DataLoader(
+        small_ds,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=zero_pad_collator,
+    )
+
     batch = next(iter(loader))
     B, T, J, C = batch["data"].shape
     print(f"[INFO] Overfit set: {B}×{T} frames | J={J}, C={C}")
@@ -136,8 +139,7 @@ if __name__ == "__main__":
             print("[WARN] Unnormalize failed:", e)
             fut_un, pred_un = fut, pred
 
-    # 4️⃣ 保存 pose + 可视化
-    header = get_reduced_header(os.path.join(data_dir, small_ds.base.records[0]["pose"]))
+    header = get_reduced_header(os.path.join(data_dir, base_ds.records[0]["pose"]))
     gt_pose   = tensor_to_pose(fut_un,  header)
     pred_pose = tensor_to_pose(pred_un, header)
 
