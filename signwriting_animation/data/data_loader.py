@@ -93,36 +93,11 @@ class DynamicPosePredictionDataset(Dataset):
         with open(pose_path, "rb") as f:
             raw = Pose.read(f)
 
-        try:
-            tf = len(raw.body.data)  # total frames in this pose file
-
-            s = None if rec.get("start") is None else int(rec["start"])
-            e = None if rec.get("end")   is None else int(rec["end"])
-
-            if s is None and e is None:
-                # no slicing
-                pass
-            else:
-                # fill missing with boundaries
-                s = 0  if s is None else s
-                e = tf if e is None else e
-                # clamp range into [0, tf]
-                s = max(0, min(s, max(0, tf - 1)))
-                e = max(0, min(e, tf))
-
-                if s >= e:
-                    # invalid range: fallback to full sequence and warn
-                    print(f"[WARN] Ignoring invalid range ({rec.get('start')},{rec.get('end')}) "
-                        f"for {os.path.basename(pose_path)} | tf={tf}")
-                else:
-                    raw.body = raw.body[s:e]
-                    tf = len(raw.body.data)
-                    if tf < 5:
-                        print(f"[SKIP SHORT AFTER SLICE] file={os.path.basename(pose_path)} | "
-                            f"tf={tf} | range=({s},{e})")
-                        return self.__getitem__((idx + 1) % len(self.records))
-        except Exception as e:
-            print(f"[WARN] Failed slicing {pose_path}: {e}")
+        total_frames = len(raw.body.data)
+        if total_frames < 5:
+            print(f"[SKIP SHORT FILE] idx={idx} | total_frames={total_frames} | "
+                  f"file={os.path.basename(pose_path)}")
+            return self.__getitem__((idx + 1) % len(self.records))
 
         if self._reduce_holistic_fn is not None:
             try:
