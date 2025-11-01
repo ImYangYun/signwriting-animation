@@ -147,7 +147,7 @@ if __name__ == "__main__":
             print("[WARN] Unnormalize failed:", e)
             fut_un, pred_un = fut, pred
 
-    ref_path = os.path.join(data_dir, small_ds.base.records[0]["pose"])
+    ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
