@@ -57,7 +57,7 @@ def tensor_to_pose(t_btjc, header):
 
 def visualize_pose(pose_obj, out_mp4, title="Motion"):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
-    viz = PoseVisualizer(pose_obj.header)
+    viz = PoseVisualizer(pose_obj)
     viz.save_video(pose_obj.body, out_mp4, title=title, fps=25)
     print(f"[VIZ] Saved → {out_mp4}")
 
@@ -123,7 +123,6 @@ if __name__ == "__main__":
     print(f"[TRAIN] Overfitting on 4 samples × {J} joints × {C} dims")
     trainer.fit(model, loader, loader)
 
-    # 3️⃣ 推理测试
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -134,6 +133,8 @@ if __name__ == "__main__":
         mask = cond["target_mask"][:1].to(model.device)
 
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
+        print(f"[GEN] pred shape: {tuple(pred.shape)}, fut shape: {tuple(fut.shape)}")
+
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
@@ -141,20 +142,34 @@ if __name__ == "__main__":
             fut_un  = unnormalize_mean_std(fut)
             pred_un = unnormalize_mean_std(pred)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
+            print(f"[UNNORM] fut range=({fut_un.min():.3f},{fut_un.max():.3f}) pred range=({pred_un.min():.3f},{pred_un.max():.3f})")
         except Exception as e:
             print("[WARN] Unnormalize failed:", e)
             fut_un, pred_un = fut, pred
 
-    header = get_reduced_header(os.path.join(data_dir, base_ds.records[0]["pose"]))
+    ref_path = os.path.join(data_dir, small_ds.base.records[0]["pose"])
+    with open(ref_path, "rb") as f:
+        ref_pose = Pose.read(f)
+
+    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS", "FACE_LANDMARKS"])
+    ref_pose_reduced = reduce_holistic(ref_pose)
+    header = ref_pose_reduced.header
+
     gt_pose   = tensor_to_pose(fut_un,  header)
     pred_pose = tensor_to_pose(pred_un, header)
+    print(f"[POSE] gt shape={gt_pose.body.data.shape}, pred shape={pred_pose.body.data.shape}")
 
-    out_gt, out_pred = os.path.join(out_dir, "gt.pose"), os.path.join(out_dir, "pred.pose")
+    out_gt, out_pred = os.path.join(out_dir, "gt_178.pose"), os.path.join(out_dir, "pred_178.pose")
     with open(out_gt, "wb") as f: gt_pose.write(f)
     with open(out_pred, "wb") as f: pred_pose.write(f)
-    print(f"[SAVE] .pose files written → {out_dir}")
+    print(f"[SAVE] Reduced 178-joint pose files written → {out_dir}")
+
+    try:
+        _ = Pose.read(open(out_pred, "rb"))
+        print("[CHECK] Pose file verified: structure OK ✅")
+    except Exception as e:
+        print(f"[ERROR] Pose read-back failed: {e}")
 
     visualize_pose(gt_pose,   os.path.join(out_dir, "gt.mp4"),   "Ground Truth")
     visualize_pose(pred_pose, os.path.join(out_dir, "pred.mp4"), "Prediction")
-
     print("✅ Done! Overfit sanity check (178 joints) complete.")
