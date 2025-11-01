@@ -124,6 +124,7 @@ if __name__ == "__main__":
     trainer.fit(model, loader, loader)
 
 
+        # 3️⃣ 推理测试 + 可视化保存
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -142,31 +143,35 @@ if __name__ == "__main__":
             fut_un  = unnormalize_mean_std(fut)
             pred_un = unnormalize_mean_std(pred)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
-            print(f"[UNNORM RANGE] fut=({fut_un.min():.3f},{fut_un.max():.3f}), "
-                  f"pred=({pred_un.min():.3f},{pred_un.max():.3f})")
         except Exception as e:
             print("[WARN] Unnormalize failed, fallback to raw tensor:", e)
             fut_un, pred_un = fut.detach().cpu(), pred.detach().cpu()
 
-    # ========== 坐标平移 + 缩放中心化 ==========
-    def center_and_scale_pose(tensor, scale=400, offset=(500, 500, 0)):
-        """平移到屏幕中心并放大，适配 PoseViewer"""
+    # ========== 坐标重心平移 + 缩放 + Y轴翻转 ==========
+    def center_and_scale_pose(tensor, scale=800, offset=(500, 500, 0)):
+        """居中、放大并翻转Y轴以适配PoseViewer"""
         if tensor.dim() == 4:
             tensor = tensor[0]
+        # 居中
         center = tensor.mean(dim=1, keepdim=True)
-        tensor = (tensor - center) * scale
+        tensor = tensor - center
+        # 放大
+        tensor = tensor * scale
+        # 翻转 Y 轴（PoseViewer 坐标系向下为正）
+        tensor[..., 1] = -tensor[..., 1]
+        # 居中偏移
         tensor[..., 0] += offset[0]
         tensor[..., 1] += offset[1]
         return tensor
 
     fut_un  = center_and_scale_pose(fut_un)
     pred_un = center_and_scale_pose(pred_un)
-    print(f"[REMAP] Centered + scaled → min={pred_un.min():.2f}, max={pred_un.max():.2f}")
+    print(f"[REMAP] Centered + scaled + flipped Y ✅ | range=({pred_un.min():.2f}, {pred_un.max():.2f})")
 
-    # ========== 时间平滑，减少闪烁 ==========
+    # ========== 时间平滑去闪烁 ==========
     import torch.nn.functional as F
     def temporal_smooth(x, k=5):
-        """简单滑动平均滤波去抖动"""
+        """滑动平均滤波，减少帧间抖动"""
         if x.dim() == 4:  # [B,T,J,C]
             x = x[0]
         x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
@@ -184,7 +189,6 @@ if __name__ == "__main__":
     ref_pose_reduced = reduce_holistic(ref_pose)
     header = ref_pose_reduced.header
 
-    # Debug: 打印 limb 信息
     print("[HEADER] limb counts:", [len(c.limbs) for c in header.components])
 
     def tensor_to_pose(t_btjc, header):
