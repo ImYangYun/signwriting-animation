@@ -99,9 +99,14 @@ if __name__ == "__main__":
     )
 
     batch = next(iter(loader))
-    B, T, J, C = batch["data"].shape
-    print(f"[INFO] Overfit set: {B}×{T} frames | J={J}, C={C}")
-    model = LitMinimal(num_keypoints=J, num_dims=C, lr=1e-3, log_dir=out_dir)
+    shape = batch["data"].shape
+
+    if len(shape) == 5:
+        B, T, P, J, C = shape
+        print(f"[INFO] Overfit set: {B}×{T} frames | P={P}, J={J}, C={C}")
+    else:
+        B, T, J, C = shape
+        print(f"[INFO] Overfit set: {B}×{T} frames | J={J}, C={C}")
 
     trainer = pl.Trainer(
         max_epochs=200,
