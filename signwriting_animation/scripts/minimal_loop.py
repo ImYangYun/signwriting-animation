@@ -58,7 +58,7 @@ def tensor_to_pose(t_btjc, header):
 def visualize_pose(pose_obj, out_mp4, title="Motion"):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
     viz = PoseVisualizer(pose_obj)
-    viz.save_video(pose_obj.body, out_mp4, title=title, fps=25)
+    viz.save_video(pose_obj.body, out_mp4, fps=25)
     print(f"[VIZ] Saved → {out_mp4}")
 
 def get_reduced_header(ref_pose_path):
@@ -139,13 +139,21 @@ if __name__ == "__main__":
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
         try:
+            # 尝试对 Pose 对象/标准结构使用官方 unnormalize
             fut_un  = unnormalize_mean_std(fut)
             pred_un = unnormalize_mean_std(pred)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
-            print(f"[UNNORM] fut range=({fut_un.min():.3f},{fut_un.max():.3f}) pred range=({pred_un.min():.3f},{pred_un.max():.3f})")
         except Exception as e:
-            print("[WARN] Unnormalize failed:", e)
-            fut_un, pred_un = fut, pred
+            # 若输入为 Tensor，则直接 fallback + 手动放大
+            print(f"[WARN] Unnormalize fallback (tensor only): {e}")
+            fut_un, pred_un = fut.detach().cpu(), pred.detach().cpu()
+            scale = 200.0
+            fut_un  = fut_un * scale
+            pred_un = pred_un * scale
+            print(f"[SCALE] multiplied coordinates by {scale}")
+
+        print(f"[UNNORM] fut range=({fut_un.min():.3f},{fut_un.max():.3f}) pred range=({pred_un.min():.3f},{pred_un.max():.3f})")
+
 
     ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
     with open(ref_path, "rb") as f:
