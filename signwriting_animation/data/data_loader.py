@@ -4,6 +4,7 @@ from typing import Literal, Optional
 
 import pandas as pd
 import torch
+import copy
 from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
@@ -18,12 +19,14 @@ def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
     Normalize a Pose object using an externally provided mean/std dict.
     This replaces the default per-file normalization for global consistency.
     """
-    pose = pose.clone()
+    pose = copy.deepcopy(pose)
     mean = torch.tensor(mean_std["mean"]).float()
     std = torch.tensor(mean_std["std"]).float()
+
     data = torch.from_numpy(pose.body.data).float()
     data = (data - mean) / std
     pose.body.data = data.numpy()
+
     return pose
 
 def _coalesce_maybe_nan(x) -> Optional[int]:
