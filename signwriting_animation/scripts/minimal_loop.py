@@ -50,15 +50,15 @@ def _to_plain(x):
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     return x.detach().cpu().contiguous().float()
 
-def tensor_to_pose(t_btjc, header):
-    t = _to_plain(t_btjc)
-    if t.dim() == 5: t = t[:, :, 0, :, :]
-    if t.dim() == 4:  # [B,T,J,C]
-        t = t[0]
-    arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
-    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
-    body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-    return Pose(header=header, body=body)
+#def tensor_to_pose(t_btjc, header):
+    #t = _to_plain(t_btjc)
+    #if t.dim() == 5: t = t[:, :, 0, :, :]
+    #if t.dim() == 4:  # [B,T,J,C]
+        #t = t[0]
+    #arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
+    #conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+    #body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
+    #return Pose(header=header, body=body)
 
 def visualize_pose(pose_obj, out_mp4, title="Motion"):
     os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
@@ -203,6 +203,8 @@ if __name__ == "__main__":
             for j in range(x.shape[1])
         ], dim=1)
         return smoothed
+
+    pred_un = temporal_smooth(pred_un)
     print("[SMOOTH] Temporal smoothing applied ✅")
 
     # ========== 生成 Pose 对象并保存 ==========
@@ -214,13 +216,16 @@ if __name__ == "__main__":
     header = ref_pose_reduced.header
 
     print("[HEADER] limb counts:", [len(c.limbs) for c in header.components])
+    print("[DEBUG] creating gt_pose and pred_pose ...")
+    print(f"[DEBUG] gt_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
 
     def tensor_to_pose(t_btjc, header):
         """将 [T,J,C] 或 [B,T,J,C] tensor 转为 Pose 对象"""
         t = t_btjc
-        if t.dim() == 4: t = t[0]
+        if t.dim() == 4:
+            t = t[0]  # [T,J,C]
         arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
-        conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+        conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)  # [T,1,J,1]
         body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
         return Pose(header=header, body=body)
 
