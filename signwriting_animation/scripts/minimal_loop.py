@@ -74,7 +74,7 @@ def temporal_smooth(x, k=5):
     x = x.contiguous().float()
     x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
     x = F.avg_pool1d(x.reshape(1, C*J, T), kernel_size=k, stride=1, padding=k//2)
-    x = x.reshape(1, C, J, T).squeeze(0).permute(3, 2, 1)  # [T,J,C]
+    x = x.reshape(1, C, J, T).squeeze(0).permute(3, 2, 1).contiguous()
     return x
 
 
@@ -155,28 +155,32 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
+        # -- Unnormalize --
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
-        print(f"[DEBUG] pred_un mean={pred_un.mean():.4f}, std={pred_un.std():.4f}, "
-              f"min={pred_un.min():.2f}, max={pred_un.max():.2f}")
 
-    # ---------------------- Post-process ----------------------
-    if hasattr(fut_un, "tensor"):
-        fut_un = fut_un.tensor
-    if hasattr(fut_un, "zero_filled"):
-        fut_un = fut_un.zero_filled()
-    if hasattr(pred_un, "tensor"):
-        pred_un = pred_un.tensor
-    if hasattr(pred_un, "zero_filled"):
-        pred_un = pred_un.zero_filled()
+        # -- Convert to plain tensors --
+        for x_name in ["fut_un", "pred_un"]:
+            x = locals()[x_name]
+            if hasattr(x, "tensor"):
+                x = x.tensor
+            if hasattr(x, "zero_filled"):
+                x = x.zero_filled()
+            locals()[x_name] = x
 
-    fut_un  = center_and_scale_pose(fut_un)
-    pred_un = center_and_scale_pose(pred_un)
+        # -- Remove person dim if present --
+        if fut_un.dim() == 5 and fut_un.shape[2] == 1:
+            fut_un = fut_un.squeeze(2)
+        if pred_un.dim() == 5 and pred_un.shape[2] == 1:
+            pred_un = pred_un.squeeze(2)
 
-    pred_un = temporal_smooth(pred_un)
-    print("[POST] Center + scale + smooth ✅")
-    print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
+        # -- Center / scale / smooth --
+        fut_un  = center_and_scale_pose(fut_un)
+        pred_un = center_and_scale_pose(pred_un)
+        pred_un = temporal_smooth(pred_un)
+        print("[POST] Center + scale + smooth ✅")
+        print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
 
     # =====================================================
     #  Save & visualize
