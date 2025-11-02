@@ -16,11 +16,14 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_
 
 
 def unnormalize_tensor_with_global_stats(tensor: torch.Tensor, mean_std: dict):
-    mean = torch.tensor(mean_std["mean"]).float().to(tensor.device)
-    std = torch.tensor(mean_std["std"]).float().to(tensor.device)
+    if torch.is_tensor(mean_std["mean"]):
+        mean = mean_std["mean"].detach().clone().float().to(tensor.device)
+        std = mean_std["std"].detach().clone().float().to(tensor.device)
+    else:
+        mean = torch.tensor(mean_std["mean"], dtype=torch.float32, device=tensor.device)
+        std = torch.tensor(mean_std["std"], dtype=torch.float32, device=tensor.device)
     return tensor * std + mean
 
-# ---------------------- Dataset wrapper ----------------------
 class FilteredSmallDataset(Dataset):
     """从大 dataset 中挑出 N 条合法样本（非空 pose）用于过拟合测试"""
     def __init__(self, base_ds, num_samples=4, max_scan=500):
@@ -30,7 +33,7 @@ class FilteredSmallDataset(Dataset):
             try:
                 sample = base_ds[i]
                 if isinstance(sample, dict) and "data" in sample:
-                    if sample["data"].shape[1] > 5:  # 至少 5 帧
+                    if sample["data"].shape[1] > 5:
                         self.valid_idx.append(i)
                 if len(self.valid_idx) >= num_samples:
                     break
@@ -44,38 +47,51 @@ class FilteredSmallDataset(Dataset):
     def __getitem__(self, i): return self.base[self.valid_idx[i]]
 
 
-# ---------------------- Helper functions ----------------------
 def _to_plain(x):
     if hasattr(x, "tensor"): x = x.tensor
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     return x.detach().cpu().contiguous().float()
 
-#def tensor_to_pose(t_btjc, header):
-    #t = _to_plain(t_btjc)
-    #if t.dim() == 5: t = t[:, :, 0, :, :]
-    #if t.dim() == 4:  # [B,T,J,C]
-        #t = t[0]
-    #arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
-    #conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
-    #body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-    #return Pose(header=header, body=body)
 
-def visualize_pose(pose_obj, out_mp4, title="Motion"):
-    os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
-    viz = PoseVisualizer(pose_obj)
-    viz.save_video(pose_obj.body, out_mp4, fps=25)
-    print(f"[VIZ] Saved → {out_mp4}")
-
-def get_reduced_header(ref_pose_path):
-    with open(ref_pose_path, "rb") as f:
-        pose = Pose.read(f)
-    if any(c.name == "POSE_WORLD_LANDMARKS" for c in pose.header.components):
-        pose = pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    pose = reduce_holistic(pose)
-    return pose.header
+def center_and_scale_pose(tensor, scale=300, offset=(0, 0, 0)):
+    """居中、放大并翻转Y轴以适配PoseViewer"""
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    center = tensor.mean(dim=1, keepdim=True)
+    tensor = (tensor - center) * scale
+    tensor[..., 1] = -tensor[..., 1]
+    tensor[..., 0] += offset[0]
+    tensor[..., 1] += offset[1]
+    return tensor
 
 
-# ---------------------- Main pipeline ----------------------
+def temporal_smooth(x, k=5):
+    """时间维平滑：减少帧间抖动"""
+    import torch.nn.functional as F
+    if x.dim() == 4:
+        x = x[0]  # [T,J,C]
+    T, J, C = x.shape
+    x = x.contiguous().float()
+    x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
+    x = F.avg_pool1d(x.reshape(1, C*J, T), kernel_size=k, stride=1, padding=k//2)
+    x = x.reshape(1, C, J, T).squeeze(0).permute(3, 2, 1)  # [T,J,C]
+    return x
+
+
+def tensor_to_pose(t_btjc, header):
+    """将 [T,J,C] 或 [B,T,J,C] tensor 转为 Pose 对象"""
+    t = _to_plain(t_btjc)
+    if t.dim() == 4:
+        t = t[0]
+    arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
+    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+    body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
+    return Pose(header=header, body=body)
+
+
+# ============================================================
+#  Main pipeline
+# ============================================================
 if __name__ == "__main__":
     pl.seed_everything(42)
     data_dir = "/data/yayun/pose_data"
@@ -85,6 +101,7 @@ if __name__ == "__main__":
 
     mean_std_path = os.path.join(data_dir, "mean_std.pt")
 
+    # ---------------------- Dataset ----------------------
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -98,52 +115,33 @@ if __name__ == "__main__":
     base_ds.mean_std = torch.load(mean_std_path)
     print(f"[NORM] Loaded mean/std from {mean_std_path}")
 
-    first = base_ds[0]["data"]
-
-    if hasattr(first, "tensor"):
-        first = first.tensor
-    if hasattr(first, "zero_filled"):
-        first = first.zero_filled()
-
-    print("[CHECK] raw data mean/std:",
-        first.mean().item(), first.std().item())
+    first = _to_plain(base_ds[0]["data"])
+    print(f"[CHECK] raw data mean/std: {first.mean():.4f}, {first.std():.4f}")
 
     small_ds = torch.utils.data.Subset(base_ds, list(range(min(4, len(base_ds)))))
-    print(f"[DEBUG] Using subset of {len(small_ds)} samples for overfit test")
+    loader = DataLoader(small_ds, batch_size=4, shuffle=True, collate_fn=zero_pad_collator)
 
-    loader = DataLoader(
-        small_ds,
-        batch_size=4,
-        shuffle=True,
-        collate_fn=zero_pad_collator,
-    )
+    shape = next(iter(loader))["data"].shape
+    print(f"[INFO] Overfit set shape: {tuple(shape)}")
 
-    batch = next(iter(loader))
-    shape = batch["data"].shape
-
-    if len(shape) == 5:
-        B, T, P, J, C = shape
-        print(f"[INFO] Overfit set: {B}×{T} frames | P={P}, J={J}, C={C}")
-    else:
-        B, T, J, C = shape
-        print(f"[INFO] Overfit set: {B}×{T} frames | J={J}, C={C}")
-
-    model = LitMinimal(num_keypoints=J, num_dims=C, lr=1e-3, log_dir=out_dir)
+    # ---------------------- Training ----------------------
+    model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=1e-3, log_dir=out_dir)
     trainer = pl.Trainer(
         max_epochs=200,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        limit_train_batches=1,  # 只用1个batch = 4样本
+        limit_train_batches=1,
         limit_val_batches=1,
         log_every_n_steps=1,
         enable_checkpointing=False,
         deterministic=True,
     )
-
-    print(f"[TRAIN] Overfitting on 4 samples × {J} joints × {C} dims")
+    print(f"[TRAIN] Overfitting on 4 samples × {shape[-2]} joints × {shape[-1]} dims")
     trainer.fit(model, loader, loader)
 
-
+    # =====================================================
+    #  Inference + postprocess
+    # =====================================================
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -157,93 +155,56 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-       # ========== Unnormalize ==========
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
-        print(f"[DEBUG] pred_un mean={pred_un.mean():.4f}, std={pred_un.std():.4f}, min={pred_un.min():.2f}, max={pred_un.max():.2f}")
+        print(f"[DEBUG] pred_un mean={pred_un.mean():.4f}, std={pred_un.std():.4f}, "
+              f"min={pred_un.min():.2f}, max={pred_un.max():.2f}")
 
-        if hasattr(fut_un, "zero_filled"):
-            fut_un = fut_un.zero_filled()
-        if hasattr(pred_un, "zero_filled"):
-            pred_un = pred_un.zero_filled()
-
-        fut_un = fut_un.detach().cpu()
-        pred_un = pred_un.detach().cpu()
-
-    def center_and_scale_pose(tensor, scale=100, offset=(500, 500, 0)):
-        """居中、放大并翻转Y轴以适配PoseViewer"""
-        if tensor.dim() == 4:
-            tensor = tensor[0]
-        # 居中
-        center = tensor.mean(dim=1, keepdim=True)
-        tensor = tensor - center
-        # 放大
-        tensor = tensor * scale
-        # 翻转 Y 轴（PoseViewer 坐标系向下为正）
-        tensor[..., 1] = -tensor[..., 1]
-        # 居中偏移
-        tensor[..., 0] += offset[0]
-        tensor[..., 1] += offset[1]
-        return tensor
-
+    # ---------------------- Post-process ----------------------
     fut_un  = center_and_scale_pose(fut_un)
     pred_un = center_and_scale_pose(pred_un)
-    print(f"[REMAP] Centered + scaled + flipped Y ✅ | range=({pred_un.min():.2f}, {pred_un.max():.2f})")
-
-    # ========== 时间平滑去闪烁 ==========
-    import torch.nn.functional as F
-    def temporal_smooth(x, k=5):
-        if x.dim() == 4:
-            x = x[0]
-        kernel = torch.ones(k) / k
-        x_pad = torch.nn.functional.pad(x, (0, 0, 0, 0, k//2, k//2))
-        smoothed = torch.stack([
-            torch.conv1d(x_pad[:, j, :].T.unsqueeze(0), kernel.view(1,1,-1), padding=0)[0].T
-            for j in range(x.shape[1])
-        ], dim=1)
-        return smoothed
-
     pred_un = temporal_smooth(pred_un)
-    print("[SMOOTH] Temporal smoothing applied ✅")
+    print("[POST] Center + scale + smooth ✅")
+    print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
 
-    # ========== 生成 Pose 对象并保存 ==========
+    # =====================================================
+    #  Save & visualize
+    # =====================================================
     ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
-    with open(ref_path, "rb") as f:
-        ref_pose = Pose.read(f)
-    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    ref_pose_reduced = reduce_holistic(ref_pose)
-    header = ref_pose_reduced.header
+    print(f"[REF] Using reference pose header from: {ref_path}")
 
-    print("[HEADER] limb counts:", [len(c.limbs) for c in header.components])
-    print("[DEBUG] creating gt_pose and pred_pose ...")
-    print(f"[DEBUG] gt_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
+    try:
+        with open(ref_path, "rb") as f:
+            ref_pose = Pose.read(f)
+        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        header = reduce_holistic(ref_pose).header
+        print("[HEADER] limb counts:", [len(c.limbs) for c in header.components])
+    except Exception as e:
+        print(f"[ERROR] Failed to load or reduce header: {e}")
+        raise
 
-    def tensor_to_pose(t_btjc, header):
-        """将 [T,J,C] 或 [B,T,J,C] tensor 转为 Pose 对象"""
-        t = t_btjc
-        if t.dim() == 4:
-            t = t[0]  # [T,J,C]
-        arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)  # [T,1,J,C]
-        conf = np.ones((arr.shape[0], arr.shape[1], arr.shape[2], 1), dtype=np.float32)  # [T,1,J,1]
-        body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-        return Pose(header=header, body=body)
+    try:
+        gt_pose = tensor_to_pose(fut_un, header)
+        pred_pose = tensor_to_pose(pred_un, header)
+        print(f"[DEBUG] gt_pose frames={len(gt_pose.body.data)}, pred_pose frames={len(pred_pose.body.data)}")
+    except Exception as e:
+        print(f"[ERROR] Failed to create Pose objects: {e}")
+        raise
 
-    gt_pose   = tensor_to_pose(fut_un,  header)
-    pred_pose = tensor_to_pose(pred_un, header)
-
-    out_gt, out_pred = os.path.join(out_dir, "gt_178.pose"), os.path.join(out_dir, "pred_178.pose")
-
+    out_gt = os.path.join(out_dir, "gt_178.pose")
+    out_pred = os.path.join(out_dir, "pred_178.pose")
     for f in [out_gt, out_pred, os.path.join(out_dir, "gt.mp4"), os.path.join(out_dir, "pred.mp4")]:
         if os.path.exists(f):
             os.remove(f)
 
-    with open(out_gt, "wb") as f:
-        gt_pose.write(f)
-    with open(out_pred, "wb") as f:
-        pred_pose.write(f)
-
-    print(f"[SAVE] Reduced 178-joint pose files written → {out_dir}")
+    try:
+        with open(out_gt, "wb") as f: gt_pose.write(f)
+        with open(out_pred, "wb") as f: pred_pose.write(f)
+        print(f"[SAVE] Pose files written → {out_dir}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save pose files: {e}")
+        raise
 
     try:
         p = Pose.read(open(out_pred, "rb"))
@@ -251,8 +212,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERROR] Pose verification failed: {e}")
 
-    # ========== 可视化输出 ==========
-    viz = PoseVisualizer(header)
-    viz.save_video(gt_pose.body, os.path.join(out_dir, "gt.mp4"), fps=25)
-    viz.save_video(pred_pose.body, os.path.join(out_dir, "pred.mp4"), fps=25)
-    print("✅ Visualization videos saved successfully!")
+    try:
+        viz = PoseVisualizer(header)
+        viz.save_video(gt_pose.body, os.path.join(out_dir, "gt.mp4"), fps=25)
+        viz.save_video(pred_pose.body, os.path.join(out_dir, "pred.mp4"), fps=25)
+        print("✅ Visualization videos saved successfully!")
+    except Exception as e:
+        print(f"[ERROR] Visualization failed: {e}")
+
