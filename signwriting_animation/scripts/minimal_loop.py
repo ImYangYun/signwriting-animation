@@ -162,8 +162,18 @@ if __name__ == "__main__":
               f"min={pred_un.min():.2f}, max={pred_un.max():.2f}")
 
     # ---------------------- Post-process ----------------------
+    if hasattr(fut_un, "tensor"):
+        fut_un = fut_un.tensor
+    if hasattr(fut_un, "zero_filled"):
+        fut_un = fut_un.zero_filled()
+    if hasattr(pred_un, "tensor"):
+        pred_un = pred_un.tensor
+    if hasattr(pred_un, "zero_filled"):
+        pred_un = pred_un.zero_filled()
+
     fut_un  = center_and_scale_pose(fut_un)
     pred_un = center_and_scale_pose(pred_un)
+
     pred_un = temporal_smooth(pred_un)
     print("[POST] Center + scale + smooth ✅")
     print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
