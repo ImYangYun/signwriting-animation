@@ -104,7 +104,11 @@ class DynamicPosePredictionDataset(Dataset):
                 raw = self._reduce_holistic_fn(raw)
             except Exception:
                 pass
-        pose = normalize_mean_std(raw)
+        if hasattr(self, "mean_std") and self.mean_std is not None:
+            pose = normalize_mean_std(raw, self.mean_std)
+        else:
+            pose = normalize_mean_std(raw)
+
         total_frames = len(pose.body.data)
 
         if total_frames < 5:
