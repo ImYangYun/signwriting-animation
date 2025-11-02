@@ -9,11 +9,16 @@ from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.pose_visualizer import PoseVisualizer
 from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
-from pose_anonymization.data.normalization import normalize_mean_std, unnormalize_mean_std
+from pose_anonymization.data.normalization import normalize_mean_std
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
+
+def unnormalize_tensor_with_global_stats(tensor: torch.Tensor, mean_std: dict):
+    mean = torch.tensor(mean_std["mean"]).float().to(tensor.device)
+    std = torch.tensor(mean_std["std"]).float().to(tensor.device)
+    return tensor * std + mean
 
 # ---------------------- Dataset wrapper ----------------------
 class FilteredSmallDataset(Dataset):
@@ -154,13 +159,9 @@ if __name__ == "__main__":
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
         # ========== Unnormalize ==========
-        try:
-            fut_un  = unnormalize_mean_std(fut)
-            pred_un = unnormalize_mean_std(pred)
-            print("[UNNORM] Applied unnormalize_mean_std ✅")
-        except Exception as e:
-            print("[WARN] Unnormalize failed, fallback to raw tensor:", e)
-            fut_un, pred_un = _to_plain(fut), _to_plain(pred)
+        fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
+        pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
+        print("[UNNORM] Applied FluentPose-style unnormalize ✅")
 
     def center_and_scale_pose(tensor, scale=800, offset=(500, 500, 0)):
         """居中、放大并翻转Y轴以适配PoseViewer"""
