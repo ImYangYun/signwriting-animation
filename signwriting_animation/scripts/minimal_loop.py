@@ -225,11 +225,14 @@ if __name__ == "__main__":
             os.remove(f)
 
     try:
-        with open(out_gt, "wb") as f: gt_pose.write(f)
-        with open(out_pred, "wb") as f: pred_pose.write(f)
+        with open(out_gt, "wb") as f:
+            gt_pose.write(f)
+        with open(out_pred, "wb") as f:
+            pred_pose.write(f)
         print(f"[SAVE] Pose files written → {out_dir}")
+        print(f"[OK] ✅ Pose objects successfully written: {os.path.basename(out_gt)}, {os.path.basename(out_pred)}")
     except Exception as e:
-        print(f"[ERROR] Failed to save pose files: {e}")
+        print(f"[ERROR] ❌ Failed to save pose files: {e}")
         raise
 
     try:
@@ -239,7 +242,7 @@ if __name__ == "__main__":
         print(f"[ERROR] Pose verification failed: {e}")
 
     try:
-        viz = PoseVisualizer(header)
+        viz = PoseVisualizer(gt_pose.header)
         viz.save_video(gt_pose.body, os.path.join(out_dir, "gt.mp4"), fps=25)
         viz.save_video(pred_pose.body, os.path.join(out_dir, "pred.mp4"), fps=25)
         print("✅ Visualization videos saved successfully!")
