@@ -53,12 +53,12 @@ def _to_plain(x):
     return x.detach().cpu().contiguous().float()
 
 
-def center_and_scale_pose(tensor, scale=300, offset=(0, 0, 0)):
-    """居中、放大并翻转Y轴以适配PoseViewer"""
+def center_and_scale_pose(tensor, scale=1.0, offset=(500, 500, 0)):
+    """居中、翻转Y轴以适配PoseViewer (不再放大scale)"""
     if tensor.dim() == 4:
         tensor = tensor[0]
     center = tensor.mean(dim=1, keepdim=True)
-    tensor = (tensor - center) * scale
+    tensor = tensor - center
     tensor[..., 1] = -tensor[..., 1]
     tensor[..., 0] += offset[0]
     tensor[..., 1] += offset[1]
