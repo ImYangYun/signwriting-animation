@@ -13,6 +13,19 @@ from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
 
+def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
+    """
+    Normalize a Pose object using an externally provided mean/std dict.
+    This replaces the default per-file normalization for global consistency.
+    """
+    pose = pose.clone()
+    mean = torch.tensor(mean_std["mean"]).float()
+    std = torch.tensor(mean_std["std"]).float()
+    data = torch.from_numpy(pose.body.data).float()
+    data = (data - mean) / std
+    pose.body.data = data.numpy()
+    return pose
+
 def _coalesce_maybe_nan(x) -> Optional[int]:
     """Return None if value is NaN/None/empty; else return the value."""
     try:
@@ -71,7 +84,6 @@ class DynamicPosePredictionDataset(Dataset):
                 from pose_format.utils.generic import reduce_holistic as _rh
                 self._reduce_holistic_fn = _rh
             except Exception:
-                # Not fatal; we simply skip reduction if missing
                 self._reduce_holistic_fn = None
 
     def __len__(self):
@@ -104,8 +116,9 @@ class DynamicPosePredictionDataset(Dataset):
                 raw = self._reduce_holistic_fn(raw)
             except Exception:
                 pass
+        
         if hasattr(self, "mean_std") and self.mean_std is not None:
-            pose = normalize_mean_std(raw, self.mean_std)
+            pose = normalize_pose_with_global_stats(raw, self.mean_std)
         else:
             pose = normalize_mean_std(raw)
 
