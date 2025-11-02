@@ -161,6 +161,7 @@ if __name__ == "__main__":
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+        print(f"[DEBUG] pred_un mean={pred_un.mean():.4f}, std={pred_un.std():.4f}, min={pred_un.min():.2f}, max={pred_un.max():.2f}")
 
         if hasattr(fut_un, "zero_filled"):
             fut_un = fut_un.zero_filled()
@@ -170,7 +171,7 @@ if __name__ == "__main__":
         fut_un = fut_un.detach().cpu()
         pred_un = pred_un.detach().cpu()
 
-    def center_and_scale_pose(tensor, scale=800, offset=(500, 500, 0)):
+    def center_and_scale_pose(tensor, scale=100, offset=(500, 500, 0)):
         """居中、放大并翻转Y轴以适配PoseViewer"""
         if tensor.dim() == 4:
             tensor = tensor[0]
@@ -193,14 +194,15 @@ if __name__ == "__main__":
     # ========== 时间平滑去闪烁 ==========
     import torch.nn.functional as F
     def temporal_smooth(x, k=5):
-        """滑动平均滤波，减少帧间抖动"""
-        if x.dim() == 4:  # [B,T,J,C]
+        if x.dim() == 4:
             x = x[0]
-        x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
-        x = F.avg_pool1d(x, kernel_size=k, stride=1, padding=k//2)
-        return x.squeeze(0).permute(2, 1, 0)
-
-    pred_un = temporal_smooth(pred_un)
+        kernel = torch.ones(k) / k
+        x_pad = torch.nn.functional.pad(x, (0, 0, 0, 0, k//2, k//2))
+        smoothed = torch.stack([
+            torch.conv1d(x_pad[:, j, :].T.unsqueeze(0), kernel.view(1,1,-1), padding=0)[0].T
+            for j in range(x.shape[1])
+        ], dim=1)
+        return smoothed
     print("[SMOOTH] Temporal smoothing applied ✅")
 
     # ========== 生成 Pose 对象并保存 ==========
