@@ -135,26 +135,45 @@ class LitMinimal(pl.LightningModule):
         else:
             print(f"[WARN] stats not found → computing global mean/std from {csv_path}")
             from pose_format import Pose
-            import pandas as pd
+            import pandas as pd, random
             df = pd.read_csv(csv_path)
             df = df[df["split"] == "train"].reset_index(drop=True)
 
-            sum_all, sum_sq_all, count = 0.0, 0.0, 0
-            for rec in df.to_dict(orient="records"):
+            records = df.to_dict(orient="records")
+            random.shuffle(records)
+            sample_size = min(500, len(records))
+            records = records[:sample_size]
+            print(f"[INFO] Using {sample_size} samples to estimate mean/std")
+
+            sum_all = torch.zeros(3)
+            sum_sq_all = torch.zeros(3)
+            count = 0
+
+            for i, rec in enumerate(records):
                 pose_path = os.path.join(data_dir, rec["pose"])
                 if not os.path.exists(pose_path):
                     continue
-                with open(pose_path, "rb") as f:
-                    p = Pose.read(f)
+                try:
+                    with open(pose_path, "rb") as f:
+                        p = Pose.read(f)
                     arr = torch.tensor(p.body.data, dtype=torch.float32)  # [T,P,J,C]
                     arr = arr.view(-1, arr.shape[-1])  # [T*P*J, C]
                     sum_all += arr.sum(dim=0)
                     sum_sq_all += (arr ** 2).sum(dim=0)
                     count += arr.shape[0]
+                except Exception as e:
+                    print(f"[WARN] Failed on {pose_path}: {e}")
+                    continue
+
+                if (i + 1) % 50 == 0 or (i + 1) == sample_size:
+                    print(f"[INFO] Processed {i+1}/{sample_size} files...")
+
+            # ✅ Step 4: 计算 mean/std 并保存
             mean = sum_all / count
             std = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
             torch.save({"mean": mean, "std": std}, stats_path)
             print(f"[Saved new mean/std] → {stats_path}")
+
 
         # register buffer
         self.register_buffer("mean_pose", mean)
