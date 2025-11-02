@@ -78,6 +78,8 @@ if __name__ == "__main__":
     out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
+    mean_std_path = os.path.join(data_dir, "mean_std.pt")
+
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -87,6 +89,9 @@ if __name__ == "__main__":
         split="train",
         reduce_holistic=True,
     )
+
+    base_ds.mean_std = torch.load(mean_std_path)
+    print(f"[NORM] Loaded mean/std from {mean_std_path}")
 
     small_ds = torch.utils.data.Subset(base_ds, list(range(min(4, len(base_ds)))))
     print(f"[DEBUG] Using subset of {len(small_ds)} samples for overfit test")
@@ -140,14 +145,13 @@ if __name__ == "__main__":
 
         # ========== Unnormalize ==========
         try:
-            fut_un  = unnormalize_mean_std(fut)
-            pred_un = unnormalize_mean_std(pred)
+            fut_un  = unnormalize_mean_std(fut, mean_std_path)
+            pred_un = unnormalize_mean_std(pred, mean_std_path)
             print("[UNNORM] Applied unnormalize_mean_std ✅")
         except Exception as e:
             print("[WARN] Unnormalize failed, fallback to raw tensor:", e)
             fut_un, pred_un = fut.detach().cpu(), pred.detach().cpu()
 
-    # ========== 坐标重心平移 + 缩放 + Y轴翻转 ==========
     def center_and_scale_pose(tensor, scale=800, offset=(500, 500, 0)):
         """居中、放大并翻转Y轴以适配PoseViewer"""
         if tensor.dim() == 4:
