@@ -66,15 +66,27 @@ def center_and_scale_pose(tensor, scale=300, offset=(0, 0, 0)):
 
 
 def temporal_smooth(x, k=5):
-    """时间维平滑：减少帧间抖动"""
+    """对时间维进行平滑，减少抖动 (x: [T, J, C])"""
     import torch.nn.functional as F
+
+    # 如果输入是 [B,T,J,C]，只取 batch 0
     if x.dim() == 4:
-        x = x[0]  # [T,J,C]
+        x = x[0]
+    # 如果输入是 [T,1,J,C]（多了一维P）
+    if x.dim() == 5 and x.shape[2] == 1:
+        x = x.squeeze(2)
+
     T, J, C = x.shape
-    x = x.contiguous().float()
-    x = x.permute(2, 1, 0).unsqueeze(0)  # [1,C,J,T]
-    x = F.avg_pool1d(x.reshape(1, C*J, T), kernel_size=k, stride=1, padding=k//2)
-    x = x.reshape(1, C, J, T).squeeze(0).permute(3, 2, 1).contiguous()
+    x = x.contiguous().float()  # 确保内存连续
+
+    # [T,J,C] → [1, C*J, T]
+    x = x.permute(2, 1, 0).reshape(1, C * J, T)
+
+    # 在时间维上平均池化平滑
+    x = F.avg_pool1d(x, kernel_size=k, stride=1, padding=k // 2)
+
+    # [1, C*J, T] → [T, J, C]
+    x = x.reshape(C, J, T).permute(2, 1, 0).contiguous()
     return x
 
 
