@@ -94,7 +94,14 @@ if __name__ == "__main__":
     print(f"[NORM] Loaded mean/std from {mean_std_path}")
 
     first = base_ds[0]["data"]
-    print("[CHECK] raw data mean/std:", first.mean().item(), first.std().item())
+
+    if hasattr(first, "tensor"):
+        first = first.tensor
+    if hasattr(first, "zero_filled"):
+        first = first.zero_filled()
+
+    print("[CHECK] raw data mean/std:",
+        first.mean().item(), first.std().item())
 
     small_ds = torch.utils.data.Subset(base_ds, list(range(min(4, len(base_ds)))))
     print(f"[DEBUG] Using subset of {len(small_ds)} samples for overfit test")
