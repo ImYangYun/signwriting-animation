@@ -144,7 +144,6 @@ if __name__ == "__main__":
     trainer.fit(model, loader, loader)
 
 
-        # 3️⃣ 推理测试 + 可视化保存
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -158,10 +157,18 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # ========== Unnormalize ==========
+       # ========== Unnormalize ==========
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+
+        if hasattr(fut_un, "zero_filled"):
+            fut_un = fut_un.zero_filled()
+        if hasattr(pred_un, "zero_filled"):
+            pred_un = pred_un.zero_filled()
+
+        fut_un = fut_un.detach().cpu()
+        pred_un = pred_un.detach().cpu()
 
     def center_and_scale_pose(tensor, scale=800, offset=(500, 500, 0)):
         """居中、放大并翻转Y轴以适配PoseViewer"""
@@ -219,11 +226,18 @@ if __name__ == "__main__":
     pred_pose = tensor_to_pose(pred_un, header)
 
     out_gt, out_pred = os.path.join(out_dir, "gt_178.pose"), os.path.join(out_dir, "pred_178.pose")
-    with open(out_gt, "wb") as f: gt_pose.write(f)
-    with open(out_pred, "wb") as f: pred_pose.write(f)
+
+    for f in [out_gt, out_pred, os.path.join(out_dir, "gt.mp4"), os.path.join(out_dir, "pred.mp4")]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    with open(out_gt, "wb") as f:
+        gt_pose.write(f)
+    with open(out_pred, "wb") as f:
+        pred_pose.write(f)
+
     print(f"[SAVE] Reduced 178-joint pose files written → {out_dir}")
 
-    # ✅ 验证结构
     try:
         p = Pose.read(open(out_pred, "rb"))
         print("[CHECK] Pose OK ✅ limbs:", [len(c.limbs) for c in p.header.components])
