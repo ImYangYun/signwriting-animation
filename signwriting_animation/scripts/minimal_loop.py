@@ -199,12 +199,19 @@ if __name__ == "__main__":
         print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, "
               f"mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
+        print("[STEP] finished printing pred stats", flush=True)
+        import torch, sys
+        torch.cuda.synchronize()
+        print("[STEP] GPU sync OK", flush=True)
+        sys.stdout.flush()
+        print("[STEP] going to clamp...", flush=True)
+
         # ---- clamp ----
         print("[STEP] before clamp", flush=True)
         pred = torch.clamp(pred, -3, 3)
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
         print("[STEP] after clamp", flush=True)
-        
+
         # ---- unnormalize ----
         mean_std = _unwrap_mean_std(base_ds.mean_std)
         fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
