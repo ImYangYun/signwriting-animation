@@ -150,6 +150,11 @@ if __name__ == "__main__":
     )
     print(f"[TRAIN] Overfitting on 4 samples × {shape[-2]} joints × {shape[-1]} dims")
     trainer.fit(model, loader, loader)
+    # ---- monitor training loss ----
+    if hasattr(model, "loss_history"):
+        print("[TRAIN] Final loss:", model.loss_history[-1])
+    else:
+        print("[WARN] model has no loss_history, check Lightning logging")
 
     # ---------------------- Evaluation ----------------------
     model.eval()
@@ -164,6 +169,15 @@ if __name__ == "__main__":
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
+
+        # ---- value diagnostics ----
+        print(f"[DEBUG] pred has NaN? {torch.isnan(pred).any().item()}")
+        print(f"[DEBUG] pred range: min={pred.min().item():.3f}, max={pred.max().item():.3f}")
+        print(f"[DEBUG] fut  range: min={fut.min().item():.3f}, max={fut.max().item():.3f}")
+
+        # shape sanity
+        print(f"[SHAPE] pred {tuple(pred.shape)}, fut {tuple(fut.shape)}, mask {tuple(mask.shape)}")
+
 
         # ---- plain tensors ----
         for name in ["fut", "pred"]:
@@ -191,6 +205,9 @@ if __name__ == "__main__":
         fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+
+        print(f"[CHECK] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
+        print(f"[CHECK] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
 
         # ---- temporal smooth ----
         fut_un  = temporal_smooth(fut_un)
