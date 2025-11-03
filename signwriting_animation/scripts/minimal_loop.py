@@ -164,10 +164,14 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        if hasattr(pred, "tensor"):
-            pred = pred.tensor
-        if hasattr(pred, "zero_filled"):
-            pred = pred.zero_filled()
+        # --- Convert MaskedTensor → plain tensor ---
+    for x_name in ["fut", "pred"]:
+        x = locals()[x_name]
+        if hasattr(x, "tensor"):
+            x = x.tensor
+        if hasattr(x, "zero_filled"):
+            x = x.zero_filled()
+        locals()[x_name] = x
         
         print(f"[CHECK fut range] min={fut.min().item():.2f}, max={fut.max().item():.2f}, mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
         print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
