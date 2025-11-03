@@ -160,13 +160,14 @@ if __name__ == "__main__":
 
     # ---------------------- Evaluation ----------------------
     model.eval()
+    model = model.cpu()
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
-        past = cond["input_pose"][:1].to(model.device)
-        sign = cond["sign_image"][:1].to(model.device)
-        fut  = batch["data"][:1].to(model.device)
-        mask = cond["target_mask"][:1].to(model.device)
+        past = cond["input_pose"][:1].cpu()
+        sign = cond["sign_image"][:1].cpu()
+        fut  = batch["data"][:1].cpu()
+        mask = cond["target_mask"][:1].cpu()
 
         print("[STEP] before generate_full_sequence", flush=True)
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
