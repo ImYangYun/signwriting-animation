@@ -67,20 +67,24 @@ def temporal_smooth(x, k=5):
     return x
 
 
-def recenter_for_view(x, offset=(512, 384, 0)):
-    """整段(T×J)居中并加偏移，使人物位于可视化中心"""
-    if hasattr(x, "tensor"):
-        x = x.tensor
-    if hasattr(x, "zero_filled"):
-        x = x.zero_filled()
-    if x.dim() == 5 and x.shape[2] == 1:
-        x = x.squeeze(2)
-    if x.dim() == 4:
-        x = x.mean(dim=0)  # 更稳妥：取 batch 均值而非仅第0样本
+def recenter_for_view(x, offset=(0, 0, 0)):
+    if hasattr(x, "tensor"): x = x.tensor
+    if hasattr(x, "zero_filled"): x = x.zero_filled()
+    if x.dim() == 5 and x.shape[2] == 1: x = x.squeeze(2)
+    if x.dim() == 4: x = x.mean(dim=0)
+
     center = x.mean(dim=(0, 1), keepdim=True)
     x = x - center
-    x[..., 0] += offset[0]
-    x[..., 1] += offset[1]
+
+    min_xy = x[..., :2].min(dim=1)[0].min(dim=0)[0]  # [2]
+    max_xy = x[..., :2].max(dim=1)[0].max(dim=0)[0]  # [2]
+    span = max_xy - min_xy
+
+    offset_x = 512 - span[0] / 2
+    offset_y = 384 - span[1] / 2
+
+    x[..., 0] += offset_x + offset[0]
+    x[..., 1] += offset_y + offset[1]
     return x.contiguous().float()
 
 
@@ -107,7 +111,7 @@ if __name__ == "__main__":
     out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
-    mean_std_path = os.path.join(data_dir, "mean_std.pt")
+    mean_std_path = os.path.join(data_dir, "mean_std_178.pt")
 
     # ---------------------- Dataset ----------------------
     base_ds = DynamicPosePredictionDataset(
