@@ -168,6 +168,9 @@ if __name__ == "__main__":
             pred = pred.tensor
         if hasattr(pred, "zero_filled"):
             pred = pred.zero_filled()
+        
+        print(f"[CHECK fut range] min={fut.min().item():.2f}, max={fut.max().item():.2f}, mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
+        print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
         print(f"[DEBUG raw pred range] min={pred.min().item():.3f}, max={pred.max().item():.3f}, mean={pred.mean().item():.3f}, std={pred.std().item():.3f}")
         # --- Clamp explosion ---
@@ -175,9 +178,11 @@ if __name__ == "__main__":
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
 
         # --- Unnormalize ---
-        fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
-        pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
-        print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+        #fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
+        #pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
+        fut_un  = fut[0].cpu()
+        pred_un = pred[0].cpu()
+        print("[UNNORM] Skipped, model already outputs in original coordinate space ✅")
 
         # --- Center per-frame across joints (prevent sliding) ---
         fut_un = fut_un - fut_un.mean(dim=2, keepdim=True)
