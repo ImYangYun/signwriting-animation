@@ -14,8 +14,6 @@ from pose_anonymization.data.normalization import normalize_mean_std
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
-import sys
-sys.stdout.reconfigure(line_buffering=True)
 
 # ============================================================
 #  Utility Functions
@@ -141,47 +139,31 @@ if __name__ == "__main__":
     # ---------------------- Training ----------------------
     model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=5e-4, log_dir=out_dir)
     trainer = pl.Trainer(
-        max_epochs=200,
+        max_epochs=500,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         limit_train_batches=1,
         limit_val_batches=1,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         enable_checkpointing=False,
         deterministic=True,
     )
     print(f"[TRAIN] Overfitting on 4 samples × {shape[-2]} joints × {shape[-1]} dims")
     trainer.fit(model, loader, loader)
-    # ---- monitor training loss ----
-    if hasattr(model, "loss_history"):
-        print("[TRAIN] Final loss:", model.loss_history[-1])
-    else:
-        print("[WARN] model has no loss_history, check Lightning logging")
 
     # ---------------------- Evaluation ----------------------
     model.eval()
-    model = model.cpu()
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
-        past = cond["input_pose"][:1].cpu()
-        sign = cond["sign_image"][:1].cpu()
-        fut  = batch["data"][:1].cpu()
-        mask = cond["target_mask"][:1].cpu()
+        past = cond["input_pose"][:1].to(model.device)
+        sign = cond["sign_image"][:1].to(model.device)
+        fut  = batch["data"][:1].to(model.device)
+        mask = cond["target_mask"][:1].to(model.device)
 
-        print("[STEP] before generate_full_sequence", flush=True)
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
-
-        # ---- value diagnostics ----
-        print(f"[DEBUG] pred has NaN? {torch.isnan(pred).any().item()}")
-        print(f"[DEBUG] pred range: min={pred.min().item():.3f}, max={pred.max().item():.3f}")
-        print(f"[DEBUG] fut  range: min={fut.min().item():.3f}, max={fut.max().item():.3f}")
-
-        # shape sanity
-        print(f"[SHAPE] pred {tuple(pred.shape)}, fut {tuple(fut.shape)}, mask {tuple(mask.shape)}")
-
 
         # ---- plain tensors ----
         for name in ["fut", "pred"]:
@@ -200,27 +182,15 @@ if __name__ == "__main__":
         print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, "
               f"mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
-        print("[STEP] finished printing pred stats", flush=True)
-        import torch, sys
-        torch.cuda.synchronize()
-        print("[STEP] GPU sync OK", flush=True)
-        sys.stdout.flush()
-        print("[STEP] going to clamp...", flush=True)
-
         # ---- clamp ----
-        print("[STEP] before clamp", flush=True)
         pred = torch.clamp(pred, -3, 3)
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
-        print("[STEP] after clamp", flush=True)
 
         # ---- unnormalize ----
         mean_std = _unwrap_mean_std(base_ds.mean_std)
         fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
-
-        print(f"[CHECK] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
-        print(f"[CHECK] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
 
         # ---- temporal smooth ----
         fut_un  = temporal_smooth(fut_un)
