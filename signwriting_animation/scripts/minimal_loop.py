@@ -169,6 +169,7 @@ if __name__ == "__main__":
         if hasattr(pred, "zero_filled"):
             pred = pred.zero_filled()
 
+        print(f"[DEBUG raw pred range] min={pred.min().item():.3f}, max={pred.max().item():.3f}, mean={pred.mean().item():.3f}, std={pred.std().item():.3f}")
         # --- Clamp explosion ---
         pred = torch.clamp(pred, -3, 3)
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
