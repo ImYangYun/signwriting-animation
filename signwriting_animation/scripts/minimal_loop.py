@@ -182,10 +182,10 @@ if __name__ == "__main__":
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
 
         # --- Unnormalize ---
-        #fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
-        #pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
-        fut_un  = fut[0].cpu()
-        pred_un = pred[0].cpu()
+        fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
+        pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
+        #fut_un  = fut[0].cpu()
+        #pred_un = pred[0].cpu()
         print("[UNNORM] Skipped, model already outputs in original coordinate space ✅")
 
         # --- Center per-frame across joints (prevent sliding) ---
