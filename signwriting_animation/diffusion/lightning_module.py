@@ -115,7 +115,7 @@ class LitMinimal(pl.LightningModule):
     def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs",
                 stats_path="/data/yayun/pose_data/mean_std.pt",
                 data_dir="/data/yayun/pose_data",
-                csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):  # 🟩 新增路径参数
+                csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):
         super().__init__()
         self.save_hyperparameters()
 
@@ -127,7 +127,6 @@ class LitMinimal(pl.LightningModule):
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
 
-        # 🟩 自动加载或计算 mean/std
         if os.path.exists(stats_path):
             stats = torch.load(stats_path, map_location="cpu")
             mean, std = stats["mean"].float(), stats["std"].float()
@@ -168,7 +167,6 @@ class LitMinimal(pl.LightningModule):
                 if (i + 1) % 50 == 0 or (i + 1) == sample_size:
                     print(f"[INFO] Processed {i+1}/{sample_size} files...")
 
-            # ✅ Step 4: 计算 mean/std 并保存
             mean = sum_all / count
             std = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
             torch.save({"mean": mean, "std": std}, stats_path)
@@ -224,6 +222,18 @@ class LitMinimal(pl.LightningModule):
         pred_std = pred[..., :2].std()
         scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
         loss = loss + 0.15 * scale_loss
+
+        def torso_center(btjc):
+            torso_end = min(33, btjc.size(2))
+            return btjc[..., :torso_end, :2].mean(dim=(1,2))  # [B,2]
+
+        c_gt = torso_center(fut)    # fut/pred 都是标准化域
+        c_pr = torso_center(pred)
+        center_loss = ((c_pr - c_gt) ** 2).mean()
+        loss = loss + 0.05 * center_loss
+
+        self.log("train/scale_loss", scale_loss)
+        self.log("train/center_loss", center_loss)
 
         # ---- Logging ----
         self.log("train/scale_loss", scale_loss)

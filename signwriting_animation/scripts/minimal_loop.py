@@ -67,7 +67,7 @@ def temporal_smooth(x, k=5):
     return x
 
 
-def recenter_for_view(x, offset=(0, 0, 0), target_shoulder_px=260):
+def recenter_for_view(x, offset=(0, 0, 0)):
     if hasattr(x, "tensor"): x = x.tensor
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     if x.dim() == 5 and x.shape[2] == 1: x = x.squeeze(2)
@@ -77,20 +77,10 @@ def recenter_for_view(x, offset=(0, 0, 0), target_shoulder_px=260):
     torso_end = min(33, J)
     torso_xy = x[:, :torso_end, :2]
 
-    mean_center = torso_xy.mean(dim=(0,1), keepdim=True)
-    median_center = torso_xy.median(dim=1).values.median(dim=0, keepdim=True).values  # [1,2]
-    median_center = median_center.view(1,1,2)
+    mean_center = torso_xy.mean(dim=(0,1), keepdim=True)  # [1,1,2]
+    median_center = torso_xy.median(dim=1).values.median(dim=0, keepdim=True).values.view(1,1,2)
     center = 0.5 * (mean_center + median_center)
     x[..., :2] -= center[..., :2]
-
-    if J >= 13:
-        L, R = 11, 12
-        sh = x[:, [L, R], :2]                                # [T,2,2]
-        sh_dist = torch.linalg.norm(sh[:,0] - sh[:,1], dim=-1)  # [T]
-        med_sh = sh_dist.median()
-        if torch.isfinite(med_sh) and med_sh > 1e-3:
-            scale = (target_shoulder_px / med_sh).clamp(0.5, 3.0)  # 避免过大缩放
-            x[..., :2] = x[..., :2] * scale
 
     flat_xy = x[..., :2].reshape(T * J, 2)
     q02 = torch.quantile(flat_xy, 0.02, dim=0)
@@ -101,6 +91,7 @@ def recenter_for_view(x, offset=(0, 0, 0), target_shoulder_px=260):
     offset_y = 384 - span[1] / 2
     x[..., 0] += offset_x + offset[0]
     x[..., 1] += offset_y + offset[1]
+
     return x.contiguous().float()
 
 
@@ -207,6 +198,8 @@ if __name__ == "__main__":
         fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+        print("[DEBUG unnorm] fut mean/std:", fut_un.mean().item(), fut_un.std().item())
+        print("[DEBUG unnorm] pred mean/std:", pred_un.mean().item(), pred_un.std().item())
 
         # ---- temporal smooth ----
         fut_un  = temporal_smooth(fut_un)
