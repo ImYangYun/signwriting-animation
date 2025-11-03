@@ -48,9 +48,17 @@ class FilteredSmallDataset(Dataset):
 
 
 def _to_plain(x):
-    if hasattr(x, "tensor"): x = x.tensor
-    if hasattr(x, "zero_filled"): x = x.zero_filled()
-    return x.detach().cpu().contiguous().float()
+    """Convert pose_format.MaskedTensor or Lightning output to plain [B,T,J,C] torch.Tensor"""
+    if hasattr(x, "tensor"):
+        x = x.tensor
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
+
+    # squeeze person dimension if present, e.g. [B,T,1,J,C] -> [B,T,J,C]
+    if x.dim() == 5 and x.shape[2] == 1:
+        x = x.squeeze(2)
+
+    return x.detach().contiguous().float()
 
 
 def center_and_scale_pose(tensor, scale=1.0, offset=(500, 500, 0)):
@@ -164,55 +172,56 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # --- Convert MaskedTensor → plain tensor ---
+        # --- Convert MaskedTensor → plain [B,T,J,C] tensors ---
     for x_name in ["fut", "pred"]:
         x = locals()[x_name]
         if hasattr(x, "tensor"):
             x = x.tensor
         if hasattr(x, "zero_filled"):
             x = x.zero_filled()
+        if x.dim() == 5 and x.shape[2] == 1:
+            x = x.squeeze(2)
         locals()[x_name] = x
-        
-        print(f"[CHECK fut range] min={fut.min().item():.2f}, max={fut.max().item():.2f}, mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
-        print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
-        print(f"[DEBUG raw pred range] min={pred.min().item():.3f}, max={pred.max().item():.3f}, mean={pred.mean().item():.3f}, std={pred.std().item():.3f}")
-        # --- Clamp explosion ---
-        pred = torch.clamp(pred, -3, 3)
-        print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
+    # --- Check raw ranges before clamp ---
+    print(f"[CHECK fut range] min={fut.min().item():.2f}, max={fut.max().item():.2f}, mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
+    print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
-        # --- Unnormalize ---
-        fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
-        pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
-        #fut_un  = fut[0].cpu()
-        #pred_un = pred[0].cpu()
-        print("[UNNORM] Skipped, model already outputs in original coordinate space ✅")
+    # --- Clamp explosion (keep within normalized range) ---
+    pred = torch.clamp(pred, -3, 3)
+    print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
 
-        # --- Center per-frame across joints (prevent sliding) ---
-        fut_un = fut_un - fut_un.mean(dim=2, keepdim=True)
-        pred_un = pred_un - pred_un.mean(dim=2, keepdim=True)
+    # --- Unnormalize (FluentPose-style global stats) ---
+    fut_un  = unnormalize_tensor_with_global_stats(fut,  base_ds.mean_std)
+    pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
+    print("[UNNORM] Applied FluentPose-style unnormalize ✅")
 
-        # --- Convert to plain tensors ---
-        for x_name in ["fut_un", "pred_un"]:
-            x = locals()[x_name]
-            if hasattr(x, "tensor"):
-                x = x.tensor
-            if hasattr(x, "zero_filled"):
-                x = x.zero_filled()
-            locals()[x_name] = x
 
-        # --- Remove person dim if present ---
-        if fut_un.dim() == 5 and fut_un.shape[2] == 1:
-            fut_un = fut_un.squeeze(2)
-        if pred_un.dim() == 5 and pred_un.shape[2] == 1:
-            pred_un = pred_un.squeeze(2)
+    # --- Center per-frame across joints (prevent sliding) ---
+    fut_un = fut_un - fut_un.mean(dim=2, keepdim=True)
+    pred_un = pred_un - pred_un.mean(dim=2, keepdim=True)
 
-        # --- Smooth ---
-        fut_un  = temporal_smooth(fut_un)
-        pred_un = temporal_smooth(pred_un)
+    # --- Convert to plain tensors ---
+    for x_name in ["fut_un", "pred_un"]:
+        x = locals()[x_name]
+        if hasattr(x, "tensor"):
+            x = x.tensor
+        if hasattr(x, "zero_filled"):
+            x = x.zero_filled()
+        locals()[x_name] = x
 
-        print(f"[DEBUG] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
-        print(f"[DEBUG] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
+    # --- Remove person dim if present ---
+    if fut_un.dim() == 5 and fut_un.shape[2] == 1:
+        fut_un = fut_un.squeeze(2)
+    if pred_un.dim() == 5 and pred_un.shape[2] == 1:
+        pred_un = pred_un.squeeze(2)
+
+    # --- Smooth ---
+    fut_un  = temporal_smooth(fut_un)
+    pred_un = temporal_smooth(pred_un)
+
+    print(f"[DEBUG] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
+    print(f"[DEBUG] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
 
 
 
