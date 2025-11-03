@@ -166,10 +166,13 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
+        pred = torch.clamp(pred, -3, 3)
         # -- Unnormalize --
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+
+        fut_un = fut_un - fut_un.mean(dim=(0,1), keepdim=True)
 
         # -- Convert to plain tensors --
         for x_name in ["fut_un", "pred_un"]:
@@ -191,8 +194,9 @@ if __name__ == "__main__":
         fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
 
-        #print("[POST] Center + scale + smooth ✅")
         print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
+        print(f"[DEBUG] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
+        print(f"[DEBUG] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
 
     # =====================================================
     #  Save & visualize
@@ -220,7 +224,7 @@ if __name__ == "__main__":
 
     out_gt = os.path.join(out_dir, "gt_178.pose")
     out_pred = os.path.join(out_dir, "pred_178.pose")
-    for f in [out_gt, out_pred, os.path.join(out_dir, "gt.mp4"), os.path.join(out_dir, "pred.mp4")]:
+    for f in [out_gt, out_pred]:
         if os.path.exists(f):
             os.remove(f)
 
@@ -240,11 +244,3 @@ if __name__ == "__main__":
         print("[CHECK] Pose OK ✅ limbs:", [len(c.limbs) for c in p.header.components])
     except Exception as e:
         print(f"[ERROR] Pose verification failed: {e}")
-
-    try:
-        viz = PoseVisualizer(gt_pose.header)
-        viz.save_video(gt_pose.body, os.path.join(out_dir, "gt.mp4"), fps=25)
-        viz.save_video(pred_pose.body, os.path.join(out_dir, "pred.mp4"), fps=25)
-        print("✅ Visualization videos saved successfully!")
-    except Exception as e:
-        print(f"[ERROR] Visualization failed: {e}")
