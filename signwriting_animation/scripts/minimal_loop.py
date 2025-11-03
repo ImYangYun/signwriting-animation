@@ -166,15 +166,22 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
+        # -- Ensure plain tensor before clamp --
+        if hasattr(pred, "tensor"):
+            pred = pred.tensor
+        if hasattr(pred, "zero_filled"):
+            pred = pred.zero_filled()
+
         pred = torch.clamp(pred, -3, 3)
+
         # -- Unnormalize --
         fut_un  = unnormalize_tensor_with_global_stats(fut, base_ds.mean_std)
         pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
         print("[UNNORM] Applied FluentPose-style unnormalize ✅")
 
-        fut_un = fut_un - fut_un.mean(dim=(0,1), keepdim=True)
+        fut_un = fut_un - fut_un.mean(dim=1, keepdim=True)
+        pred_un = pred_un - pred_un.mean(dim=1, keepdim=True)
 
-        # -- Convert to plain tensors --
         for x_name in ["fut_un", "pred_un"]:
             x = locals()[x_name]
             if hasattr(x, "tensor"):
@@ -189,18 +196,13 @@ if __name__ == "__main__":
         if pred_un.dim() == 5 and pred_un.shape[2] == 1:
             pred_un = pred_un.squeeze(2)
 
-        # -- Center / scale / smooth --
-        # NOTE: only smooth, do NOT scale before saving
         fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
 
-        print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
         print(f"[DEBUG] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
         print(f"[DEBUG] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
 
-    # =====================================================
-    #  Save & visualize
-    # =====================================================
+
     ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
     print(f"[REF] Using reference pose header from: {ref_path}")
 
