@@ -67,25 +67,38 @@ def temporal_smooth(x, k=5):
     return x
 
 
-def recenter_for_view(x, offset=(0, 0, 0)):
+def recenter_for_view(x, offset=(0, 0, 0), target_shoulder_px=260):
     if hasattr(x, "tensor"): x = x.tensor
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     if x.dim() == 5 and x.shape[2] == 1: x = x.squeeze(2)
-    if x.dim() == 4: x = x.mean(dim=0)
+    if x.dim() == 4: x = x.mean(dim=0)  # [T,J,C]
 
-    num_joints = x.shape[1]
-    torso_end = min(33, num_joints)
-    center = x[:, :torso_end, :2].mean(dim=(0, 1), keepdim=True)
-    x[..., :2] -= center
+    T, J, C = x.shape
+    torso_end = min(33, J)
+    torso_xy = x[:, :torso_end, :2]
 
+    mean_center = torso_xy.mean(dim=(0,1), keepdim=True)
+    median_center = torso_xy.median(dim=1).values.median(dim=0, keepdim=True).values  # [1,2]
+    median_center = median_center.view(1,1,2)
+    center = 0.5 * (mean_center + median_center)
+    x[..., :2] -= center[..., :2]
 
-    min_xy = x[..., :2].min(dim=1)[0].min(dim=0)[0]  # [2]
-    max_xy = x[..., :2].max(dim=1)[0].max(dim=0)[0]  # [2]
-    span = max_xy - min_xy
+    if J >= 13:
+        L, R = 11, 12
+        sh = x[:, [L, R], :2]                                # [T,2,2]
+        sh_dist = torch.linalg.norm(sh[:,0] - sh[:,1], dim=-1)  # [T]
+        med_sh = sh_dist.median()
+        if torch.isfinite(med_sh) and med_sh > 1e-3:
+            scale = (target_shoulder_px / med_sh).clamp(0.5, 3.0)  # 避免过大缩放
+            x[..., :2] = x[..., :2] * scale
+
+    flat_xy = x[..., :2].reshape(T * J, 2)
+    q02 = torch.quantile(flat_xy, 0.02, dim=0)
+    q98 = torch.quantile(flat_xy, 0.98, dim=0)
+    span = (q98 - q02).clamp(min=1.0)
 
     offset_x = 512 - span[0] / 2
     offset_y = 384 - span[1] / 2
-
     x[..., 0] += offset_x + offset[0]
     x[..., 1] += offset_y + offset[1]
     return x.contiguous().float()
@@ -140,7 +153,7 @@ if __name__ == "__main__":
     print(f"[INFO] Overfit set shape: {tuple(shape)}")
 
     # ---------------------- Training ----------------------
-    model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=5e-4, log_dir=out_dir)
+    model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=1e-4, log_dir=out_dir)
     trainer = pl.Trainer(
         max_epochs=500,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
