@@ -201,21 +201,6 @@ if __name__ == "__main__":
     fut_un = fut_un - fut_un.mean(dim=2, keepdim=True)
     pred_un = pred_un - pred_un.mean(dim=2, keepdim=True)
 
-    # --- Convert to plain tensors ---
-    for x_name in ["fut_un", "pred_un"]:
-        x = locals()[x_name]
-        if hasattr(x, "tensor"):
-            x = x.tensor
-        if hasattr(x, "zero_filled"):
-            x = x.zero_filled()
-        locals()[x_name] = x
-
-    # --- Remove person dim if present ---
-    if fut_un.dim() == 5 and fut_un.shape[2] == 1:
-        fut_un = fut_un.squeeze(2)
-    if pred_un.dim() == 5 and pred_un.shape[2] == 1:
-        pred_un = pred_un.squeeze(2)
-
     # --- Smooth ---
     fut_un  = temporal_smooth(fut_un)
     pred_un = temporal_smooth(pred_un)
