@@ -15,7 +15,12 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
 
+# ============================================================
+#  Utility Functions
+# ============================================================
+
 def unnormalize_tensor_with_global_stats(tensor: torch.Tensor, mean_std: dict):
+    """反归一化：x * std + mean"""
     if torch.is_tensor(mean_std["mean"]):
         mean = mean_std["mean"].detach().clone().float().to(tensor.device)
         std = mean_std["std"].detach().clone().float().to(tensor.device)
@@ -24,81 +29,63 @@ def unnormalize_tensor_with_global_stats(tensor: torch.Tensor, mean_std: dict):
         std = torch.tensor(mean_std["std"], dtype=torch.float32, device=tensor.device)
     return tensor * std + mean
 
-class FilteredSmallDataset(Dataset):
-    """从大 dataset 中挑出 N 条合法样本（非空 pose）用于过拟合测试"""
-    def __init__(self, base_ds, num_samples=4, max_scan=500):
-        self.base = base_ds
-        self.valid_idx = []
-        for i in range(min(len(base_ds), max_scan)):
-            try:
-                sample = base_ds[i]
-                if isinstance(sample, dict) and "data" in sample:
-                    if sample["data"].shape[1] > 5:
-                        self.valid_idx.append(i)
-                if len(self.valid_idx) >= num_samples:
-                    break
-            except Exception:
-                continue
-        if len(self.valid_idx) < num_samples:
-            print(f"[WARN] only {len(self.valid_idx)} valid samples found")
-        print(f"[INIT] Selected {len(self.valid_idx)} samples for overfit test.")
 
-    def __len__(self): return len(self.valid_idx)
-    def __getitem__(self, i): return self.base[self.valid_idx[i]]
+def _unwrap_mean_std(ms):
+    """兼容多种 mean/std 存储格式"""
+    if isinstance(ms, dict):
+        return ms
+    elif hasattr(ms, "mean") and hasattr(ms, "std"):
+        return {"mean": ms.mean, "std": ms.std}
+    elif isinstance(ms, (list, tuple)) and len(ms) == 2:
+        return {"mean": ms[0], "std": ms[1]}
+    else:
+        raise ValueError(f"Unsupported mean_std format: {type(ms)}")
 
 
 def _to_plain(x):
-    """Convert pose_format.MaskedTensor or Lightning output to plain [B,T,J,C] torch.Tensor"""
+    """Convert MaskedTensor or Lightning output to plain [B,T,J,C] tensor"""
     if hasattr(x, "tensor"):
         x = x.tensor
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
-
-    # squeeze person dimension if present, e.g. [B,T,1,J,C] -> [B,T,J,C]
     if x.dim() == 5 and x.shape[2] == 1:
         x = x.squeeze(2)
-
     return x.detach().contiguous().float()
 
 
-def center_and_scale_pose(tensor, scale=1.0, offset=(500, 500, 0)):
-    """居中、翻转Y轴以适配PoseViewer (不再放大scale)"""
-    if tensor.dim() == 4:
-        tensor = tensor[0]
-    center = tensor.mean(dim=1, keepdim=True)
-    tensor = tensor - center
-    tensor[..., 0] += offset[0]
-    tensor[..., 1] += offset[1]
-    return tensor
-
-
 def temporal_smooth(x, k=5):
-    """对时间维进行平滑，减少抖动 (x: [T, J, C])"""
+    """对时间维平滑，减少抖动 (x: [B,T,J,C] 或 [T,J,C])"""
     import torch.nn.functional as F
-
-    # 如果输入是 [B,T,J,C]，只取 batch 0
-    if x.dim() == 4:
-        x = x[0]
-    # 如果输入是 [T,1,J,C]（多了一维P）
     if x.dim() == 5 and x.shape[2] == 1:
         x = x.squeeze(2)
-
+    if x.dim() == 4:
+        x = x[0]
     T, J, C = x.shape
-    x = x.contiguous().float()  # 确保内存连续
-
-    # [T,J,C] → [1, C*J, T]
     x = x.permute(2, 1, 0).reshape(1, C * J, T)
-
-    # 在时间维上平均池化平滑
     x = F.avg_pool1d(x, kernel_size=k, stride=1, padding=k // 2)
-
-    # [1, C*J, T] → [T, J, C]
     x = x.reshape(C, J, T).permute(2, 1, 0).contiguous()
     return x
 
 
+def recenter_for_view(x, offset=(512, 384, 0)):
+    """整段(T×J)居中并加偏移，使人物位于可视化中心"""
+    if hasattr(x, "tensor"):
+        x = x.tensor
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
+    if x.dim() == 5 and x.shape[2] == 1:
+        x = x.squeeze(2)
+    if x.dim() == 4:
+        x = x.mean(dim=0)  # 更稳妥：取 batch 均值而非仅第0样本
+    center = x.mean(dim=(0, 1), keepdim=True)
+    x = x - center
+    x[..., 0] += offset[0]
+    x[..., 1] += offset[1]
+    return x.contiguous().float()
+
+
 def tensor_to_pose(t_btjc, header):
-    """将 [T,J,C] 或 [B,T,J,C] tensor 转为 Pose 对象"""
+    """将 [T,J,C] 或 [B,T,J,C] 转为 Pose 对象"""
     t = _to_plain(t_btjc)
     if t.dim() == 4:
         t = t[0]
@@ -109,10 +96,12 @@ def tensor_to_pose(t_btjc, header):
 
 
 # ============================================================
-#  Main pipeline
+#  Main Script
 # ============================================================
+
 if __name__ == "__main__":
     pl.seed_everything(42)
+
     data_dir = "/data/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
     out_dir = "logs/overfit_178"
@@ -158,7 +147,7 @@ if __name__ == "__main__":
     print(f"[TRAIN] Overfitting on 4 samples × {shape[-2]} joints × {shape[-1]} dims")
     trainer.fit(model, loader, loader)
 
-#evaluation
+    # ---------------------- Evaluation ----------------------
     model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
@@ -172,45 +161,50 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-        # --- Convert MaskedTensor → plain [B,T,J,C] tensors ---
-    for x_name in ["fut", "pred"]:
-        x = locals()[x_name]
-        if hasattr(x, "tensor"):
-            x = x.tensor
-        if hasattr(x, "zero_filled"):
-            x = x.zero_filled()
-        if x.dim() == 5 and x.shape[2] == 1:
-            x = x.squeeze(2)
-        locals()[x_name] = x
+        # ---- plain tensors ----
+        for name in ["fut", "pred"]:
+            x = locals()[name]
+            if hasattr(x, "tensor"):
+                x = x.tensor
+            if hasattr(x, "zero_filled"):
+                x = x.zero_filled()
+            if x.dim() == 5 and x.shape[2] == 1:
+                x = x.squeeze(2)
+            locals()[name] = x
 
-    # --- Check raw ranges before clamp ---
-    print(f"[CHECK fut range] min={fut.min().item():.2f}, max={fut.max().item():.2f}, mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
-    print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
+        # ---- range check (normalized space) ----
+        print(f"[CHECK fut range]  min={fut.min().item():.2f}, max={fut.max().item():.2f}, "
+              f"mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
+        print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, "
+              f"mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
-    # --- Clamp explosion (keep within normalized range) ---
-    pred = torch.clamp(pred, -3, 3)
-    print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
+        # ---- clamp ----
+        pred = torch.clamp(pred, -3, 3)
+        print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
 
-    # --- Unnormalize (FluentPose-style global stats) ---
-    fut_un  = unnormalize_tensor_with_global_stats(fut,  base_ds.mean_std)
-    pred_un = unnormalize_tensor_with_global_stats(pred, base_ds.mean_std)
-    print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+        # ---- unnormalize ----
+        mean_std = _unwrap_mean_std(base_ds.mean_std)
+        fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
+        pred_un = unnormalize_tensor_with_global_stats(pred, mean_std)
+        print("[UNNORM] Applied FluentPose-style unnormalize ✅")
 
+        # ---- temporal smooth ----
+        fut_un  = temporal_smooth(fut_un)
+        pred_un = temporal_smooth(pred_un)
 
-    # --- Center per-frame across joints (prevent sliding) ---
-    fut_un = fut_un - fut_un.mean(dim=2, keepdim=True)
-    pred_un = pred_un - pred_un.mean(dim=2, keepdim=True)
+        # ---- axis-wise stats ----
+        def axis_stats(t):
+            if t.dim() == 4: t = t[0]
+            m = t.mean(dim=(0,1)); s = t.std(dim=(0,1))
+            return [round(v, 3) for v in m.tolist()], [round(v, 3) for v in s.tolist()]
+        m_gt, s_gt = axis_stats(fut_un)
+        m_pr, s_pr = axis_stats(pred_un)
+        print(f"[POST-UNNORM] GT axis mean={m_gt}, std={s_gt}")
+        print(f"[POST-UNNORM] PR axis mean={m_pr}, std={s_pr}")
 
-    # --- Smooth ---
-    fut_un  = temporal_smooth(fut_un)
-    pred_un = temporal_smooth(pred_un)
-
-    print(f"[DEBUG] fut_un mean={fut_un.mean():.3f}, std={fut_un.std():.3f}")
-    print(f"[DEBUG] pred_un mean={pred_un.mean():.3f}, std={pred_un.std():.3f}")
-
-
-
-    ref_path = os.path.join(data_dir, base_ds.records[0]["pose"])
+    # ---------------------- Save Pose ----------------------
+    pose_path = base_ds.records[0]["pose"]
+    ref_path = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
     print(f"[REF] Using reference pose header from: {ref_path}")
 
     try:
@@ -223,19 +217,23 @@ if __name__ == "__main__":
         print(f"[ERROR] Failed to load or reduce header: {e}")
         raise
 
+    # ---- recenter for visualization ----
+    fut_for_save  = recenter_for_view(fut_un)
+    pred_for_save = recenter_for_view(pred_un)
+
     try:
-        gt_pose = tensor_to_pose(fut_un, header)
-        pred_pose = tensor_to_pose(pred_un, header)
+        gt_pose   = tensor_to_pose(fut_for_save,  header)
+        pred_pose = tensor_to_pose(pred_for_save, header)
         print(f"[DEBUG] gt_pose frames={len(gt_pose.body.data)}, pred_pose frames={len(pred_pose.body.data)}")
     except Exception as e:
         print(f"[ERROR] Failed to create Pose objects: {e}")
         raise
 
-    out_gt = os.path.join(out_dir, "gt_178.pose")
+    out_gt   = os.path.join(out_dir, "gt_178.pose")
     out_pred = os.path.join(out_dir, "pred_178.pose")
-    for f in [out_gt, out_pred]:
-        if os.path.exists(f):
-            os.remove(f)
+    for pth in [out_gt, out_pred]:
+        if os.path.exists(pth):
+            os.remove(pth)
 
     try:
         with open(out_gt, "wb") as f:
