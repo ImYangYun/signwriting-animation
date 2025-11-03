@@ -14,6 +14,8 @@ from pose_anonymization.data.normalization import normalize_mean_std
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
 
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 
 # ============================================================
 #  Utility Functions
@@ -137,7 +139,7 @@ if __name__ == "__main__":
     print(f"[INFO] Overfit set shape: {tuple(shape)}")
 
     # ---------------------- Training ----------------------
-    model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=1e-3, log_dir=out_dir)
+    model = LitMinimal(num_keypoints=shape[-2], num_dims=shape[-1], lr=5e-4, log_dir=out_dir)
     trainer = pl.Trainer(
         max_epochs=200,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -166,6 +168,7 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
+        print("[STEP] before generate_full_sequence", flush=True)
         pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
@@ -197,9 +200,11 @@ if __name__ == "__main__":
               f"mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
 
         # ---- clamp ----
+        print("[STEP] before clamp", flush=True)
         pred = torch.clamp(pred, -3, 3)
         print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
-
+        print("[STEP] after clamp", flush=True)
+        
         # ---- unnormalize ----
         mean_std = _unwrap_mean_std(base_ds.mean_std)
         fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
