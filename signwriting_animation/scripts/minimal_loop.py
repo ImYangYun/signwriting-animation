@@ -73,8 +73,11 @@ def recenter_for_view(x, offset=(0, 0, 0)):
     if x.dim() == 5 and x.shape[2] == 1: x = x.squeeze(2)
     if x.dim() == 4: x = x.mean(dim=0)
 
-    center = x.mean(dim=(0, 1), keepdim=True)
-    x = x - center
+    num_joints = x.shape[1]
+    torso_end = min(33, num_joints)
+    center = x[:, :torso_end, :2].mean(dim=(0, 1), keepdim=True)
+    x[..., :2] -= center
+
 
     min_xy = x[..., :2].min(dim=1)[0].min(dim=0)[0]  # [2]
     max_xy = x[..., :2].max(dim=1)[0].max(dim=0)[0]  # [2]

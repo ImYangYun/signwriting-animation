@@ -220,8 +220,16 @@ class LitMinimal(pl.LightningModule):
         else:
             loss = loss_pos
 
-        self.train_losses.append(loss.item())
+        gt_std = fut[..., :2].std()
+        pred_std = pred[..., :2].std()
+        scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
+        loss = loss + 0.1 * scale_loss
+
+        # ---- Logging ----
+        self.log("train/scale_loss", scale_loss)
         self.log("train/loss", loss, prog_bar=True, on_step=True)
+
+        self.train_losses.append(loss.item())
         return loss
 
 
