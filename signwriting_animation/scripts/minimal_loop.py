@@ -59,7 +59,6 @@ def center_and_scale_pose(tensor, scale=1.0, offset=(500, 500, 0)):
         tensor = tensor[0]
     center = tensor.mean(dim=1, keepdim=True)
     tensor = tensor - center
-    tensor[..., 1] = -tensor[..., 1]
     tensor[..., 0] += offset[0]
     tensor[..., 1] += offset[1]
     return tensor
@@ -188,10 +187,11 @@ if __name__ == "__main__":
             pred_un = pred_un.squeeze(2)
 
         # -- Center / scale / smooth --
-        fut_un  = center_and_scale_pose(fut_un)
-        pred_un = center_and_scale_pose(pred_un)
+        # NOTE: only smooth, do NOT scale before saving
+        fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
-        print("[POST] Center + scale + smooth ✅")
+
+        #print("[POST] Center + scale + smooth ✅")
         print(f"[DEBUG] fut_un shape={fut_un.shape}, pred_un shape={pred_un.shape}")
 
     # =====================================================
@@ -248,4 +248,3 @@ if __name__ == "__main__":
         print("✅ Visualization videos saved successfully!")
     except Exception as e:
         print(f"[ERROR] Visualization failed: {e}")
-
