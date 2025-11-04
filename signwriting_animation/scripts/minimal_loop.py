@@ -288,11 +288,16 @@ if __name__ == "__main__":
             print(f"[SHAPE CHECK] {tag} after slice:", x.shape)
         except Exception as e:
             print(f"[ERROR in {tag} slicing] {type(e).__name__}: {e}")
-            return  # ⛔ stop if error
+            return
 
         nan_ratio = torch.isnan(x).float().mean().item()
         big_ratio = (x.abs() > 2000).float().mean().item()
-        frame_std = torch.nanstd(x, dim=1).nanmean().item()
+
+        try:
+            frame_std = torch.nanstd(x, dim=1).nanmean().item()
+        except Exception as e:
+            frame_std = float("nan")
+            print(f"[WARN] frame_std failed for {tag}: {e}")
 
         print(f"[{tag}] NaN%={nan_ratio:.4f}, |xy|>2000%={big_ratio:.4f}, frame-std≈{frame_std:.2f}")
 
