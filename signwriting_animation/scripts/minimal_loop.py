@@ -254,36 +254,57 @@ if __name__ == "__main__":
         print(f"[ERROR] Failed to load or reduce header: {e}")
         raise
 
+# ============================================================
+# === COMPONENT DIAG ===
+# ============================================================
+
     print("\n=== COMPONENT DIAG ===")
     print("[HEADER COMPONENTS]", [c.name for c in header.components])
     sys.stdout.flush()
 
+    # ---- Utility: locate component index range ----
     def component_slice(header, name):
         s = 0
         for comp in header.components:
             e = s + len(comp.points)
-            if name.upper() in comp.name.upper():
+            if name.upper() in comp.name.upper():  # ✅ 模糊匹配
                 return s, e
             s = e
+        print(f"[WARN] component_slice: no match for {name}, available={[c.name for c in header.components]}")
         return None
 
+    # ---- Diagnostic: evaluate NAN / outlier / motion for each hand ----
     def hand_diag(tag, x_btjc, sl):
+        print(f"[CALL] hand_diag {tag} with slice={sl}")
         if sl is None:
-            print(f"[WARN] {tag} hand slice not found in header")
+            print(f"[WARN] {tag} slice not found → skipping")
             return
-        x = x_btjc if x_btjc.dim()==3 else x_btjc[0]
-        x = x[:, sl[0]:sl[1], :2]
-        nan_ratio = torch.isnan(x).float().mean().item()
-        big = (x.abs()>2000).float().mean().item()
-        per_frame_std = torch.nanstd(x, dim=1).nanmean(dim=(0,1)).item()
-        print(f"[{tag}] NaN%={nan_ratio:.4f}, |xy|>2000%={big:.4f}, frame-std≈{per_frame_std:.2f}")
 
+        # flatten input [B,T,J,C] → [T,J,C]
+        x = x_btjc if x_btjc.dim() == 3 else x_btjc[0]
+        s, e = sl
+        x = x[:, s:e, :2]  # only XY
+
+        nan_ratio = torch.isnan(x).float().mean().item()
+        big_ratio = (x.abs() > 2000).float().mean().item()
+        frame_std = torch.nanstd(x, dim=1).nanmean().item()
+
+        print(f"[{tag}] NaN%={nan_ratio:.4f}, |xy|>2000%={big_ratio:.4f}, frame-std≈{frame_std:.2f}")
+
+    # ---- Compute slices ----
     rhs = component_slice(header, "RIGHT_HAND_LANDMARKS")
     lhs = component_slice(header, "LEFT_HAND_LANDMARKS")
+    print("[DEBUG] Using slices:", rhs, lhs)
+    sys.stdout.flush()
+
+    # ---- Run diagnostics ----
     hand_diag("GT RIGHT", fut_un, rhs)
     hand_diag("PR RIGHT", pred_un, rhs)
     hand_diag("GT LEFT",  fut_un, lhs)
     hand_diag("PR LEFT",  pred_un, lhs)
+    sys.stdout.flush()
+
+    print("=== COMPONENT DIAG END ===\n")
 
     # ---- recenter for visualization ----
     fut_for_save  = recenter_for_view(fut_un)
