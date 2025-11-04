@@ -280,10 +280,15 @@ if __name__ == "__main__":
             print(f"[WARN] {tag} slice not found → skipping")
             return
 
-        # flatten input [B,T,J,C] → [T,J,C]
-        x = x_btjc if x_btjc.dim() == 3 else x_btjc[0]
-        s, e = sl
-        x = x[:, s:e, :2]  # only XY
+        print(f"[SHAPE CHECK] {tag} shape before slicing:", getattr(x_btjc, "shape", None))
+        try:
+            x = x_btjc if x_btjc.dim() == 3 else x_btjc[0]
+            s, e = sl
+            x = x[:, s:e, :2]
+            print(f"[SHAPE CHECK] {tag} after slice:", x.shape)
+        except Exception as e:
+            print(f"[ERROR in {tag} slicing] {type(e).__name__}: {e}")
+            return  # ⛔ stop if error
 
         nan_ratio = torch.isnan(x).float().mean().item()
         big_ratio = (x.abs() > 2000).float().mean().item()
