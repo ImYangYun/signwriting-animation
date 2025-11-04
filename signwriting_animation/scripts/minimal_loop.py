@@ -183,9 +183,10 @@ if __name__ == "__main__":
 
         print("=== USING TEACHER-FORCED PATH ===")
         ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        in_seq = fut.tensor.clone() if hasattr(fut, "tensor") else fut.clone()
-
+        T = fut.size(1)
+        in_seq = 0.2 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
         pred = model.forward(in_seq, ts, past, sign)
+
         print("[EVAL] pred (teacher-forced) mean/std:",
               pred.mean().item(), pred.std().item())
 
