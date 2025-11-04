@@ -172,9 +172,17 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
+        print("=== USING TEACHER-FORCED PATH ===")
         ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        in_seq = fut.clone()
+        in_seq = fut.tensor.clone() if hasattr(fut, "tensor") else fut.clone()
+
         pred = model.forward(in_seq, ts, past, sign)
+        print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
+
+        pj_std = pred[0, :, :, :2].std(dim=0).mean(dim=1)
+        print("[DBG] per-joint std head:", pj_std[:12].tolist())
+        print("[DBG] avg joint std:", pj_std.mean().item())
+
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
