@@ -172,6 +172,8 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
+        print("[CHECK] target_mask mean / sum:", mask.mean().item(), mask.sum().item())
+        
         print("=== USING TEACHER-FORCED PATH ===")
         ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
         in_seq = fut.tensor.clone() if hasattr(fut, "tensor") else fut.clone()

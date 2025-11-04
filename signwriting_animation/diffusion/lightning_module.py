@@ -227,16 +227,13 @@ class LitMinimal(pl.LightningModule):
             torso_end = min(33, btjc.size(2))
             return btjc[..., :torso_end, :2].mean(dim=(1,2))  # [B,2]
 
-        c_gt = torso_center(fut)    # fut/pred 都是标准化域
+        c_gt = torso_center(fut)
         c_pr = torso_center(pred)
         center_loss = ((c_pr - c_gt) ** 2).mean()
         loss = loss + 0.05 * center_loss
 
         self.log("train/scale_loss", scale_loss)
         self.log("train/center_loss", center_loss)
-
-        # ---- Logging ----
-        self.log("train/scale_loss", scale_loss)
         self.log("train/loss", loss, prog_bar=True, on_step=True)
 
         self.train_losses.append(loss.item())
