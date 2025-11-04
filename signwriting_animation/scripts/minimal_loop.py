@@ -163,9 +163,10 @@ if __name__ == "__main__":
     print(f"[TRAIN] Overfitting on 4 samples × {shape[-2]} joints × {shape[-1]} dims")
     trainer.fit(model, loader, loader)
 
-    # ---------------------- Evaluation ----------------------
-    model.eval()
+# ------------------ Evaluation ------------------
+if __name__ == "__main__":
     print("=== DEBUG EVAL START ===")
+    model.eval()
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
@@ -174,7 +175,8 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
-        print("[CHECK] target_mask mean / sum:", mask.float().mean().item(), mask.float().sum().item())
+        print("[CHECK] target_mask mean / sum:",
+              mask.float().mean().item(), mask.float().sum().item())
         sys.stdout.flush()
 
         print("=== USING TEACHER-FORCED PATH ===")
