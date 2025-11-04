@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 import torch
 import numpy as np
 import lightning as pl
@@ -164,6 +165,7 @@ if __name__ == "__main__":
 
     # ---------------------- Evaluation ----------------------
     model.eval()
+    print("=== DEBUG EVAL START ===")
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
@@ -173,6 +175,7 @@ if __name__ == "__main__":
         mask = cond["target_mask"][:1].to(model.device)
 
         print("[CHECK] target_mask mean / sum:", mask.float().mean().item(), mask.float().sum().item())
+        sys.stdout.flush()
 
         print("=== USING TEACHER-FORCED PATH ===")
         ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
