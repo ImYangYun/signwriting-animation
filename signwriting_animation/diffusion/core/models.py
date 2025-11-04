@@ -170,7 +170,26 @@ class SignWritingToPoseDiffusion(nn.Module):
         output = self.pose_projection(output)         # [B,J,C,T]
         _stat("pose_projection_output", output)
 
-        # ======================= DEBUG PATCH END ==========================
+        with torch.no_grad():
+            def _motion_diag(name, t):
+                if t is None or t.dim() < 2:
+                    print(f"[MOTION] {name}: skipped (invalid shape {None if t is None else t.shape})")
+                    return
+                diff = t[1:] - t[:-1]
+                mag = diff.abs().mean().item()
+                std = diff.std().item()
+                print(f"[MOTION] {name}: Δmean={mag:.6f}, Δstd={std:.6f}")
+
+            _motion_diag("future_motion_emb", future_motion_emb)
+            _motion_diag("xseq_after_posenc", xseq)
+            _motion_diag("encoder_out", output)
+
+            if output.dim() == 4:
+                pose_diff = output[..., 1:] - output[..., :-1]
+                pose_mag = pose_diff.abs().mean().item()
+                pose_std = pose_diff.std().item()
+                print(f"[MOTION] pose_projection_output: Δmean={pose_mag:.6f}, Δstd={pose_std:.6f}")
+ 
         return output
 
     def interface(self,
