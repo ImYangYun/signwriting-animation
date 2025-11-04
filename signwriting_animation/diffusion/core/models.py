@@ -138,6 +138,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         # ---- 1. Embeddings ----
         time_emb = self.embed_timestep(timesteps)                 # [1, B, D]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
+        time_emb = time_emb.expand(-1, signwriting_emb.size(1), -1)
 
         _stat("time_emb", time_emb)
         _stat("signwriting_emb", signwriting_emb)
@@ -164,7 +165,9 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = self.sequence_pos_encoder(xseq)
         _stat("xseq_after_posenc", xseq)
 
-        output = self.seqEncoder(xseq)                # [Tf,B,D]
+        output = self.seqEncoder(xseq)
+        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
+        output = torch.clamp(output, -10, 10)
         _stat("encoder_out", output)
 
         output = self.pose_projection(output)         # [B,J,C,T]

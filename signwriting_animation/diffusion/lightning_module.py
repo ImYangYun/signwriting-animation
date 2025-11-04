@@ -206,7 +206,7 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * t_ramp
+        in_seq = 0.3 * torch.randn_like(fut) + 1.0 * t_ramp
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -249,7 +249,7 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
         T = fut.size(1)
-        in_seq = 0.05 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        in_seq = 0.2 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
         pred = self.forward(in_seq, ts, past, sign)
 
         loss_pos = masked_mse(pred, fut, mask)
