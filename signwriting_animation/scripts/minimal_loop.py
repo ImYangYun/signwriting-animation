@@ -255,6 +255,8 @@ if __name__ == "__main__":
         raise
 
     print("\n=== COMPONENT DIAG ===")
+    print("[HEADER COMPONENTS]", [c.name for c in header.components])
+    sys.stdout.flush()
 
     def component_slice(header, name):
         s = 0
