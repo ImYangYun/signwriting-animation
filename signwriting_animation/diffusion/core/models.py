@@ -14,7 +14,7 @@ class SignWritingToPoseDiffusion(nn.Module):
                  ff_size: int = 1024,
                  num_layers: int = 8,
                  num_heads: int = 4,
-                 dropout: float = 0.2,
+                 dropout: float = 0.05,
                  activation: str = "gelu",
                  arch: str = "trans_enc",
                  cond_mask_prob: float = 0):
@@ -160,7 +160,7 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         time_cond = time_emb.repeat(Tf, 1, 1)         # [Tf,B,D]
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)  # [Tf,B,D]
-        xseq = future_motion_emb + 0.5 * (time_cond + sign_cond)
+        xseq = future_motion_emb + 1.0 * (time_cond + sign_cond)
         xseq = self.sequence_pos_encoder(xseq)
         _stat("xseq_after_posenc", xseq)
 
