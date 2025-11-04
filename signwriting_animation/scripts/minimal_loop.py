@@ -262,7 +262,7 @@ if __name__ == "__main__":
         s = 0
         for comp in header.components:
             e = s + len(comp.points)
-            if comp.name.upper().startswith(name.upper()):
+            if name.upper() in comp.name.upper():
                 return s, e
             s = e
         return None
