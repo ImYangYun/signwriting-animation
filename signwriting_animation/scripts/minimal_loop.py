@@ -294,7 +294,8 @@ if __name__ == "__main__":
         big_ratio = (x.abs() > 2000).float().mean().item()
 
         try:
-            frame_std = torch.nanstd(x, dim=1).nanmean().item()
+            x = torch.nan_to_num(x, nan=0.0)
+            frame_std = torch.std(x, dim=1, unbiased=False).mean().item()
         except Exception as e:
             frame_std = float("nan")
             print(f"[WARN] frame_std failed for {tag}: {e}")
