@@ -177,6 +177,8 @@ if __name__ == "__main__":
 
         print("[CHECK] target_mask mean / sum:",
               mask.float().mean().item(), mask.float().sum().item())
+        frame_density = mask.float().mean(dim=(2,3,4)).cpu().numpy().tolist()
+        print("[CHECK] per-frame activation (avg over joints):", frame_density)
         sys.stdout.flush()
 
         print("=== USING TEACHER-FORCED PATH ===")
@@ -184,7 +186,8 @@ if __name__ == "__main__":
         in_seq = fut.tensor.clone() if hasattr(fut, "tensor") else fut.clone()
 
         pred = model.forward(in_seq, ts, past, sign)
-        print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
+        print("[EVAL] pred (teacher-forced) mean/std:",
+              pred.mean().item(), pred.std().item())
 
         pj_std = pred[0, :, :, :2].std(dim=0).mean(dim=1)
         print("[DBG] per-joint std head:", pj_std[:12].tolist())
@@ -250,6 +253,35 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERROR] Failed to load or reduce header: {e}")
         raise
+
+    print("\n=== COMPONENT DIAG ===")
+
+    def component_slice(header, name):
+        s = 0
+        for comp in header.components:
+            e = s + len(comp.points)
+            if comp.name.upper().startswith(name.upper()):
+                return s, e
+            s = e
+        return None
+
+    def hand_diag(tag, x_btjc, sl):
+        if sl is None:
+            print(f"[WARN] {tag} hand slice not found in header")
+            return
+        x = x_btjc if x_btjc.dim()==3 else x_btjc[0]
+        x = x[:, sl[0]:sl[1], :2]
+        nan_ratio = torch.isnan(x).float().mean().item()
+        big = (x.abs()>2000).float().mean().item()
+        per_frame_std = torch.nanstd(x, dim=1).nanmean(dim=(0,1)).item()
+        print(f"[{tag}] NaN%={nan_ratio:.4f}, |xy|>2000%={big:.4f}, frame-std≈{per_frame_std:.2f}")
+
+    rhs = component_slice(header, "RIGHT_HAND_LANDMARKS")
+    lhs = component_slice(header, "LEFT_HAND_LANDMARKS")
+    hand_diag("GT RIGHT", fut_un, rhs)
+    hand_diag("PR RIGHT", pred_un, rhs)
+    hand_diag("GT LEFT",  fut_un, lhs)
+    hand_diag("PR LEFT",  pred_un, lhs)
 
     # ---- recenter for visualization ----
     fut_for_save  = recenter_for_view(fut_un)
