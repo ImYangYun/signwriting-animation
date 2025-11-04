@@ -181,18 +181,30 @@ if __name__ == "__main__":
         print("[CHECK] per-frame activation (avg over joints):", frame_density)
         sys.stdout.flush()
 
-        print("=== USING TEACHER-FORCED PATH ===")
+        import sys
+        sys.stdout.flush()
         ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        T = fut.size(1)
-        in_seq = 0.2 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+
+        if hasattr(fut, "zero_filled"):
+            fut_dense = fut.zero_filled()
+        else:
+            fut_dense = fut
+
+        T = fut_dense.size(1)
+        in_seq = (
+            0.2 * torch.randn_like(fut_dense)
+            + 1.0 * torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
+        )
+
         pred = model.forward(in_seq, ts, past, sign)
 
-        print("[EVAL] pred (teacher-forced) mean/std:",
-              pred.mean().item(), pred.std().item())
+        print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
+        sys.stdout.flush()
 
         pj_std = pred[0, :, :, :2].std(dim=0).mean(dim=1)
         print("[DBG] per-joint std head:", pj_std[:12].tolist())
         print("[DBG] avg joint std:", pj_std.mean().item())
+        sys.stdout.flush()
 
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
