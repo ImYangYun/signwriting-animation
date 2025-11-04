@@ -73,16 +73,20 @@ def recenter_for_view(x, offset=(0, 0, 0)):
     if x.dim() == 5 and x.shape[2] == 1: x = x.squeeze(2)
     if x.dim() == 4: x = x.mean(dim=0)  # [T,J,C]
 
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
     T, J, C = x.shape
     torso_end = min(33, J)
-    torso_xy = x[:, :torso_end, :2]
+    torso_xy = x[:, :torso_end, :2]  # 仅 torso 区域
 
-    mean_center = torso_xy.mean(dim=(0,1), keepdim=True)  # [1,1,2]
-    median_center = torso_xy.median(dim=1).values.median(dim=0, keepdim=True).values.view(1,1,2)
+    mask = torch.isfinite(torso_xy)
+    valid_xy = torso_xy[mask].view(-1, 2) if mask.any() else torch.zeros(1, 2)
+    mean_center = valid_xy.mean(dim=0, keepdim=True)
+    median_center = valid_xy.median(dim=0).values.unsqueeze(0)
     center = 0.5 * (mean_center + median_center)
-    x[..., :2] -= center[..., :2]
+    x[..., :2] -= center  # 平移到原点
 
-    flat_xy = x[..., :2].reshape(T * J, 2)
+    flat_xy = x[..., :2].reshape(-1, 2)
     q02 = torch.quantile(flat_xy, 0.02, dim=0)
     q98 = torch.quantile(flat_xy, 0.98, dim=0)
     span = (q98 - q02).clamp(min=1.0)
@@ -168,7 +172,9 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
-        pred = model.generate_full_sequence(past_btjc=past, sign_img=sign, target_mask=mask)
+        ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
+        in_seq = fut.clone()
+        pred = model.forward(in_seq, ts, past, sign)
         dtw_val = masked_dtw(pred, fut, mask).item()
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
