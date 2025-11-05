@@ -210,7 +210,7 @@ class SignWritingToPoseDiffusion(nn.Module):
 
             _motion_diag("future_motion_emb", future_motion_emb)
             _motion_diag("xseq_after_posenc", xseq)
-            _motion_diag("encoder_out", output)
+            _motion_diag("encoder_out", output.transpose(0, 1))
 
             if output.dim() == 4:
                 pose_diff = output[..., 1:] - output[..., :-1]
@@ -306,7 +306,8 @@ class OutputProcessMLP(nn.Module):
         """
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.ln(x)
-        x = self.mlp(x) * 0.1
+        x = self.mlp(x)
+        x = torch.tanh(x * 0.1)
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x
