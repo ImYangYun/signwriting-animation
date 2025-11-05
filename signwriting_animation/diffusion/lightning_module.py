@@ -113,7 +113,7 @@ class LitMinimal(pl.LightningModule):
     """
 
     def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs",
-                stats_path="/data/yayun/pose_data/mean_std.pt",
+                stats_path="/data/yayun/pose_data/mean_std_178.pt",
                 data_dir="/data/yayun/pose_data",
                 csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):
         super().__init__()
