@@ -175,6 +175,9 @@ if __name__ == "__main__":
         fut  = batch["data"][:1].to(model.device)
         mask = cond["target_mask"][:1].to(model.device)
 
+        print("[EVAL DEBUG] fut_dense shape before forward:", fut.shape)
+        sys.stdout.flush()
+
         print("[CHECK] target_mask mean / sum:",
               mask.float().mean().item(), mask.float().sum().item())
         frame_density = mask.float().mean(dim=(2,3,4)).cpu().numpy().tolist()
@@ -197,7 +200,8 @@ if __name__ == "__main__":
         )
 
         pred = model.forward(in_seq, ts, past, sign)
-
+        print("[EVAL DEBUG] pred shape after forward:", pred.shape)
+        sys.stdout.flush()
         print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
         sys.stdout.flush()
 
