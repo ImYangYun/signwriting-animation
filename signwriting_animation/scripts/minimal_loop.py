@@ -206,6 +206,18 @@ if __name__ == "__main__":
         pred = model.forward(in_seq, ts, past, sign)
         print("[EVAL DEBUG] pred shape after forward:", pred.shape)
         sys.stdout.flush()
+
+        left_idx = slice(8+196, 8+196+21)
+        right_idx = slice(8+196+21, 8+196+42)
+
+        left_xyz = pred[0, :, left_idx, :, :].detach().cpu()
+        right_xyz = pred[0, :, right_idx, :, :].detach().cpu()
+
+        print("[EVAL DEBUG] left hand mean/std:", left_xyz.mean().item(), left_xyz.std().item(),
+            "min/max:", left_xyz.min().item(), left_xyz.max().item())
+        print("[EVAL DEBUG] right hand mean/std:", right_xyz.mean().item(), right_xyz.std().item(),
+            "min/max:", right_xyz.min().item(), right_xyz.max().item())
+
         print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
         sys.stdout.flush()
 
