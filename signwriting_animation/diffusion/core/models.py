@@ -307,7 +307,7 @@ class OutputProcessMLP(nn.Module):
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * 0.1)
+        x = torch.tanh(x * 1.0)
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x
