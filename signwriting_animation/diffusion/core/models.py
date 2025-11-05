@@ -289,6 +289,8 @@ class OutputProcessMLP(nn.Module):
             last = self.mlp[-1]
             nn.init.xavier_uniform_(last.weight, gain=0.01)
             nn.init.zeros_(last.bias)
+        
+        self.scale = 1.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -307,7 +309,9 @@ class OutputProcessMLP(nn.Module):
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * 1.0)
+        x = torch.tanh(x * self.scale)
+        if not self.training:
+            x = x + 1e-3 * torch.randn_like(x)
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x
