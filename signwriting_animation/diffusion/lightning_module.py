@@ -119,25 +119,22 @@ class LitMinimal(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.model = SignWritingToPoseDiffusion(
-            num_keypoints=num_keypoints, num_dims_per_keypoint=num_dims
-        )
-
         self.lr = lr
         self.log_dir = log_dir
         self.train_losses, self.val_losses, self.val_dtws = [], [], []
 
         if os.path.exists(stats_path):
             stats = torch.load(stats_path, map_location="cpu")
-            mean, std = stats["mean"].float(), stats["std"].float()
+            mean = stats["mean"].float()
+            std  = stats["std"].float()
             print(f"[Loaded mean/std] mean={mean.mean():.4f}, std={std.mean():.4f}")
         else:
             print(f"[WARN] stats not found → computing global mean/std from {csv_path}")
             from pose_format import Pose
             import pandas as pd, random
+
             df = pd.read_csv(csv_path)
             df = df[df["split"] == "train"].reset_index(drop=True)
-
             records = df.to_dict(orient="records")
             random.shuffle(records)
             sample_size = min(500, len(records))
@@ -156,7 +153,7 @@ class LitMinimal(pl.LightningModule):
                     with open(pose_path, "rb") as f:
                         p = Pose.read(f)
                     arr = torch.tensor(p.body.data, dtype=torch.float32)  # [T,P,J,C]
-                    arr = arr.view(-1, arr.shape[-1])  # [T*P*J, C]
+                    arr = arr.view(-1, arr.shape[-1])                     # [T*P*J, C]
                     sum_all += arr.sum(dim=0)
                     sum_sq_all += (arr ** 2).sum(dim=0)
                     count += arr.shape[0]
@@ -168,15 +165,20 @@ class LitMinimal(pl.LightningModule):
                     print(f"[INFO] Processed {i+1}/{sample_size} files...")
 
             mean = sum_all / count
-            std = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
+            std  = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
             torch.save({"mean": mean, "std": std}, stats_path)
             print(f"[Saved new mean/std] → {stats_path}")
 
-
-        # register buffer
         self.register_buffer("mean_pose", mean)
         self.register_buffer("std_pose", std)
         print(f"[LitMinimal] Using mean={mean.tolist()} std={std.tolist()}")
+
+        self.model = SignWritingToPoseDiffusion(
+            num_keypoints=num_keypoints,
+            num_dims_per_keypoint=num_dims,
+            mean=self.mean_pose,
+            std=self.std_pose
+        )
 
     def normalize_pose(self, x_btjc):
         """Normalize tensor [B,T,J,C] using global mean/std."""

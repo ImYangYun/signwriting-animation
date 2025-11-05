@@ -17,7 +17,9 @@ class SignWritingToPoseDiffusion(nn.Module):
                  dropout: float = 0.05,
                  activation: str = "gelu",
                  arch: str = "trans_enc",
-                 cond_mask_prob: float = 0):
+                 cond_mask_prob: float = 0,
+                 mean: torch.Tensor = None,
+                 std: torch.Tensor = None):
         """
         Generates pose sequences conditioned on SignWriting images and past motion using a diffusion model.
 
@@ -58,6 +60,19 @@ class SignWritingToPoseDiffusion(nn.Module):
         super().__init__()
 
         self.cond_mask_prob = cond_mask_prob
+
+        if mean is not None and std is not None:
+            self.mean = mean.detach().clone().float()
+            self.std  = std.detach().clone().float()
+            print(f"[DBG] Using dataset mean/std (mean≈{self.mean.mean():.2f}, std≈{self.std.mean():.2f})")
+        else:
+            self.mean = torch.tensor([502.02, 299.43, 230.21], dtype=torch.float32)
+            self.std  = torch.tensor([203.70, 152.87,   0.13], dtype=torch.float32)
+            print("[WARN] No dataset mean/std passed → using fallback stats "
+                f"(mean≈{self.mean.mean():.2f}, std≈{self.std.mean():.2f})")
+
+        if self.std.mean() > 200 and self.mean.mean() > 300:
+            print("[WARN] mean/std look unusually large — double check you are not mixing FluentPose stats.")
 
         # local conditions
         input_feats = num_keypoints * num_dims_per_keypoint
