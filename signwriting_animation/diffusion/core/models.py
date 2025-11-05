@@ -133,7 +133,13 @@ class SignWritingToPoseDiffusion(nn.Module):
         """
         Performs classifier-free guidance by running a forward pass of the diffusion model.
         """
-
+        if x.dim() == 5 and x.shape[2] == 1:
+            # [B, T, 1, J, C] → [B, T, J, C]
+            x = x.squeeze(2)
+        if x.dim() == 4 and x.shape[-1] < x.shape[-2]:
+            # [B, J, C, T] → [B, T, J, C]
+            x = x.permute(0, 3, 1, 2).contiguous()
+            print(f"[DBG/reshape] Permuted x to [B, T, J, C]: {x.shape}")
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
         def _stat(name, tensor):
