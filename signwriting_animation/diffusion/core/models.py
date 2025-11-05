@@ -275,6 +275,8 @@ class OutputProcessMLP(nn.Module):
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
 
+        self.ln = nn.LayerNorm(num_latent_dims)
+
         # MLP layers
         self.mlp = nn.Sequential(
             nn.Linear(num_latent_dims, hidden_dim),
