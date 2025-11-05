@@ -197,11 +197,15 @@ class SignWritingToPoseDiffusion(nn.Module):
         with torch.no_grad():
             def _motion_diag(name, t):
                 if t is None or t.dim() < 2:
-                    print(f"[MOTION] {name}: skipped (invalid shape {None if t is None else t.shape})")
+                    print(f"[MOTION] {name}: skipped (shape={None if t is None else tuple(getattr(t, 'shape', []))})")
+                    return
+                t = torch.nan_to_num(t.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                if t.size(0) < 2:
+                    print(f"[MOTION] {name}: skipped (T={t.size(0)})")
                     return
                 diff = t[1:] - t[:-1]
                 mag = diff.abs().mean().item()
-                std = diff.std().item()
+                std = diff.std(unbiased=False).item()
                 print(f"[MOTION] {name}: Δmean={mag:.6f}, Δstd={std:.6f}")
 
             _motion_diag("future_motion_emb", future_motion_emb)
@@ -279,6 +283,10 @@ class OutputProcessMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, num_keypoints * num_dims_per_keypoint)
         )
+        with torch.no_grad():
+            last = self.mlp[-1]
+            nn.init.xavier_uniform_(last.weight, gain=0.01)
+            nn.init.zeros_(last.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -295,7 +303,8 @@ class OutputProcessMLP(nn.Module):
                 Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
         """
         num_frames, batch_size, num_latent_dims = x.shape
-        x = self.mlp(x)  # use MLP instead of single linear layer
+        x = self.ln(x)
+        x = self.mlp(x) * 0.1
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x

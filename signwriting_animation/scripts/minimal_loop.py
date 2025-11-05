@@ -194,6 +194,10 @@ if __name__ == "__main__":
             fut_dense = fut
 
         T = fut_dense.size(1)
+        print("[EVAL DEBUG] T,B,J,C =",
+            T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
+        print("[EVAL DEBUG] ts shape / unique:", ts.shape, torch.unique(ts).tolist())
+
         in_seq = (
             0.2 * torch.randn_like(fut_dense)
             + 1.0 * torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
@@ -284,7 +288,7 @@ if __name__ == "__main__":
         s = 0
         for comp in header.components:
             e = s + len(comp.points)
-            if name.upper() in comp.name.upper():  # ✅ 模糊匹配
+            if name.upper() in comp.name.upper():
                 return s, e
             s = e
         print(f"[WARN] component_slice: no match for {name}, available={[c.name for c in header.components]}")
