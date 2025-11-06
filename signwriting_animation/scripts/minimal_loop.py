@@ -210,8 +210,11 @@ if __name__ == "__main__":
         left_idx = slice(8+196, 8+196+21)
         right_idx = slice(8+196+21, 8+196+42)
 
-        left_xyz = pred[0, :, left_idx, :, :].detach().cpu()
-        right_xyz = pred[0, :, right_idx, :, :].detach().cpu()
+        left_xyz = torch.index_select(pred[0], 1, torch.arange(8+196, 8+196+21, device=pred.device))
+        right_xyz = torch.index_select(pred[0], 1, torch.arange(8+196+21, 8+196+42, device=pred.device))
+
+        left_xyz = left_xyz.detach().cpu()
+        right_xyz = right_xyz.detach().cpu()
 
         print("[EVAL DEBUG] left hand mean/std:", left_xyz.mean().item(), left_xyz.std().item(),
             "min/max:", left_xyz.min().item(), left_xyz.max().item())
