@@ -209,7 +209,7 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.5 * torch.randn_like(fut) + 1.0 * t_ramp
+        in_seq = 0.5 * torch.randn_like(fut) + 0.8 * t_ramp + 0.1 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         pred = self.normalize_pose(pred)
@@ -261,7 +261,10 @@ class LitMinimal(pl.LightningModule):
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
         T = fut.size(1)
-        in_seq = 0.2 * torch.randn_like(fut) + 1.0 * torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        in_seq = 0.3 * torch.randn_like(fut) + 0.8 * t_ramp + 0.1 * fut
+        print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
+
         pred = self.forward(in_seq, ts, past, sign)
         pred = self.normalize_pose(pred)
 
@@ -293,6 +296,12 @@ class LitMinimal(pl.LightningModule):
         self.print(msg)
 
         self.log("val/motion_delta", motion_magnitude, prog_bar=True)
+
+        # --- motion debug ---
+        pred_std_per_frame = pred.std(dim=(0,2,3)).detach().cpu().numpy()
+        fut_std_per_frame  = fut.std(dim=(0,2,3)).detach().cpu().numpy()
+        print("[VAL DEBUG] pred frame-wise std:", pred_std_per_frame)
+        print("[VAL DEBUG] fut  frame-wise std:", fut_std_per_frame)
 
         return {"val_loss": loss, "val_dtw": dtw}
 

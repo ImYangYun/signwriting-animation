@@ -160,6 +160,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         time_emb = self.embed_timestep(timesteps)                 # [1, B, D]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
         time_emb = time_emb.expand(-1, signwriting_emb.size(1), -1)
+        print(f"[DBG] time_emb mean/std: {time_emb.mean().item():.4f} / {time_emb.std().item():.4f}")
 
         _stat("time_emb", time_emb)
         _stat("signwriting_emb", signwriting_emb)
