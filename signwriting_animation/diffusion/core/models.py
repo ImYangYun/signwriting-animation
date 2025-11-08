@@ -296,12 +296,10 @@ class OutputProcessMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Decodes a sequence of latent vectors into keypoint motion data using a multi-layer perceptron (MLP).
-
         Args:
             x (Tensor):
                 Input latent tensor.
                 Shape: [num_frames, batch_size, num_latent_dims].
-
         Returns:
             Tensor:
                 Decoded keypoint motion.
@@ -310,12 +308,20 @@ class OutputProcessMLP(nn.Module):
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.ln(x)
         x = self.mlp(x)
-        #x = torch.tanh(x * self.scale) * 3.0
-        x = x * self.scale
+
+        x = torch.tanh(x * 2.0) * 50.0
+
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
-        if not self.training:
-            x = x + 1e-3 * torch.randn_like(x)
-        return x.permute(1, 2, 3, 0)
+
+        if self.training:
+            x_center = x.mean(dim=(2, 3), keepdim=True)
+            x = x - x_center * 0.3
+        else:
+            x = x - x.mean(dim=(2, 3), keepdim=True) * 0.2
+            x = x + 0.005 * torch.randn_like(x)
+
+        x = x.permute(1, 2, 3, 0)
+        return x
 
 
 class EmbedSignWriting(nn.Module):
