@@ -289,7 +289,7 @@ class LitMinimal(pl.LightningModule):
 
         if torch.rand(1).item() < 0.1:
             motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
-            print(f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.4f}")
+            print(f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.4f}", flush=True)
 
         return {"val_loss": loss, "val_dtw": dtw}
 
