@@ -287,9 +287,15 @@ class LitMinimal(pl.LightningModule):
             "val/dtw": dtw
         }, prog_bar=True)
 
-        if torch.rand(1).item() < 0.1:
-            motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
-            print(f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.4f}", flush=True)
+        motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
+        msg = f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.6f}"
+
+        import sys
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+        if hasattr(self, "trainer") and getattr(self.trainer, "is_global_zero", True):
+            self.log("val/motion_delta", motion_magnitude, prog_bar=True)
 
         return {"val_loss": loss, "val_dtw": dtw}
 
