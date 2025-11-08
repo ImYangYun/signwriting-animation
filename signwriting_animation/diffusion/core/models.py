@@ -285,12 +285,12 @@ class OutputProcessMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, num_keypoints * num_dims_per_keypoint)
         )
-        with torch.no_grad():
-            last = self.mlp[-1]
-            nn.init.xavier_uniform_(last.weight, gain=0.01)
-            nn.init.zeros_(last.bias)
-        
-        self.scale = 1.0
+        last = self.mlp[-1]
+        nn.init.xavier_uniform_(last.weight, gain=1.0)
+        nn.init.zeros_(last.bias)
+
+        self.scale = nn.Parameter(torch.tensor(5.0))
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -309,15 +309,12 @@ class OutputProcessMLP(nn.Module):
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * self.scale) * 3.0
+        #x = torch.tanh(x * self.scale) * 3.0
+        x = x * self.scale
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
-        x_center = x.mean(dim=(2, 3), keepdim=True)
-        x = x - x_center
         if not self.training:
             x = x + 1e-3 * torch.randn_like(x)
-
-        x = x.permute(1, 2, 3, 0)
-        return x
+        return x.permute(1, 2, 3, 0)
 
 
 class EmbedSignWriting(nn.Module):
