@@ -213,12 +213,10 @@ if __name__ == "__main__":
                 print(f"[EVAL DEBUG] pred dims: B={B}, T={T}, J={J}, C={C}")
                 sys.stdout.flush()
 
-                # ✅ only try hand stats if enough joints exist
-                if J >= 178:  # 原始 holistic 有 543; reduce_holistic 后可能只有 178
-                    left_idx = torch.arange(8+196, 8+196+21, device=pred.device)
-                    right_idx = torch.arange(8+196+21, 8+196+42, device=pred.device)
+                if J >= 178:
+                    left_idx = torch.arange(133, 133 + 21, device=pred.device)
+                    right_idx = torch.arange(154, 154 + 21, device=pred.device)
 
-                    # 使用 torch.index_select 保证兼容
                     left_xyz = torch.index_select(pred[0], 1, left_idx).detach().cpu()
                     right_xyz = torch.index_select(pred[0], 1, right_idx).detach().cpu()
 
