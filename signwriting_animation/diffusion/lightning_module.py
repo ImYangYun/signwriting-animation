@@ -200,13 +200,15 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))      # 🟩 normalized
-        past = self.normalize_pose(sanitize_btjc(cond["input_pose"])) # 🟩 normalized
-        mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
+        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))       # 🟩 normalized target
+        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))  # 🟩 normalized input
+        mask = (cond["target_mask"].float().sum(dim=(2, 3)) > 0).float() \
+            if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
-        ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
 
         T = fut.size(1)
+        ts = torch.arange(T, device=fut.device).unsqueeze(0)  # [1, T]
+
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
         in_seq = 0.3 * torch.randn_like(fut) + 1.0 * t_ramp
 
@@ -215,9 +217,12 @@ class LitMinimal(pl.LightningModule):
 
         if fut.size(1) > 1:
             vel_mask = mask[:, 1:]
-            loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 2.0 * loss_vel
+            vel_pred = pred[:, 1:] - pred[:, :-1]
+            vel_gt   = fut[:, 1:] - fut[:, :-1]
+            loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
+            loss = loss_pos + 0.5 * loss_vel
         else:
+            loss_vel = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         gt_std = fut[..., :2].std()
@@ -227,16 +232,20 @@ class LitMinimal(pl.LightningModule):
 
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
-            return btjc[..., :torso_end, :2].mean(dim=(1,2))  # [B,2]
+            return btjc[..., :torso_end, :2].mean(dim=(1, 2))  # [B, 2]
 
         c_gt = torso_center(fut)
         c_pr = torso_center(pred)
         center_loss = ((c_pr - c_gt) ** 2).mean()
         loss = loss + 0.05 * center_loss
 
-        self.log("train/scale_loss", scale_loss)
-        self.log("train/center_loss", center_loss)
-        self.log("train/loss", loss, prog_bar=True, on_step=True)
+        self.log_dict({
+            "train/loss": loss,
+            "train/loss_pos": loss_pos,
+            "train/loss_vel": loss_vel,
+            "train/scale_loss": scale_loss,
+            "train/center_loss": center_loss,
+        }, prog_bar=True, on_step=True)
 
         self.train_losses.append(loss.item())
         return loss

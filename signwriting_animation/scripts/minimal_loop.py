@@ -186,7 +186,7 @@ if __name__ == "__main__":
 
         import sys
         sys.stdout.flush()
-        ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
+        ts = torch.arange(T, device=fut.device).unsqueeze(0)  # [1, T]
 
         if hasattr(fut, "zero_filled"):
             fut_dense = fut.zero_filled()
