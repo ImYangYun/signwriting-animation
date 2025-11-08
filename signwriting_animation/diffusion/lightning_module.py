@@ -209,7 +209,7 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 1.0 * t_ramp
+        in_seq = 0.5 * torch.randn_like(fut) + 1.0 * t_ramp
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -219,7 +219,7 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_gt   = fut[:, 1:] - fut[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            loss = loss_pos + 0.2 * loss_vel
+            loss = loss_pos + 0.3 * loss_vel
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
@@ -227,7 +227,7 @@ class LitMinimal(pl.LightningModule):
         gt_std = fut[..., :2].std()
         pred_std = pred[..., :2].std()
         scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
-        loss = loss + 0.1 * scale_loss
+        loss = loss + 0.05 * scale_loss
 
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
@@ -269,7 +269,7 @@ class LitMinimal(pl.LightningModule):
         if T > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 0.2 * loss_vel
+            loss = loss_pos + 0.3 * loss_vel
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
@@ -284,6 +284,10 @@ class LitMinimal(pl.LightningModule):
             "val/vel_loss": loss_vel,
             "val/dtw": dtw
         }, prog_bar=True)
+
+        if torch.rand(1).item() < 0.1:
+            motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
+            print(f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.4f}")
 
         return {"val_loss": loss, "val_dtw": dtw}
 
