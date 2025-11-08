@@ -186,16 +186,15 @@ if __name__ == "__main__":
 
         import sys
         sys.stdout.flush()
-        ts = torch.arange(T, device=fut.device).unsqueeze(0)  # [1, T]
-
         if hasattr(fut, "zero_filled"):
             fut_dense = fut.zero_filled()
         else:
             fut_dense = fut
 
         T = fut_dense.size(1)
-        print("[EVAL DEBUG] T,B,J,C =",
-            T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
+        print("[EVAL DEBUG] T,B,J,C =", T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
+        ts = torch.zeros(1, dtype=torch.long, device=fut.device)
+
         print("[EVAL DEBUG] ts shape / unique:", ts.shape, torch.unique(ts).tolist())
 
         in_seq = (
