@@ -207,19 +207,43 @@ if __name__ == "__main__":
         print("[EVAL DEBUG] pred shape after forward:", pred.shape)
         sys.stdout.flush()
 
-        left_idx = slice(8+196, 8+196+21)
-        right_idx = slice(8+196+21, 8+196+42)
+        try:
+            if pred.ndim == 4:
+                B, T, J, C = pred.shape
+                print(f"[EVAL DEBUG] pred dims: B={B}, T={T}, J={J}, C={C}")
+                sys.stdout.flush()
 
-        left_xyz = torch.index_select(pred[0], 1, torch.arange(8+196, 8+196+21, device=pred.device))
-        right_xyz = torch.index_select(pred[0], 1, torch.arange(8+196+21, 8+196+42, device=pred.device))
+                # ✅ only try hand stats if enough joints exist
+                if J > 217:  # 原始 holistic 有 543; reduce_holistic 后可能只有 178
+                    left_idx = torch.arange(8+196, 8+196+21, device=pred.device)
+                    right_idx = torch.arange(8+196+21, 8+196+42, device=pred.device)
 
-        left_xyz = left_xyz.detach().cpu()
-        right_xyz = right_xyz.detach().cpu()
+                    # 使用 torch.index_select 保证兼容
+                    left_xyz = torch.index_select(pred[0], 1, left_idx).detach().cpu()
+                    right_xyz = torch.index_select(pred[0], 1, right_idx).detach().cpu()
 
-        print("[EVAL DEBUG] left hand mean/std:", left_xyz.mean().item(), left_xyz.std().item(),
-            "min/max:", left_xyz.min().item(), left_xyz.max().item())
-        print("[EVAL DEBUG] right hand mean/std:", right_xyz.mean().item(), right_xyz.std().item(),
-            "min/max:", right_xyz.min().item(), right_xyz.max().item())
+                    print("[EVAL DEBUG] left hand mean/std:",
+                        round(left_xyz.mean().item(), 5),
+                        round(left_xyz.std().item(), 5),
+                        "min/max:",
+                        round(left_xyz.min().item(), 3),
+                        round(left_xyz.max().item(), 3))
+
+                    print("[EVAL DEBUG] right hand mean/std:",
+                        round(right_xyz.mean().item(), 5),
+                        round(right_xyz.std().item(), 5),
+                        "min/max:",
+                        round(right_xyz.min().item(), 3),
+                        round(right_xyz.max().item(), 3))
+                else:
+                    print(f"[EVAL DEBUG] skipped hand stats (too few joints, J={J})")
+            else:
+                print(f"[EVAL DEBUG] skipped hand stats (unexpected pred.ndim={pred.ndim})")
+
+        except Exception as e:
+            print(f"[EVAL DEBUG] hand stats failed: {e}")
+
+        sys.stdout.flush()
 
         print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
         sys.stdout.flush()
