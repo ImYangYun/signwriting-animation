@@ -290,12 +290,9 @@ class LitMinimal(pl.LightningModule):
         motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
         msg = f"[DEBUG MOTION] avg frame delta: {motion_magnitude:.6f}"
 
-        import sys
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
+        self.print(msg)
 
-        if hasattr(self, "trainer") and getattr(self.trainer, "is_global_zero", True):
-            self.log("val/motion_delta", motion_magnitude, prog_bar=True)
+        self.log("val/motion_delta", motion_magnitude, prog_bar=True)
 
         return {"val_loss": loss, "val_dtw": dtw}
 
