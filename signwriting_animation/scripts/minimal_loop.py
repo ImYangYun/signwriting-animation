@@ -214,7 +214,7 @@ if __name__ == "__main__":
                 sys.stdout.flush()
 
                 # ✅ only try hand stats if enough joints exist
-                if J > 217:  # 原始 holistic 有 543; reduce_holistic 后可能只有 178
+                if J >= 178:  # 原始 holistic 有 543; reduce_holistic 后可能只有 178
                     left_idx = torch.arange(8+196, 8+196+21, device=pred.device)
                     right_idx = torch.arange(8+196+21, 8+196+42, device=pred.device)
 
