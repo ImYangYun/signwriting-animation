@@ -206,8 +206,8 @@ class LitMinimal(pl.LightningModule):
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
 
-        T = fut.size(1)
-        ts = torch.arange(T, device=fut.device).unsqueeze(0)  # [1, T]
+        B, T = fut.size(0), fut.size(1)
+        ts = torch.arange(T, device=fut.device).unsqueeze(0).expand(B, -1)  # [B, T]
 
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
         in_seq = 0.3 * torch.randn_like(fut) + 1.0 * t_ramp
