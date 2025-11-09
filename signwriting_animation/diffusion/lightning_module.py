@@ -209,7 +209,7 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.5 * torch.randn_like(fut) + 0.8 * t_ramp + 0.1 * fut
+        in_seq = 0.7 * torch.randn_like(fut) + 0.5 * t_ramp
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -261,7 +261,7 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 0.8 * t_ramp + 0.1 * fut
+        in_seq = 0.7 * torch.randn_like(fut) + 0.5 * t_ramp
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
