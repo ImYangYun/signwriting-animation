@@ -200,8 +200,8 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
-        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
+        fut  = sanitize_btjc(batch["data"])
+        past = sanitize_btjc(cond["input_pose"])
         mask = (cond["target_mask"].float().sum(dim=(2, 3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
@@ -253,8 +253,8 @@ class LitMinimal(pl.LightningModule):
 
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
-        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
+        fut  = sanitize_btjc(batch["data"])
+        past = sanitize_btjc(cond["input_pose"])
         mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
