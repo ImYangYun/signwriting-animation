@@ -311,7 +311,7 @@ class OutputProcessMLP(nn.Module):
 
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * 1.0) * 2.0
+        x = torch.tanh(x * 1.5) * 3.0
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
 
         torso_ids = [11, 12, 23, 24]
