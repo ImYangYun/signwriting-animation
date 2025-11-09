@@ -212,6 +212,7 @@ class LitMinimal(pl.LightningModule):
         in_seq = 0.3 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
+        pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
         if T > 1:
@@ -271,7 +272,7 @@ class LitMinimal(pl.LightningModule):
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
-
+        pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
         # --- same weights as training ---
