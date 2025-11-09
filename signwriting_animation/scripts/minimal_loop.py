@@ -129,8 +129,8 @@ if __name__ == "__main__":
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
-        num_past_frames=20,
-        num_future_frames=10,
+        num_past_frames=40,
+        num_future_frames=20,
         with_metadata=True,
         split="train",
         reduce_holistic=True,
