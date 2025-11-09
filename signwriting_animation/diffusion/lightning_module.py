@@ -209,10 +209,10 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
+        in_seq = 0.6 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
-        pred = self.normalize_pose(pred)
+       #pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
         if T > 1:
@@ -220,7 +220,7 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_gt   = fut[:, 1:] - fut[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            loss = loss_pos + 0.3 * loss_vel
+            loss = loss_pos + 0.6 * loss_vel
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
@@ -268,18 +268,18 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
+        in_seq = 0.6 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
-        pred = self.normalize_pose(pred)
+        #pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
         # --- same weights as training ---
         if T > 1:
             vel_mask = mask[:, 1:]
             loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 0.3 * loss_vel
+            loss = loss_pos + 0.6 * loss_vel
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
