@@ -308,27 +308,24 @@ class OutputProcessMLP(nn.Module):
                 Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
         """
         num_frames, batch_size, num_latent_dims = x.shape
+
         x = self.ln(x)
         x = self.mlp(x)
-
-        x = torch.tanh(x * 1.2) * 2.0
+        x = torch.tanh(x * 1.0) * 2.0
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
 
-        if self.training:
-            x_center = x.mean(dim=(2, 3), keepdim=True)
-            x = x - x_center * 0.1
+        torso_ids = [11, 12, 23, 24]
+        torso_ids = [i for i in torso_ids if i < self.num_keypoints]
+        if len(torso_ids) > 0:
+            center = x[:, :, torso_ids, :].mean(dim=2, keepdim=True)
+            x = x - center
         else:
-            x = x - x.mean(dim=(2, 3), keepdim=True) * 0.2
-            x = x + 0.005 * torch.randn_like(x)
+            x = x - x.mean(dim=(2, 3), keepdim=True)
 
-        x = x.permute(1, 2, 3, 0)
+        if not self.training:
+            x = x + 0.002 * torch.randn_like(x)
 
-        anchor_joint_idx = 0
-        if anchor_joint_idx < self.num_keypoints:
-            anchor = x[:, anchor_joint_idx:anchor_joint_idx + 1, :, :].clone()
-            x = x - anchor
-        else:
-            print(f"[WARN] anchor_joint_idx={anchor_joint_idx} 超出关节数量 {self.num_keypoints}")
+        x = x.permute(1, 2, 3, 0).contiguous()
 
         return x
 
