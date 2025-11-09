@@ -375,8 +375,10 @@ if __name__ == "__main__":
     print("=== COMPONENT DIAG END ===\n")
 
     # ---- recenter for visualization ----
-    fut_for_save  = recenter_for_view(fut_un)
-    pred_for_save = recenter_for_view(pred_un)
+    #fut_for_save  = recenter_for_view(fut_un)
+    #pred_for_save = recenter_for_view(pred_un)
+    fut_for_save  = fut_un
+    pred_for_save = pred_un
 
     try:
         gt_pose   = tensor_to_pose(fut_for_save,  header)

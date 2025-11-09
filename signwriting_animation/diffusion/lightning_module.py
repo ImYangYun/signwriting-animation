@@ -181,8 +181,14 @@ class LitMinimal(pl.LightningModule):
         )
 
     def normalize_pose(self, x_btjc):
-        """Normalize tensor [B,T,J,C] using global mean/std."""
-        return (x_btjc - self.mean_pose) / self.std_pose
+        """
+        Normalize tensor [B,T,J,C] per frame to preserve motion.
+        Previously used global mean/std, which removed temporal variation.
+        """
+        mean = x_btjc.mean(dim=(2, 3), keepdim=True)
+        std = x_btjc.std(dim=(2, 3), keepdim=True)
+        return (x_btjc - mean) / (std + 1e-6)
+
 
     def unnormalize_pose(self, x_btjc):
         """Unnormalize tensor [B,T,J,C] using global mean/std."""
