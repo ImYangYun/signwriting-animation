@@ -58,8 +58,8 @@ class DynamicPosePredictionDataset(Dataset):
         self,
         data_dir: str,
         csv_path: str,
-        num_past_frames: int = 60,
-        num_future_frames: int = 30,
+        num_past_frames: int = 20,
+        num_future_frames: int = 10,
         with_metadata: bool = True,
         clip_model_name: str = "openai/clip-vit-base-patch32",
         split: Literal["train", "dev", "test"] = "train",
@@ -195,8 +195,8 @@ def main():
     dataset = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
-        num_past_frames=60,
-        num_future_frames=30,
+        num_past_frames=20,
+        num_future_frames=10,
         with_metadata=True,
         split="train",
         reduce_holistic=True,  # turn on to speed up testing
