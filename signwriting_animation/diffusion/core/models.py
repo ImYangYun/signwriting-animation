@@ -296,10 +296,12 @@ class OutputProcessMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Decodes a sequence of latent vectors into keypoint motion data using a multi-layer perceptron (MLP).
+
         Args:
             x (Tensor):
                 Input latent tensor.
                 Shape: [num_frames, batch_size, num_latent_dims].
+
         Returns:
             Tensor:
                 Decoded keypoint motion.
@@ -309,18 +311,25 @@ class OutputProcessMLP(nn.Module):
         x = self.ln(x)
         x = self.mlp(x)
 
-        x = torch.tanh(x * 1.4) * 15.0
-
+        x = torch.tanh(x * 1.5) * 20.0
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
 
         if self.training:
             x_center = x.mean(dim=(2, 3), keepdim=True)
-            x = x - x_center * 0.15
+            x = x - x_center * 0.1
         else:
             x = x - x.mean(dim=(2, 3), keepdim=True) * 0.2
             x = x + 0.005 * torch.randn_like(x)
 
         x = x.permute(1, 2, 3, 0)
+
+        anchor_joint_idx = 0
+        if anchor_joint_idx < self.num_keypoints:
+            anchor = x[:, anchor_joint_idx:anchor_joint_idx + 1, :, :].clone()
+            x = x - anchor
+        else:
+            print(f"[WARN] anchor_joint_idx={anchor_joint_idx} 超出关节数量 {self.num_keypoints}")
+
         return x
 
 
