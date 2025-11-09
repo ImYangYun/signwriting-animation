@@ -311,22 +311,13 @@ class OutputProcessMLP(nn.Module):
 
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * 1.5) * 3.0
+        x = torch.tanh(x * 1.8) * 2.5
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
-
-        torso_ids = [11, 12, 23, 24]
-        torso_ids = [i for i in torso_ids if i < self.num_keypoints]
-        if len(torso_ids) > 0:
-            center = x[:, :, torso_ids, :].mean(dim=2, keepdim=True)
-            x = x - center
-        else:
-            x = x - x.mean(dim=(2, 3), keepdim=True)
-
+        x_center = x.mean(dim=(2, 3), keepdim=True)
+        x = x - x_center
         if not self.training:
-            x = x + 0.002 * torch.randn_like(x)
-
+            x = x + 0.001 * torch.randn_like(x)
         x = x.permute(1, 2, 3, 0).contiguous()
-
         return x
 
 
