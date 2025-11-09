@@ -209,7 +209,7 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 0.7 * t_ramp + 0.05 * fut
+        in_seq = 0.3 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -238,6 +238,12 @@ class LitMinimal(pl.LightningModule):
         center_loss = ((c_pr - c_gt) ** 2).mean()
         loss = loss + 0.02 * center_loss
 
+        if pred.size(2) >= 175:
+            right = pred[:, :, 154:175, :2].mean(dim=(1, 2))
+            left  = pred[:, :, 133:154, :2].mean(dim=(1, 2))
+            hand_sep = ((right - left).pow(2).sum(dim=-1) + 1e-6).sqrt().mean()
+            loss = loss + 0.01 * (1.0 / hand_sep)
+
         self.log_dict({
             "train/loss": loss,
             "train/loss_pos": loss_pos,
@@ -261,7 +267,7 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.3 * torch.randn_like(fut) + 0.7 * t_ramp + 0.05 * fut
+        in_seq = 0.3 * torch.randn_like(fut) + 0.5 * t_ramp + 0.05 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
