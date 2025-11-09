@@ -200,8 +200,8 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = sanitize_btjc(batch["data"])
-        past = sanitize_btjc(cond["input_pose"])
+        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
+        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
         mask = (cond["target_mask"].float().sum(dim=(2, 3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
@@ -209,7 +209,7 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.7 * torch.randn_like(fut) + 0.5 * t_ramp
+        in_seq = 0.3 * torch.randn_like(fut) + 0.7 * t_ramp + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -252,8 +252,8 @@ class LitMinimal(pl.LightningModule):
 
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = sanitize_btjc(batch["data"])
-        past = sanitize_btjc(cond["input_pose"])
+        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
+        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
         mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
@@ -261,7 +261,7 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.7 * torch.randn_like(fut) + 0.5 * t_ramp
+        in_seq = 0.3 * torch.randn_like(fut) + 0.7 * t_ramp + 0.05 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
