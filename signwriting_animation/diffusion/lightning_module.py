@@ -224,12 +224,16 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        # inject temporal-dependent noise
-        noise = torch.randn_like(fut) * (0.5 + 0.5 * t_ramp)
-        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.1 * fut
+
+        noise = torch.randn_like(fut) * (0.3 + 0.3 * t_ramp)
+        if fut.size(2) > 150:  # holistic 178 joints
+            hand_face_mask = torch.ones_like(fut)
+            hand_face_mask[:, :, 130:, :] = 0.5
+            noise = noise * hand_face_mask
+
+        in_seq = 0.7 * noise + 0.6 * t_ramp + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
-       #pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
         if T > 1:
@@ -237,9 +241,11 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_gt   = fut[:, 1:] - fut[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            loss = loss_pos + 0.8 * loss_vel
+            motion_loss = (pred[:, 1:] - pred[:, :-1]).abs().mean()
+            loss = loss_pos + 0.8 * loss_vel + 0.1 * motion_loss
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
+            motion_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         gt_std = fut[..., :2].std()
@@ -249,7 +255,7 @@ class LitMinimal(pl.LightningModule):
 
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
-            return btjc[..., :torso_end, :2].mean(dim=(1, 2))  # [B, 2]
+            return btjc[..., :torso_end, :2].mean(dim=(1, 2))
 
         c_gt = torso_center(fut)
         c_pr = torso_center(pred)
@@ -266,6 +272,7 @@ class LitMinimal(pl.LightningModule):
             "train/loss": loss,
             "train/loss_pos": loss_pos,
             "train/loss_vel": loss_vel,
+            "train/motion_loss": motion_loss,
             "train/scale_loss": scale_loss,
             "train/center_loss": center_loss,
         }, prog_bar=True, on_step=True)
@@ -285,29 +292,35 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        # inject temporal-dependent noise
-        noise = torch.randn_like(fut) * (0.5 + 0.5 * t_ramp)
-        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.1 * fut
 
-        print("[VAL DEBUG] pred frame-wise std (before forward):",
-            fut.std(dim=(0,2,3)).detach().cpu().numpy())
+        # === inject same moderated noise ===
+        noise = torch.randn_like(fut) * (0.3 + 0.3 * t_ramp)
+        if fut.size(2) > 150:
+            hand_face_mask = torch.ones_like(fut)
+            hand_face_mask[:, :, 130:, :] = 0.5
+            noise = noise * hand_face_mask
+
+        in_seq = 0.7 * noise + 0.6 * t_ramp + 0.15 * fut
+        print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
-        #pred = self.normalize_pose(pred)
         loss_pos = masked_mse(pred, fut, mask)
 
-        # --- same weights as training ---
         if T > 1:
             vel_mask = mask[:, 1:]
-            loss_vel = masked_mse(pred[:,1:]-pred[:,:-1], fut[:,1:]-fut[:,:-1], vel_mask)
-            loss = loss_pos + 0.8 * loss_vel
+            vel_pred = pred[:, 1:] - pred[:, :-1]
+            vel_gt   = fut[:, 1:] - fut[:, :-1]
+            loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
+            motion_loss = (pred[:, 1:] - pred[:, :-1]).abs().mean()
+            loss = loss_pos + 0.8 * loss_vel + 0.1 * motion_loss
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
+            motion_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
-            return btjc[..., :torso_end, :2].mean(dim=(1, 2))  # [B, 2]
+            return btjc[..., :torso_end, :2].mean(dim=(1, 2))
 
         c_gt = torso_center(fut)
         c_pr = torso_center(pred)
@@ -323,6 +336,7 @@ class LitMinimal(pl.LightningModule):
             "val/loss": loss,
             "val/loss_pos": loss_pos,
             "val/vel_loss": loss_vel,
+            "val/motion_loss": motion_loss,
             "val/center_loss": center_loss,
             "val/dtw": dtw
         }, prog_bar=True)
@@ -332,7 +346,6 @@ class LitMinimal(pl.LightningModule):
         self.print(msg)
         self.log("val/motion_delta", motion_magnitude, prog_bar=True)
 
-        # --- motion debug ---
         pred_std_per_frame = pred.std(dim=(0,2,3)).detach().cpu().numpy()
         fut_std_per_frame  = fut.std(dim=(0,2,3)).detach().cpu().numpy()
         print("[VAL DEBUG] pred frame-wise std:", pred_std_per_frame)
