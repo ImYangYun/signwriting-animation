@@ -285,7 +285,7 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        i# inject temporal-dependent noise
+        # inject temporal-dependent noise
         noise = torch.randn_like(fut) * (0.5 + 0.5 * t_ramp)
         in_seq = 0.8 * noise + 0.6 * t_ramp + 0.1 * fut
 
