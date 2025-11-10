@@ -225,13 +225,16 @@ class LitMinimal(pl.LightningModule):
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
-        noise = torch.randn_like(fut) * (0.3 + 0.3 * t_ramp)
-        if fut.size(2) > 150:  # holistic 178 joints
+        # === temporal-dependent noise ===
+        temporal_noise = torch.randn_like(fut[:, 1:] - fut[:, :-1])
+        temporal_noise = torch.cat([temporal_noise[:, :1], temporal_noise], dim=1)
+        noise = 0.3 * torch.randn_like(fut) + 0.3 * temporal_noise
+        if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
-        in_seq = 0.7 * noise + 0.6 * t_ramp + 0.15 * fut
+        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -241,8 +244,13 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_gt   = fut[:, 1:] - fut[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            motion_loss = (pred[:, 1:] - pred[:, :-1]).abs().mean()
-            loss = loss_pos + 0.8 * loss_vel + 0.1 * motion_loss
+
+            # === cosine motion direction loss ===
+            cos_sim = torch.nn.functional.cosine_similarity(
+                vel_pred.flatten(2), vel_gt.flatten(2), dim=2
+            ).mean()
+            motion_loss = (1 - cos_sim)  # encourage same direction
+            loss = loss_pos + 0.8 * loss_vel + 0.2 * motion_loss
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             motion_loss = torch.tensor(0.0, device=fut.device)
@@ -293,14 +301,16 @@ class LitMinimal(pl.LightningModule):
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
-        # === inject same moderated noise ===
-        noise = torch.randn_like(fut) * (0.3 + 0.3 * t_ramp)
+        # === temporal noise same as training ===
+        temporal_noise = torch.randn_like(fut[:, 1:] - fut[:, :-1])
+        temporal_noise = torch.cat([temporal_noise[:, :1], temporal_noise], dim=1)
+        noise = 0.3 * torch.randn_like(fut) + 0.3 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
-        in_seq = 0.7 * noise + 0.6 * t_ramp + 0.15 * fut
+        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
@@ -311,8 +321,11 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_gt   = fut[:, 1:] - fut[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            motion_loss = (pred[:, 1:] - pred[:, :-1]).abs().mean()
-            loss = loss_pos + 0.8 * loss_vel + 0.1 * motion_loss
+            cos_sim = torch.nn.functional.cosine_similarity(
+                vel_pred.flatten(2), vel_gt.flatten(2), dim=2
+            ).mean()
+            motion_loss = (1 - cos_sim)
+            loss = loss_pos + 0.8 * loss_vel + 0.2 * motion_loss
         else:
             loss_vel = torch.tensor(0.0, device=fut.device)
             motion_loss = torch.tensor(0.0, device=fut.device)
