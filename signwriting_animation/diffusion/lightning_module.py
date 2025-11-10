@@ -191,8 +191,17 @@ class LitMinimal(pl.LightningModule):
 
 
     def unnormalize_pose(self, x_btjc):
-        """Unnormalize tensor [B,T,J,C] using global mean/std."""
-        return x_btjc * self.std_pose + self.mean_pose
+        x_btjc = x_btjc * self.std_pose + self.mean_pose
+        try:
+            from pose_anonymization.data.normalization import unshift_hands
+            from pose_format.pose import Pose
+            dummy = Pose(header=None, body=None)
+            dummy.body.data = x_btjc[0].detach().cpu().numpy()
+            unshift_hands(dummy)
+            x_btjc[0] = torch.tensor(dummy.body.data, device=x_btjc.device)
+        except Exception as e:
+            print(f"[WARN] unshift_hands failed: {e}")
+        return x_btjc
 
 
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
@@ -215,7 +224,9 @@ class LitMinimal(pl.LightningModule):
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.8 * torch.randn_like(fut) + 0.6 * t_ramp + 0.05 * fut
+        # inject temporal-dependent noise
+        noise = torch.randn_like(fut) * (0.5 + 0.5 * t_ramp)
+        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.1 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
        #pred = self.normalize_pose(pred)
@@ -274,7 +285,10 @@ class LitMinimal(pl.LightningModule):
 
         T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
-        in_seq = 0.8 * torch.randn_like(fut) + 0.6 * t_ramp + 0.05 * fut
+        i# inject temporal-dependent noise
+        noise = torch.randn_like(fut) * (0.5 + 0.5 * t_ramp)
+        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.1 * fut
+
         print("[VAL DEBUG] pred frame-wise std (before forward):",
             fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
