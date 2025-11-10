@@ -226,16 +226,16 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         # === temporal-dependent noise ===
-        temporal_noise = torch.randn_like(fut[:, 1:] - fut[:, :-1])
-        temporal_noise = torch.cat([temporal_noise[:, :1], temporal_noise], dim=1)
-        noise = 0.3 * torch.randn_like(fut) + 0.3 * temporal_noise
+        velocity = fut[:, 1:] - fut[:, :-1]
+        temporal_noise = torch.cat([velocity[:, :1], velocity], dim=1)
+        noise = 0.3 * torch.randn_like(fut) + 0.6 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
+        in_seq = 0.8 * noise + 0.5 * t_ramp + 0.1 * past + 0.1 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -303,16 +303,16 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         # === temporal noise same as training ===
-        temporal_noise = torch.randn_like(fut[:, 1:] - fut[:, :-1])
-        temporal_noise = torch.cat([temporal_noise[:, :1], temporal_noise], dim=1)
-        noise = 0.3 * torch.randn_like(fut) + 0.3 * temporal_noise
+        velocity = fut[:, 1:] - fut[:, :-1]
+        temporal_noise = torch.cat([velocity[:, :1], velocity], dim=1)
+        noise = 0.3 * torch.randn_like(fut) + 0.6 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
+        in_seq = 0.8 * noise + 0.5 * t_ramp + 0.1 * past + 0.1 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
         pred = self.forward(in_seq, ts, past, sign)
