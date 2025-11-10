@@ -234,6 +234,7 @@ class LitMinimal(pl.LightningModule):
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
+        past = past[:, -T:, :, :]
         in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
@@ -310,6 +311,7 @@ class LitMinimal(pl.LightningModule):
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
+        past = past[:, -T:, :, :]
         in_seq = 0.8 * noise + 0.6 * t_ramp + 0.05 * past + 0.05 * fut
         print("[VAL DEBUG] pred frame-wise std (before forward):", fut.std(dim=(0,2,3)).detach().cpu().numpy())
 
