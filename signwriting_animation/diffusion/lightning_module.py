@@ -182,12 +182,19 @@ class LitMinimal(pl.LightningModule):
 
     def normalize_pose(self, x_btjc):
         """
-        Normalize tensor [B,T,J,C] per frame to preserve motion.
-        Previously used global mean/std, which removed temporal variation.
+        Hybrid normalization to suppress high-frequency jitter:
+        - 80% framewise normalization (preserve temporal structure)
+        - 20% global normalization (stabilize overall scale)
         """
-        mean = x_btjc.mean(dim=(2, 3), keepdim=True)
-        std = x_btjc.std(dim=(2, 3), keepdim=True)
-        return (x_btjc - mean) / (std + 1e-6)
+        frame_mean = x_btjc.mean(dim=(2, 3), keepdim=True)
+        global_mean = x_btjc.mean(dim=(1, 2, 3), keepdim=True)
+        mixed_mean = 0.8 * frame_mean + 0.2 * global_mean
+
+        frame_std = x_btjc.std(dim=(2, 3), keepdim=True)
+        global_std = x_btjc.std(dim=(1, 2, 3), keepdim=True)
+        mixed_std = 0.8 * frame_std + 0.2 * global_std
+
+        return (x_btjc - mixed_mean) / (mixed_std + 1e-6)
 
 
     def unnormalize_pose(self, x_btjc):
@@ -226,14 +233,8 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        accel = torch.zeros_like(velocity)
-        accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = (
-            0.6 * velocity.mean(dim=1, keepdim=True)
-            + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        )
-
+        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
         noise = 0.2 * torch.randn_like(fut) + 0.15 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
@@ -245,16 +246,14 @@ class LitMinimal(pl.LightningModule):
 
         pred = self.forward(in_seq, ts, past, sign)
 
-        # === Joint-wise weighting: emphasize hands ===
         B, T, J, C = pred.shape
         w = torch.ones(B, T, J, 1, device=pred.device)
-        w[:, :, :33, :] = 0.4
-        w[:, :, 133:154, :] = 1.3
-        w[:, :, 154:175, :] = 1.3
+        w[:, :, :33, :] = 0.4      # face
+        w[:, :, 133:154, :] = 1.3  # left hand
+        w[:, :, 154:175, :] = 1.3  # right hand
         w[:, :, 175:, :] = 0.8
         diff = (pred - fut) ** 2
-        mask_bt = mask if mask.dim() == 2 else mask.squeeze(-1).squeeze(-1)
-        mask_4d = mask_bt[:, :, None, None].float()
+        mask_4d = mask[:, :, None, None].float()
         loss_pos = ((diff * w) * mask_4d).mean()
 
         if T > 2:
@@ -265,81 +264,39 @@ class LitMinimal(pl.LightningModule):
             acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
             loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
             loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
-
-            cos_sim = torch.nn.functional.cosine_similarity(
-                vel_pred.flatten(2), vel_gt.flatten(2), dim=2
-            ).mean()
+            cos_sim = torch.nn.functional.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
             motion_consistency = (1 - cos_sim)
-
-            dir_change = vel_pred[:, 1:] * vel_pred[:, :-1]
-            direction_loss = (dir_change < 0).float().mean()
-
+            direction_loss = (vel_pred[:, 1:] * vel_pred[:, :-1] < 0).float().mean()
             smooth_acc_loss = (acc_pred ** 2).mean()
             temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
             temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
-
-            loss = (
-                loss_pos
-                + 0.4 * loss_vel
-                + 0.15 * loss_acc
-                + 0.35 * motion_consistency
-                + 0.02 * direction_loss
-                + 0.03 * smooth_acc_loss
-                + 0.02 * temporal_smooth_loss
-            )
+            loss = (loss_pos
+                    + 0.4 * loss_vel
+                    + 0.15 * loss_acc
+                    + 0.35 * motion_consistency
+                    + 0.02 * direction_loss
+                    + 0.03 * smooth_acc_loss
+                    + 0.02 * temporal_smooth_loss)
         else:
             loss = loss_pos
             vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
 
+        # === Regularizers ===
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
         loss += 0.15 * motion_amp
-        self.log("train/motion_amp_loss", motion_amp, prog_bar=True)
-
-        vel_align = 1 - torch.cosine_similarity(
-            vel_pred.flatten(2), vel_gt.flatten(2), dim=2
-        ).mean()
-        loss += 0.08 * vel_align
+        vel_align = 1 - torch.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
+        loss += 0.08 * vel_align  # stronger weight
         self.log("train/vel_align_loss", vel_align, prog_bar=True)
-
-        gt_std = fut[..., :2].std()
-        pred_std = pred[..., :2].std()
-        scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
-
-        def torso_center(btjc):
-            torso_end = min(33, btjc.size(2))
-            return btjc[..., :torso_end, :2].mean(dim=(1, 2))
-
-        c_gt = torso_center(fut)
-        c_pr = torso_center(pred)
-        center_loss = ((c_pr - c_gt) ** 2).mean()
-
-        loss += 0.03 * scale_loss + 0.02 * center_loss
 
         if fut.size(2) > 150:
             face_pred = pred[:, :, :33, :]
-            face_gt = fut[:, :, :33, :]
-            face_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean()
-            loss += 0.01 * face_smooth
-            self.log("train/face_smooth_loss", face_smooth, prog_bar=False)
+            hand_pred = pred[:, :, 133:175, :]
+            local_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean() * 0.6 \
+                        + ((hand_pred[:, 1:] - hand_pred[:, :-1]) ** 2).mean() * 0.4
+            loss += 0.015 * local_smooth
+            self.log("train/local_smooth_loss", local_smooth, prog_bar=False)
 
-        motion_delta = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
-        self.log("train/motion_delta", motion_delta, prog_bar=True)
-
-        self.log_dict({
-            "train/loss": loss,
-            "train/loss_pos": loss_pos,
-            "train/loss_vel": loss_vel,
-            "train/loss_acc": loss_acc,
-            "train/motion_consistency": motion_consistency,
-            "train/direction_loss": direction_loss,
-            "train/smooth_acc_loss": smooth_acc_loss,
-            "train/temporal_smooth_loss": temporal_smooth_loss,
-            "train/scale_loss": scale_loss,
-            "train/center_loss": center_loss,
-            "train/motion_amp_loss": motion_amp,
-        }, prog_bar=True, on_step=True)
-
-        self.train_losses.append(loss.item())
+        self.log("train/loss", loss, prog_bar=True)
         return loss
 
 
@@ -355,111 +312,78 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        accel = torch.zeros_like(velocity)
-        accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = (
-            0.6 * velocity.mean(dim=1, keepdim=True)
-            + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        )
+        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
         noise = 0.1 * torch.randn_like(fut) + 0.1 * temporal_noise
-
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 1.2
             hand_face_mask[:, :, :33, :] = 1.3
             noise = noise * hand_face_mask
-
         past = past[:, -T:, :, :]
         in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         B, T, J, C = pred.shape
         w = torch.ones(B, T, J, 1, device=pred.device)
-
-        w[:, :, :33, :] = 0.4      # 降低面部影响
-        w[:, :, 133:154, :] = 1.3  # 左手
-        w[:, :, 154:175, :] = 1.3  # 右手
-        w[:, :, 175:, :] = 0.8     # 世界坐标适度弱化
-
+        w[:, :, :33, :] = 0.4
+        w[:, :, 133:154, :] = 1.3
+        w[:, :, 154:175, :] = 1.3
+        w[:, :, 175:, :] = 0.8
         diff = (pred - fut) ** 2
-        mask_bt = mask if mask.dim() == 2 else mask.squeeze(-1).squeeze(-1)
-        mask_4d = mask_bt[:, :, None, None].float()
+        mask_4d = mask[:, :, None, None].float()
         loss_pos = ((diff * w) * mask_4d).mean()
 
-        if T > 2:
-            vel_mask = mask[:, 1:]
-            vel_pred = pred[:, 1:] - pred[:, :-1]
-            vel_gt   = fut[:, 1:] - fut[:, :-1]
-            acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-            acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
-            loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
+        vel_mask = mask[:, 1:]
+        vel_pred = pred[:, 1:] - pred[:, :-1]
+        vel_gt   = fut[:, 1:] - fut[:, :-1]
+        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
+        acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
 
-            cos_sim = torch.nn.functional.cosine_similarity(
-                vel_pred.flatten(2), vel_gt.flatten(2), dim=2
-            ).mean()
-            motion_consistency = (1 - cos_sim)
+        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
+        loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
+        cos_sim = torch.nn.functional.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
+        motion_consistency = (1 - cos_sim)
+        direction_loss = (vel_pred[:, 1:] * vel_pred[:, :-1] < 0).float().mean()
+        smooth_acc_loss = (acc_pred ** 2).mean()
+        temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
+        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
 
-            dir_change = vel_pred[:, 1:] * vel_pred[:, :-1]
-            direction_loss = (dir_change < 0).float().mean()
-
-            smooth_acc_loss = (acc_pred ** 2).mean()
-            temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
-            temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
-
-            loss = (
-                loss_pos
+        loss = (loss_pos
                 + 0.35 * loss_vel
                 + 0.15 * loss_acc
                 + 0.35 * motion_consistency
                 + 0.02 * direction_loss
                 + 0.05 * smooth_acc_loss
-                + 0.03 * temporal_smooth_loss
-            )
-        else:
-            loss = loss_pos
-            vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
+                + 0.03 * temporal_smooth_loss)
 
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
         loss += 0.1 * motion_amp
-        self.log("val/motion_amp_loss", motion_amp, prog_bar=True)
-
-        vel_align = 1 - torch.cosine_similarity(
-            vel_pred.flatten(2), vel_gt.flatten(2), dim=2
-        ).mean()
-        loss += 0.05 * vel_align
-        self.log("val/vel_align_loss", vel_align, prog_bar=True)
+        vel_align = 1 - torch.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
+        loss += 0.08 * vel_align
 
         if fut.size(2) > 150:
             face_pred = pred[:, :, :33, :]
-            face_gt = fut[:, :, :33, :]
-            face_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean()
-            loss += 0.01 * face_smooth
-            self.log("val/face_smooth_loss", face_smooth, prog_bar=False)
+            hand_pred = pred[:, :, 133:175, :]
+            local_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean() * 0.6 \
+                        + ((hand_pred[:, 1:] - hand_pred[:, :-1]) ** 2).mean() * 0.4
+            loss += 0.015 * local_smooth
+            self.log("val/local_smooth_loss", local_smooth, prog_bar=False)
 
-        dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
-        motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
-
-        dtw_norm = masked_dtw(pred, fut, mask)
+        # === DTW metrics ===
+        dtw_norm  = masked_dtw(pred, fut, mask)
         dtw_unorm = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
+        dtw_face  = masked_dtw(pred[:, :, :33, :], fut[:, :, :33, :], mask)
+        dtw_handR = masked_dtw(pred[:, :, 154:175, :], fut[:, :, 154:175, :], mask)
+
         self.log("val/dtw_norm", dtw_norm, prog_bar=False)
         self.log("val/dtw_unorm", dtw_unorm, prog_bar=True)
+        self.log("val/dtw_face", dtw_face, prog_bar=False)
+        self.log("val/dtw_handR", dtw_handR, prog_bar=False)
+        self.log("val/loss", loss, prog_bar=True)
+        
+        return {"val_loss": loss, "val_dtw": dtw_unorm}
 
-        self.log_dict({
-            "val/loss": loss,
-            "val/loss_pos": loss_pos,
-            "val/loss_vel": loss_vel,
-            "val/loss_acc": loss_acc,
-            "val/motion_consistency": motion_consistency,
-            "val/direction_loss": direction_loss,
-            "val/smooth_acc_loss": smooth_acc_loss,
-            "val/temporal_smooth_loss": temporal_smooth_loss,
-            "val/dtw": dtw,
-            "val/motion_delta": motion_magnitude,
-        }, prog_bar=True)
-
-        return {"val_loss": loss, "val_dtw": dtw}
 
 
     @torch.no_grad()
