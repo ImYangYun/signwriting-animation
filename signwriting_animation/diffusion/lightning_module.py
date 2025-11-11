@@ -229,16 +229,19 @@ class LitMinimal(pl.LightningModule):
         accel = torch.zeros_like(velocity)
         accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
+        temporal_noise = (
+            0.6 * velocity.mean(dim=1, keepdim=True)
+            + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
+        )
 
-        noise = 0.25 * torch.randn_like(fut) + 0.15 * temporal_noise
+        noise = 0.2 * torch.randn_like(fut) + 0.15 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 0.5
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
+        in_seq = 0.2 * noise + 0.25 * t_ramp + 0.4 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -266,16 +269,16 @@ class LitMinimal(pl.LightningModule):
 
             loss = (
                 loss_pos
-                + 0.5 * loss_vel
+                + 0.4 * loss_vel
                 + 0.15 * loss_acc
-                + 0.25 * motion_consistency
+                + 0.35 * motion_consistency
                 + 0.02 * direction_loss
-                + 0.05 * smooth_acc_loss
-                + 0.03 * temporal_smooth_loss
+                + 0.04 * smooth_acc_loss
+                + 0.025 * temporal_smooth_loss
             )
         else:
             loss = loss_pos
-            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
+            vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
 
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
         loss += 0.1 * motion_amp
@@ -337,8 +340,11 @@ class LitMinimal(pl.LightningModule):
         accel = torch.zeros_like(velocity)
         accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        noise = 0.15 * torch.randn_like(fut) + 0.1 * temporal_noise
+        temporal_noise = (
+            0.6 * velocity.mean(dim=1, keepdim=True)
+            + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
+        )
+        noise = 0.1 * torch.randn_like(fut) + 0.1 * temporal_noise
 
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
@@ -346,7 +352,7 @@ class LitMinimal(pl.LightningModule):
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.3 * noise + 0.25 * t_ramp + 0.3 * past + 0.15 * fut
+        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -374,11 +380,11 @@ class LitMinimal(pl.LightningModule):
 
             loss = (
                 loss_pos
-                + 0.4 * loss_vel
+                + 0.35 * loss_vel
                 + 0.15 * loss_acc
-                + 0.2 * motion_consistency
+                + 0.35 * motion_consistency
                 + 0.02 * direction_loss
-                + 0.03 * smooth_acc_loss
+                + 0.05 * smooth_acc_loss
                 + 0.03 * temporal_smooth_loss
             )
         else:
