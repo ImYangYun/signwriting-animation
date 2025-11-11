@@ -304,6 +304,13 @@ class LitMinimal(pl.LightningModule):
 
         loss += 0.03 * scale_loss + 0.02 * center_loss
 
+        if fut.size(2) > 150:
+            face_pred = pred[:, :, :33, :]
+            face_gt = fut[:, :, :33, :]
+            face_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean()
+            loss += 0.01 * face_smooth
+            self.log("train/face_smooth_loss", face_smooth, prog_bar=False)
+
         motion_delta = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
         self.log("train/motion_delta", motion_delta, prog_bar=True)
 
@@ -349,6 +356,7 @@ class LitMinimal(pl.LightningModule):
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 1.2
+            hand_face_mask[:, :, :33, :] = 1.3
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
@@ -400,6 +408,13 @@ class LitMinimal(pl.LightningModule):
         ).mean()
         loss += 0.05 * vel_align
         self.log("val/vel_align_loss", vel_align, prog_bar=True)
+
+        if fut.size(2) > 150:
+            face_pred = pred[:, :, :33, :]
+            face_gt = fut[:, :, :33, :]
+            face_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean()
+            loss += 0.01 * face_smooth
+            self.log("val/face_smooth_loss", face_smooth, prog_bar=False)
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
         motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
