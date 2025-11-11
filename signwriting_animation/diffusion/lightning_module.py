@@ -112,7 +112,7 @@ class LitMinimal(pl.LightningModule):
     Uses precomputed global statistics for consistent scale across samples.
     """
 
-    def __init__(self, num_keypoints=586, num_dims=3, lr=1e-3, log_dir="logs",
+    def __init__(self, num_keypoints=586, num_dims=3, lr=1e-4, log_dir="logs",
                 stats_path="/data/yayun/pose_data/mean_std_178.pt",
                 data_dir="/data/yayun/pose_data",
                 csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):
@@ -237,7 +237,7 @@ class LitMinimal(pl.LightningModule):
         noise = 0.2 * torch.randn_like(fut) + 0.15 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, 130:, :] = 0.5
+            hand_face_mask[:, :, 130:, :] = 1.2
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
@@ -273,15 +273,15 @@ class LitMinimal(pl.LightningModule):
                 + 0.15 * loss_acc
                 + 0.35 * motion_consistency
                 + 0.02 * direction_loss
-                + 0.04 * smooth_acc_loss
-                + 0.025 * temporal_smooth_loss
+                + 0.03 * smooth_acc_loss
+                + 0.02 * temporal_smooth_loss
             )
         else:
             loss = loss_pos
             vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
 
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
-        loss += 0.1 * motion_amp
+        loss += 0.15 * motion_amp
         self.log("train/motion_amp_loss", motion_amp, prog_bar=True)
 
         vel_align = 1 - torch.cosine_similarity(
@@ -348,7 +348,7 @@ class LitMinimal(pl.LightningModule):
 
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, 130:, :] = 0.5
+            hand_face_mask[:, :, 130:, :] = 1.2
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
