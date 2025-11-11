@@ -219,6 +219,17 @@ if __name__ == "__main__":
         print("[EVAL DEBUG] pred shape after forward:", pred.shape)
         sys.stdout.flush()
 
+        # ---- Motion diagnostic ----
+        try:
+            if pred.ndim == 4:
+                vel_pred = pred[:, 1:] - pred[:, :-1]
+                motion_delta = vel_pred.abs().mean().item()
+                print(f"[MOTION CHECK] pred Δ mean: {motion_delta:.5f}")
+            else:
+                print(f"[MOTION CHECK] skipped (pred.ndim={pred.ndim})")
+        except Exception as e:
+            print(f"[MOTION CHECK ERROR] {e}")
+
         try:
             if pred.ndim == 4:
                 B, T, J, C = pred.shape
@@ -264,6 +275,10 @@ if __name__ == "__main__":
         sys.stdout.flush()
 
         dtw_val = masked_dtw(pred, fut, mask).item()
+        vel_pred = pred[:, 1:] - pred[:, :-1]
+        vel_gt = fut[:, 1:] - fut[:, :-1]
+        print("[VEL CHECK] mean |vel_pred| =", vel_pred.abs().mean().item(),
+            " |vel_gt| =", vel_gt.abs().mean().item())
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
         # ---- plain tensors ----
