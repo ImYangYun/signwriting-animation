@@ -226,9 +226,10 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        accel = velocity[:, 1:] - velocity[:, :-1]
-        accel = torch.cat([accel[:, :1], accel, accel[:, -1:]], dim=1)
+        accel = torch.zeros_like(velocity)
+        accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = 0.6 * velocity + 0.4 * accel
+        temporal_noise = torch.cat([temporal_noise, temporal_noise[:, -1:]], dim=1)  # pad to T
         noise = 0.15 * torch.randn_like(fut) + 0.35 * temporal_noise
 
         if fut.size(2) > 150:
@@ -315,9 +316,10 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        accel = velocity[:, 1:] - velocity[:, :-1]
-        accel = torch.cat([accel[:, :1], accel, accel[:, -1:]], dim=1)
+        accel = torch.zeros_like(velocity)
+        accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = 0.6 * velocity + 0.4 * accel
+        temporal_noise = torch.cat([temporal_noise, temporal_noise[:, -1:]], dim=1)  # pad to T
         noise = 0.15 * torch.randn_like(fut) + 0.35 * temporal_noise
 
         if fut.size(2) > 150:
