@@ -296,6 +296,11 @@ class LitMinimal(pl.LightningModule):
             loss += 0.015 * local_smooth
             self.log("train/local_smooth_loss", local_smooth, prog_bar=False)
 
+        if pred.size(1) > 2:
+            temporal_consistency = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
+            loss += 0.02 * temporal_consistency
+            self.log("train/temporal_consistency", temporal_consistency, prog_bar=False)
+
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
@@ -381,7 +386,7 @@ class LitMinimal(pl.LightningModule):
         self.log("val/dtw_face", dtw_face, prog_bar=False)
         self.log("val/dtw_handR", dtw_handR, prog_bar=False)
         self.log("val/loss", loss, prog_bar=True)
-        
+
         return {"val_loss": loss, "val_dtw": dtw_unorm}
 
 

@@ -320,6 +320,11 @@ if __name__ == "__main__":
         fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
 
+        alpha = 0.6
+        pred_smooth = pred_un.clone()
+        pred_smooth[1:] = alpha * pred_un[1:] + (1 - alpha) * pred_un[:-1]
+        pred_un = pred_smooth
+
         # ---- axis-wise stats ----
         def axis_stats(t):
             if t.dim() == 4: t = t[0]
