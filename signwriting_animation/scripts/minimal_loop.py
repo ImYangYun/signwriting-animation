@@ -199,7 +199,9 @@ if __name__ == "__main__":
 
         in_seq = (
             0.2 * torch.randn_like(fut_dense)
-            + 1.0 * torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
+            + 0.2 * torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
+            + 0.45 * past
+            + 0.15 * fut_dense
         )
 
         pred = model.forward(in_seq, ts, past, sign)

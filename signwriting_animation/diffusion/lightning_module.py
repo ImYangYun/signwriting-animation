@@ -278,8 +278,14 @@ class LitMinimal(pl.LightningModule):
             loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
 
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
-        loss += 0.05 * motion_amp
+        loss += 0.1 * motion_amp
         self.log("train/motion_amp_loss", motion_amp, prog_bar=True)
+
+        vel_align = 1 - torch.cosine_similarity(
+            vel_pred.flatten(2), vel_gt.flatten(2), dim=2
+        ).mean()
+        loss += 0.05 * vel_align
+        self.log("train/vel_align_loss", vel_align, prog_bar=True)
 
         gt_std = fut[..., :2].std()
         pred_std = pred[..., :2].std()
@@ -377,10 +383,17 @@ class LitMinimal(pl.LightningModule):
             )
         else:
             loss = loss_pos
+            vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
 
         motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
-        loss += 0.05 * motion_amp
+        loss += 0.1 * motion_amp
         self.log("val/motion_amp_loss", motion_amp, prog_bar=True)
+
+        vel_align = 1 - torch.cosine_similarity(
+            vel_pred.flatten(2), vel_gt.flatten(2), dim=2
+        ).mean()
+        loss += 0.05 * vel_align
+        self.log("val/vel_align_loss", vel_align, prog_bar=True)
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
         motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
