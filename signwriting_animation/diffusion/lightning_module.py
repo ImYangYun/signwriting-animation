@@ -226,17 +226,19 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        temporal_noise = torch.cat([velocity[:, :1], velocity], dim=1)
-        noise = 0.25 * torch.randn_like(fut) + 0.45 * temporal_noise
+        accel = velocity[:, 1:] - velocity[:, :-1]
+        accel = torch.cat([accel[:, :1], accel, accel[:, -1:]], dim=1)
+        temporal_noise = 0.6 * velocity + 0.4 * accel
+        noise = 0.15 * torch.randn_like(fut) + 0.35 * temporal_noise
 
         if fut.size(2) > 150:
-            hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, :33, :] = 0.7
-            hand_face_mask[:, :, 130:, :] = 0.4
-            noise = noise * hand_face_mask
+            region_mask = torch.ones_like(fut)
+            region_mask[:, :, :33, :] = 0.7   # torso+head more stable
+            region_mask[:, :, 130:, :] = 0.4  # hands remain expressive
+            noise = noise * region_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.8 * noise + 0.5 * t_ramp + 0.1 * past + 0.1 * fut
+        in_seq = 0.8 * noise + 0.3 * t_ramp + 0.1 * past + 0.1 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -257,13 +259,17 @@ class LitMinimal(pl.LightningModule):
             motion_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
-        # === scale stability ===
+        if T > 2:
+            smooth_loss = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
+            loss = loss + 0.05 * smooth_loss
+        else:
+            smooth_loss = torch.tensor(0.0, device=fut.device)
+
         gt_std = fut[..., :2].std()
         pred_std = pred[..., :2].std()
         scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
         loss = loss + 0.05 * scale_loss
 
-        # === torso center stability ===
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
             return btjc[..., :torso_end, :2].mean(dim=(1, 2))
@@ -273,18 +279,20 @@ class LitMinimal(pl.LightningModule):
         center_loss = ((c_pr - c_gt) ** 2).mean()
         loss = loss + 0.05 * center_loss
 
-        # === limb proportion consistency ===
-        limb_pairs = [(11,13),(12,14),(13,15),(14,16)]  # upper/lower arms
+        limb_pairs = [(11,13),(12,14),(13,15),(14,16)]
         limb_gt = torch.stack([(fut[:,:,a,:2]-fut[:,:,b,:2]).norm(dim=-1) for a,b in limb_pairs], dim=-1)
         limb_pr = torch.stack([(pred[:,:,a,:2]-pred[:,:,b,:2]).norm(dim=-1) for a,b in limb_pairs], dim=-1)
-        loss_limb = ((limb_pr / (limb_gt + 1e-6) - 1.0) ** 2).mean()
-        loss = loss + 0.02 * loss_limb
+        limb_ratio = (limb_pr / (limb_gt + 1e-6))
+        limb_clip = torch.clamp(limb_ratio, 0.5, 1.5)
+        loss_limb = ((limb_clip / (limb_gt + 1e-6) - 1.0) ** 2).mean()
+        loss = loss + 0.05 * loss_limb
 
         self.log_dict({
             "train/loss": loss,
             "train/loss_pos": loss_pos,
             "train/loss_vel": loss_vel,
             "train/motion_loss": motion_loss,
+            "train/smooth_loss": smooth_loss,
             "train/scale_loss": scale_loss,
             "train/center_loss": center_loss,
             "train/limb_loss": loss_limb,
@@ -307,17 +315,19 @@ class LitMinimal(pl.LightningModule):
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
-        temporal_noise = torch.cat([velocity[:, :1], velocity], dim=1)
-        noise = 0.25 * torch.randn_like(fut) + 0.45 * temporal_noise
+        accel = velocity[:, 1:] - velocity[:, :-1]
+        accel = torch.cat([accel[:, :1], accel, accel[:, -1:]], dim=1)
+        temporal_noise = 0.6 * velocity + 0.4 * accel
+        noise = 0.15 * torch.randn_like(fut) + 0.35 * temporal_noise
 
         if fut.size(2) > 150:
-            hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, :33, :] = 0.7
-            hand_face_mask[:, :, 130:, :] = 0.4
-            noise = noise * hand_face_mask
+            region_mask = torch.ones_like(fut)
+            region_mask[:, :, :33, :] = 0.7
+            region_mask[:, :, 130:, :] = 0.4
+            noise = noise * region_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.8 * noise + 0.5 * t_ramp + 0.1 * past + 0.1 * fut
+        in_seq = 0.8 * noise + 0.3 * t_ramp + 0.1 * past + 0.1 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -337,6 +347,12 @@ class LitMinimal(pl.LightningModule):
             motion_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
+        if T > 2:
+            smooth_loss = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
+            loss = loss + 0.05 * smooth_loss
+        else:
+            smooth_loss = torch.tensor(0.0, device=fut.device)
+
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
             return btjc[..., :torso_end, :2].mean(dim=(1, 2))
@@ -349,8 +365,10 @@ class LitMinimal(pl.LightningModule):
         limb_pairs = [(11,13),(12,14),(13,15),(14,16)]
         limb_gt = torch.stack([(fut[:,:,a,:2]-fut[:,:,b,:2]).norm(dim=-1) for a,b in limb_pairs], dim=-1)
         limb_pr = torch.stack([(pred[:,:,a,:2]-pred[:,:,b,:2]).norm(dim=-1) for a,b in limb_pairs], dim=-1)
-        loss_limb = ((limb_pr / (limb_gt + 1e-6) - 1.0) ** 2).mean()
-        loss = loss + 0.02 * loss_limb
+        limb_ratio = (limb_pr / (limb_gt + 1e-6))
+        limb_clip = torch.clamp(limb_ratio, 0.5, 1.5)
+        loss_limb = ((limb_clip / (limb_gt + 1e-6) - 1.0) ** 2).mean()
+        loss = loss + 0.05 * loss_limb
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
 
@@ -362,6 +380,7 @@ class LitMinimal(pl.LightningModule):
             "val/loss_pos": loss_pos,
             "val/vel_loss": loss_vel,
             "val/motion_loss": motion_loss,
+            "val/smooth_loss": smooth_loss,
             "val/center_loss": center_loss,
             "val/limb_loss": loss_limb,
             "val/dtw": dtw
