@@ -193,20 +193,26 @@ if __name__ == "__main__":
 
         if hasattr(past, "zero_filled"):
             past = past.zero_filled()
-        if hasattr(fut_dense, "zero_filled"):
-            fut_dense = fut_dense.zero_filled()
+
+        if fut_dense.dim() == 5 and fut_dense.shape[2] == 1:
+            fut_dense = fut_dense.squeeze(2)
+        if past.dim() == 5 and past.shape[2] == 1:
+            past = past.squeeze(2)
 
         T = fut_dense.size(1)
-        print("[EVAL DEBUG] T,B,J,C =", T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
-        ts = torch.zeros(1, dtype=torch.long, device=fut.device)
+        if past.size(1) != T:
+            past = past[:, -T:, :, :]
 
+        print("[EVAL DEBUG] T,B,J,C =", T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
+        ts = torch.zeros(1, dtype=torch.long, device=fut_dense.device)
         print("[EVAL DEBUG] ts shape / unique:", ts.shape, torch.unique(ts).tolist())
 
+        t_ramp = torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
         in_seq = (
             0.2 * torch.randn_like(fut_dense)
-            + 0.2 * torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
-            + 0.45 * past
-            + 0.15 * fut_dense
+        + 0.2 * t_ramp
+        + 0.45 * past
+        + 0.15 * fut_dense
         )
 
         pred = model.forward(in_seq, ts, past, sign)
