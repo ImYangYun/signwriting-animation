@@ -238,7 +238,7 @@ class LitMinimal(pl.LightningModule):
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.4 * noise + 0.3 * t_ramp + 0.2 * past + 0.1 * fut
+        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -257,20 +257,29 @@ class LitMinimal(pl.LightningModule):
             ).mean()
             motion_consistency = (1 - cos_sim)
 
+            dir_change = vel_pred[:, 1:] * vel_pred[:, :-1]
+            direction_loss = (dir_change < 0).float().mean()
+
+            smooth_acc_loss = (acc_pred ** 2).mean()
+            temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
+            temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
+
             loss = (
                 loss_pos
-                + 0.6 * loss_vel
+                + 0.5 * loss_vel
                 + 0.15 * loss_acc
                 + 0.2 * motion_consistency
+                + 0.05 * direction_loss
+                + 0.05 * smooth_acc_loss
+                + 0.05 * temporal_smooth_loss
             )
         else:
-            loss_vel = loss_acc = motion_consistency = torch.tensor(0.0, device=fut.device)
+            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         gt_std = fut[..., :2].std()
         pred_std = pred[..., :2].std()
         scale_loss = ((pred_std / (gt_std + 1e-6) - 1.0) ** 2)
-        loss += 0.03 * scale_loss
 
         def torso_center(btjc):
             torso_end = min(33, btjc.size(2))
@@ -279,7 +288,11 @@ class LitMinimal(pl.LightningModule):
         c_gt = torso_center(fut)
         c_pr = torso_center(pred)
         center_loss = ((c_pr - c_gt) ** 2).mean()
-        loss += 0.02 * center_loss
+
+        loss += 0.03 * scale_loss + 0.02 * center_loss
+
+        motion_delta = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
+        self.log("train/motion_delta", motion_delta, prog_bar=True)
 
         self.log_dict({
             "train/loss": loss,
@@ -287,6 +300,9 @@ class LitMinimal(pl.LightningModule):
             "train/loss_vel": loss_vel,
             "train/loss_acc": loss_acc,
             "train/motion_consistency": motion_consistency,
+            "train/direction_loss": direction_loss,
+            "train/smooth_acc_loss": smooth_acc_loss,
+            "train/temporal_smooth_loss": temporal_smooth_loss,
             "train/scale_loss": scale_loss,
             "train/center_loss": center_loss,
         }, prog_bar=True, on_step=True)
@@ -303,7 +319,8 @@ class LitMinimal(pl.LightningModule):
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-        T = fut.size(1)
+
+        B, T = fut.size(0), fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
@@ -311,10 +328,16 @@ class LitMinimal(pl.LightningModule):
         accel[:, 1:] = velocity[:, 1:] - velocity[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
         temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        noise = 0.25 * torch.randn_like(fut) + 0.15 * temporal_noise
+        noise = 0.15 * torch.randn_like(fut) + 0.1 * temporal_noise
+
+        if fut.size(2) > 150:
+            hand_face_mask = torch.ones_like(fut)
+            hand_face_mask[:, :, 130:, :] = 0.5
+            noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.4 * noise + 0.3 * t_ramp + 0.2 * past + 0.1 * fut
+        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
+
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
 
@@ -331,12 +354,30 @@ class LitMinimal(pl.LightningModule):
                 vel_pred.flatten(2), vel_gt.flatten(2), dim=2
             ).mean()
             motion_consistency = (1 - cos_sim)
-            loss = loss_pos + 0.6 * loss_vel + 0.15 * loss_acc + 0.2 * motion_consistency
+
+            dir_change = vel_pred[:, 1:] * vel_pred[:, :-1]
+            direction_loss = (dir_change < 0).float().mean()
+
+            smooth_acc_loss = (acc_pred ** 2).mean()
+            temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
+            temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
+
+            loss = (
+                loss_pos
+                + 0.4 * loss_vel
+                + 0.1 * loss_acc
+                + 0.15 * motion_consistency
+                + 0.03 * direction_loss
+                + 0.03 * smooth_acc_loss
+                + 0.03 * temporal_smooth_loss
+            )
         else:
-            loss_vel = loss_acc = motion_consistency = torch.tensor(0.0, device=fut.device)
+            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
+
+        motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
 
         self.log_dict({
             "val/loss": loss,
@@ -344,11 +385,13 @@ class LitMinimal(pl.LightningModule):
             "val/loss_vel": loss_vel,
             "val/loss_acc": loss_acc,
             "val/motion_consistency": motion_consistency,
+            "val/direction_loss": direction_loss,
+            "val/smooth_acc_loss": smooth_acc_loss,
+            "val/temporal_smooth_loss": temporal_smooth_loss,
             "val/dtw": dtw,
+            "val/motion_delta": motion_magnitude,
         }, prog_bar=True)
 
-        motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
-        self.log("val/motion_delta", motion_magnitude, prog_bar=True)
         return {"val_loss": loss, "val_dtw": dtw}
 
 
