@@ -191,6 +191,11 @@ if __name__ == "__main__":
         else:
             fut_dense = fut
 
+        if hasattr(past, "zero_filled"):
+            past = past.zero_filled()
+        if hasattr(fut_dense, "zero_filled"):
+            fut_dense = fut_dense.zero_filled()
+
         T = fut_dense.size(1)
         print("[EVAL DEBUG] T,B,J,C =", T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
         ts = torch.zeros(1, dtype=torch.long, device=fut.device)
