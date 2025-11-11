@@ -268,14 +268,14 @@ class LitMinimal(pl.LightningModule):
                 loss_pos
                 + 0.5 * loss_vel
                 + 0.15 * loss_acc
-                + 0.2 * motion_consistency
-                + 0.05 * direction_loss
+                + 0.25 * motion_consistency   # ↑ 稍强的时间一致性
+                + 0.02 * direction_loss       # ↓ 允许更多动作方向变化
                 + 0.05 * smooth_acc_loss
-                + 0.05 * temporal_smooth_loss
+                + 0.03 * temporal_smooth_loss # ↓ 减少过度平滑
             )
         else:
-            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
+            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
 
         gt_std = fut[..., :2].std()
         pred_std = pred[..., :2].std()
@@ -319,8 +319,7 @@ class LitMinimal(pl.LightningModule):
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
         ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
-
-        B, T = fut.size(0), fut.size(1)
+        T = fut.size(1)
         t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
 
         velocity = fut[:, 1:] - fut[:, :-1]
@@ -365,18 +364,16 @@ class LitMinimal(pl.LightningModule):
             loss = (
                 loss_pos
                 + 0.4 * loss_vel
-                + 0.1 * loss_acc
-                + 0.15 * motion_consistency
-                + 0.03 * direction_loss
+                + 0.15 * loss_acc
+                + 0.2 * motion_consistency
+                + 0.02 * direction_loss
                 + 0.03 * smooth_acc_loss
                 + 0.03 * temporal_smooth_loss
             )
         else:
-            loss_vel = loss_acc = motion_consistency = direction_loss = smooth_acc_loss = temporal_smooth_loss = torch.tensor(0.0, device=fut.device)
             loss = loss_pos
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
-
         motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
 
         self.log_dict({
