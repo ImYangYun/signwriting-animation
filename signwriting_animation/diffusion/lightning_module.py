@@ -244,7 +244,18 @@ class LitMinimal(pl.LightningModule):
         in_seq = 0.2 * noise + 0.25 * t_ramp + 0.4 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
-        loss_pos = masked_mse(pred, fut, mask)
+
+        # === Joint-wise weighting: emphasize hands ===
+        B, T, J, C = pred.shape
+        w = torch.ones(B, T, J, 1, device=pred.device)
+        w[:, :, :33, :] = 0.4
+        w[:, :, 133:154, :] = 1.3
+        w[:, :, 154:175, :] = 1.3
+        w[:, :, 175:, :] = 0.8
+        diff = (pred - fut) ** 2
+        mask_bt = mask if mask.dim() == 2 else mask.squeeze(-1).squeeze(-1)
+        mask_4d = mask_bt[:, :, None, None].float()
+        loss_pos = ((diff * w) * mask_4d).mean()
 
         if T > 2:
             vel_mask = mask[:, 1:]
@@ -287,7 +298,7 @@ class LitMinimal(pl.LightningModule):
         vel_align = 1 - torch.cosine_similarity(
             vel_pred.flatten(2), vel_gt.flatten(2), dim=2
         ).mean()
-        loss += 0.05 * vel_align
+        loss += 0.08 * vel_align
         self.log("train/vel_align_loss", vel_align, prog_bar=True)
 
         gt_std = fut[..., :2].std()
@@ -363,7 +374,18 @@ class LitMinimal(pl.LightningModule):
         in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
-        loss_pos = masked_mse(pred, fut, mask)
+        B, T, J, C = pred.shape
+        w = torch.ones(B, T, J, 1, device=pred.device)
+
+        w[:, :, :33, :] = 0.4      # 降低面部影响
+        w[:, :, 133:154, :] = 1.3  # 左手
+        w[:, :, 154:175, :] = 1.3  # 右手
+        w[:, :, 175:, :] = 0.8     # 世界坐标适度弱化
+
+        diff = (pred - fut) ** 2
+        mask_bt = mask if mask.dim() == 2 else mask.squeeze(-1).squeeze(-1)
+        mask_4d = mask_bt[:, :, None, None].float()
+        loss_pos = ((diff * w) * mask_4d).mean()
 
         if T > 2:
             vel_mask = mask[:, 1:]
@@ -418,6 +440,11 @@ class LitMinimal(pl.LightningModule):
 
         dtw = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
         motion_magnitude = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
+
+        dtw_norm = masked_dtw(pred, fut, mask)
+        dtw_unorm = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
+        self.log("val/dtw_norm", dtw_norm, prog_bar=False)
+        self.log("val/dtw_unorm", dtw_unorm, prog_bar=True)
 
         self.log_dict({
             "val/loss": loss,
