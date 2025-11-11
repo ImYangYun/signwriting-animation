@@ -277,8 +277,14 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, fut, mask).item()
         vel_pred = pred[:, 1:] - pred[:, :-1]
         vel_gt = fut[:, 1:] - fut[:, :-1]
+        if hasattr(vel_pred, "zero_filled"):
+            vel_pred = vel_pred.zero_filled()
+        if hasattr(vel_gt, "zero_filled"):
+            vel_gt = vel_gt.zero_filled()
+
         print("[VEL CHECK] mean |vel_pred| =", vel_pred.abs().mean().item(),
             " |vel_gt| =", vel_gt.abs().mean().item())
+
         print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
         # ---- plain tensors ----
