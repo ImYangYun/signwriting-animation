@@ -238,7 +238,7 @@ class LitMinimal(pl.LightningModule):
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
+        in_seq = 0.3 * noise + 0.25 * t_ramp + 0.3 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
@@ -336,7 +336,7 @@ class LitMinimal(pl.LightningModule):
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
+        in_seq = 0.3 * noise + 0.25 * t_ramp + 0.3 * past + 0.15 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         loss_pos = masked_mse(pred, fut, mask)
