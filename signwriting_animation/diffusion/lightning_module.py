@@ -235,22 +235,22 @@ class LitMinimal(pl.LightningModule):
         velocity = fut[:, 1:] - fut[:, :-1]
         temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
         temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        noise = 0.2 * torch.randn_like(fut) + 0.15 * temporal_noise
+        noise = 0.1 * torch.randn_like(fut) + 0.1 * temporal_noise
         if fut.size(2) > 150:
             hand_face_mask = torch.ones_like(fut)
             hand_face_mask[:, :, 130:, :] = 1.2
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.2 * noise + 0.25 * t_ramp + 0.4 * past + 0.15 * fut
+        in_seq = 0.1 * noise + 0.1 * t_ramp + 0.55 * past + 0.25 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
 
         B, T, J, C = pred.shape
         w = torch.ones(B, T, J, 1, device=pred.device)
         w[:, :, :33, :] = 0.4      # face
-        w[:, :, 133:154, :] = 1.3  # left hand
-        w[:, :, 154:175, :] = 1.3  # right hand
+        w[:, :, 133:154, :] = 1.8  # left hand
+        w[:, :, 154:175, :] = 1.8 # right hand
         w[:, :, 175:, :] = 0.8
         diff = (pred - fut) ** 2
         mask_4d = mask[:, :, None, None].float()
@@ -293,7 +293,7 @@ class LitMinimal(pl.LightningModule):
             hand_pred = pred[:, :, 133:175, :]
             local_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean() * 0.6 \
                         + ((hand_pred[:, 1:] - hand_pred[:, :-1]) ** 2).mean() * 0.4
-            loss += 0.015 * local_smooth
+            loss += 0.020 * local_smooth
             self.log("train/local_smooth_loss", local_smooth, prog_bar=False)
 
         if pred.size(1) > 2:
@@ -306,8 +306,14 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_fut = fut[:, 1:] - fut[:, :-1]
             vel_smooth_loss = (vel_pred - vel_fut).abs().mean()
-            loss += 0.015 * vel_smooth_loss
+            loss += 0.03 * vel_smooth_loss
             self.log("train/vel_smooth_loss", vel_smooth_loss, prog_bar=False)
+
+        vel_std_pred = vel_pred.std(dim=1, unbiased=False)  # [B, J, C]
+        vel_std_gt   = vel_gt.std(dim=1, unbiased=False)
+        vel_std_loss = (vel_std_pred - vel_std_gt).abs().mean()
+        loss += 0.05 * vel_std_loss
+        self.log("train/vel_std_loss", vel_std_loss, prog_bar=False)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
