@@ -320,10 +320,13 @@ if __name__ == "__main__":
         fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
 
-        alpha = 0.6
+        alpha = 0.8
         pred_smooth = pred_un.clone()
-        pred_smooth[1:] = alpha * pred_un[1:] + (1 - alpha) * pred_un[:-1]
-        pred_un = pred_smooth
+        if pred_smooth.dim() == 4:
+            pred_smooth = pred_smooth[0]
+        pred_smooth[1:] = alpha * pred_smooth[1:] + (1 - alpha) * pred_smooth[:-1]
+        pred_un = pred_smooth.unsqueeze(0)
+        print("[ANTI-JITTER] Applied temporal EMA smoothing ✅")
 
         # ---- axis-wise stats ----
         def axis_stats(t):
