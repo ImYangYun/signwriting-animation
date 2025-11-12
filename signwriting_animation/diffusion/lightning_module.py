@@ -273,7 +273,7 @@ class LitMinimal(pl.LightningModule):
             loss = (loss_pos
                     + 0.4 * loss_vel
                     + 0.15 * loss_acc
-                    + 0.35 * motion_consistency
+                    + 0.3 * motion_consistency
                     + 0.02 * direction_loss
                     + 0.03 * smooth_acc_loss
                     + 0.02 * temporal_smooth_loss)
@@ -300,6 +300,14 @@ class LitMinimal(pl.LightningModule):
             temporal_consistency = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
             loss += 0.05 * temporal_consistency
             self.log("train/temporal_consistency", temporal_consistency, prog_bar=False)
+
+        # ---- velocity smooth loss (reduce jitter) ----
+        if pred.size(1) > 1:
+            vel_pred = pred[:, 1:] - pred[:, :-1]
+            vel_fut = fut[:, 1:] - fut[:, :-1]
+            vel_smooth_loss = (vel_pred - vel_fut).abs().mean()
+            loss += 0.03 * vel_smooth_loss
+            self.log("train/vel_smooth_loss", vel_smooth_loss, prog_bar=False)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
