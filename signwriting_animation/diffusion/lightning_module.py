@@ -306,7 +306,7 @@ class LitMinimal(pl.LightningModule):
             vel_pred = pred[:, 1:] - pred[:, :-1]
             vel_fut = fut[:, 1:] - fut[:, :-1]
             vel_smooth_loss = (vel_pred - vel_fut).abs().mean()
-            loss += 0.03 * vel_smooth_loss
+            loss += 0.015 * vel_smooth_loss
             self.log("train/vel_smooth_loss", vel_smooth_loss, prog_bar=False)
 
         self.log("train/loss", loss, prog_bar=True)
