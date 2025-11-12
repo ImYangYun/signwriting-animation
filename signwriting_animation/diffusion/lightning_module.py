@@ -298,7 +298,7 @@ class LitMinimal(pl.LightningModule):
 
         if pred.size(1) > 2:
             temporal_consistency = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
-            loss += 0.02 * temporal_consistency
+            loss += 0.05 * temporal_consistency
             self.log("train/temporal_consistency", temporal_consistency, prog_bar=False)
 
         self.log("train/loss", loss, prog_bar=True)

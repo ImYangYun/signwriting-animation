@@ -320,13 +320,21 @@ if __name__ == "__main__":
         fut_un  = temporal_smooth(fut_un)
         pred_un = temporal_smooth(pred_un)
 
-        alpha = 0.8
+        # --- region-wise temporal smoothing ---
+        alpha_face, alpha_hand, alpha_torso = 0.85, 0.8, 0.6
         pred_smooth = pred_un.clone()
         if pred_smooth.dim() == 4:
-            pred_smooth = pred_smooth[0]
-        pred_smooth[1:] = alpha * pred_smooth[1:] + (1 - alpha) * pred_smooth[:-1]
+            pred_smooth = pred_smooth[0]  # [T, J, C]
+
+        # Face (0:33)
+        pred_smooth[1:, :33] = alpha_face * pred_smooth[1:, :33] + (1 - alpha_face) * pred_smooth[:-1, :33]
+        # Hands (133:175)
+        pred_smooth[1:, 133:175] = alpha_hand * pred_smooth[1:, 133:175] + (1 - alpha_hand) * pred_smooth[:-1, 133:175]
+        # Torso & others
+        pred_smooth[1:, 33:133] = alpha_torso * pred_smooth[1:, 33:133] + (1 - alpha_torso) * pred_smooth[:-1, 33:133]
+
         pred_un = pred_smooth.unsqueeze(0)
-        print("[ANTI-JITTER] Applied temporal EMA smoothing ✅")
+        print("[ANTI-JITTER] Applied region-wise smoothing ✅")
 
         # ---- axis-wise stats ----
         def axis_stats(t):
