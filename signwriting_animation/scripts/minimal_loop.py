@@ -321,7 +321,7 @@ if __name__ == "__main__":
         pred_un = temporal_smooth(pred_un)
 
         # --- region-wise temporal smoothing ---
-        alpha_face, alpha_hand, alpha_torso = 0.85, 0.8, 0.6
+        alpha_face, alpha_hand, alpha_torso = 0.75, 0.7, 0.55
         pred_smooth = pred_un.clone()
         if pred_smooth.dim() == 4:
             pred_smooth = pred_smooth[0]  # [T, J, C]
