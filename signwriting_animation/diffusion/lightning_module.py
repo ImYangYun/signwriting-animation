@@ -180,21 +180,10 @@ class LitMinimal(pl.LightningModule):
             std=self.std_pose
         )
 
-    def normalize_pose(self, x_btjc):
-        """
-        Hybrid normalization to suppress high-frequency jitter:
-        - 80% framewise normalization (preserve temporal structure)
-        - 20% global normalization (stabilize overall scale)
-        """
-        frame_mean = x_btjc.mean(dim=(2, 3), keepdim=True)
-        global_mean = x_btjc.mean(dim=(1, 2, 3), keepdim=True)
-        mixed_mean = 0.8 * frame_mean + 0.2 * global_mean
-
-        frame_std = x_btjc.std(dim=(2, 3), keepdim=True)
-        global_std = x_btjc.std(dim=(1, 2, 3), keepdim=True)
-        mixed_std = 0.8 * frame_std + 0.2 * global_std
-
-        return (x_btjc - self.mean_pose) / (self.std_pose + 1e-6)
+    def normalize_pose(self, x):
+        frame_mean = x.mean(dim=(2,3), keepdim=True)
+        frame_std = x.std(dim=(2,3), keepdim=True)
+        return (x - frame_mean) / (frame_std + 1e-6)
 
 
     def unnormalize_pose(self, x_btjc):
@@ -256,28 +245,16 @@ class LitMinimal(pl.LightningModule):
         mask_4d = mask[:, :, None, None].float()
         loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
 
-        # 2. Velocity loss
         vel_pred = pred[:, 1:] - pred[:, :-1]
         vel_gt   = fut[:, 1:] - fut[:, :-1]
         vel_mask = mask[:, 1:]
         loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
 
-        # 3. Acceleration loss
         acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
         acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
         loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
 
-        # 4. Temporal smooth
-        temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
-        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean)**2).mean()
-
-        # --- total loss ---
-        loss = (
-            loss_pos
-            + 0.3 * loss_vel
-            + 0.1 * loss_acc
-            + 0.05 * temporal_smooth_loss
-        )
+        loss = 1.0 * loss_pos + 0.1 * loss_vel + 0.05 * loss_acc
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
@@ -317,28 +294,16 @@ class LitMinimal(pl.LightningModule):
         mask_4d = mask[:, :, None, None].float()
         loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
 
-        # 2. Velocity loss
         vel_pred = pred[:, 1:] - pred[:, :-1]
         vel_gt   = fut[:, 1:] - fut[:, :-1]
         vel_mask = mask[:, 1:]
         loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
 
-        # 3. Acceleration loss
         acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
         acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
         loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
 
-        # 4. Temporal smooth loss
-        temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
-        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean)**2).mean()
-
-        # --- total validation loss ---
-        loss = (
-            loss_pos
-            + 0.3 * loss_vel
-            + 0.1 * loss_acc
-            + 0.05 * temporal_smooth_loss
-        )
+        loss = 1.0 * loss_pos + 0.3 * loss_vel + 0.1 * loss_acc
 
         # === DTW metrics ===
         dtw_norm  = masked_dtw(pred, fut, mask)
