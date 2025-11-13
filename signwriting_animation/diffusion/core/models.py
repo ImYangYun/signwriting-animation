@@ -311,7 +311,7 @@ class OutputProcessMLP(nn.Module):
 
         x = self.ln(x)
         x = self.mlp(x)
-        x = torch.tanh(x * self.scale)
+        x = torch.tanh(x)
 
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         if not self.training:

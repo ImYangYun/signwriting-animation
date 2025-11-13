@@ -13,7 +13,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import normalize_mean_std
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw
+from signwriting_animation.diffusion.lightning_module import LitMinimal, masked_dtw, sanitize_btjc
 
 
 # ============================================================
@@ -170,176 +170,64 @@ if __name__ == "__main__":
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
-        past = cond["input_pose"][:1].to(model.device)
-        sign = cond["sign_image"][:1].to(model.device)
-        fut  = batch["data"][:1].to(model.device)
-        mask = cond["target_mask"][:1].to(model.device)
 
-        print("[EVAL DEBUG] fut_dense shape before forward:", fut.shape)
-        sys.stdout.flush()
+        fut_raw  = batch["data"][:1].to(model.device)          # [1, T, P, J, C] or [1, T, J, C]
+        past_raw = cond["input_pose"][:1].to(model.device)
+        sign     = cond["sign_image"][:1].to(model.device)
+        mask_raw = cond["target_mask"][:1].to(model.device)
 
-        print("[CHECK] target_mask mean / sum:",
-              mask.float().mean().item(), mask.float().sum().item())
-        frame_density = mask.float().mean(dim=(2,3,4)).cpu().numpy().tolist()
-        print("[CHECK] per-frame activation (avg over joints):", frame_density)
-        sys.stdout.flush()
+        fut  = model.normalize_pose(sanitize_btjc(fut_raw))
+        past = model.normalize_pose(sanitize_btjc(past_raw))
 
-        import sys
-        sys.stdout.flush()
-        if hasattr(fut, "zero_filled"):
-            fut_dense = fut.zero_filled()
-        else:
-            fut_dense = fut
-
-        if hasattr(past, "zero_filled"):
-            past = past.zero_filled()
-
-        if fut_dense.dim() == 5 and fut_dense.shape[2] == 1:
-            fut_dense = fut_dense.squeeze(2)
-        if past.dim() == 5 and past.shape[2] == 1:
-            past = past.squeeze(2)
-
-        T = fut_dense.size(1)
+        T = fut.size(1)
         if past.size(1) != T:
             past = past[:, -T:, :, :]
 
-        print("[EVAL DEBUG] T,B,J,C =", T, fut_dense.size(0), fut_dense.size(2), fut_dense.size(3))
-        ts = torch.zeros(1, dtype=torch.long, device=fut_dense.device)
+        if mask_raw.dim() == 4:
+            mask_bt = (mask_raw.float().sum(dim=(2, 3)) > 0).float()
+        else:
+            mask_bt = mask_raw.float()
+
+        print("[EVAL DEBUG] T,B,J,C =", T, fut.size(0), fut.size(2), fut.size(3))
+        ts = torch.zeros(1, dtype=torch.long, device=fut.device)
         print("[EVAL DEBUG] ts shape / unique:", ts.shape, torch.unique(ts).tolist())
 
-        t_ramp = torch.linspace(0, 1, steps=T, device=fut_dense.device).view(1, T, 1, 1)
-        in_seq = (
-            0.2 * torch.randn_like(fut_dense)
-        + 0.2 * t_ramp
-        + 0.45 * past
-        + 0.15 * fut_dense
-        )
-
-        pred = model.forward(in_seq, ts, past, sign)
+        in_seq = past
+        pred   = model.forward(in_seq, ts, past, sign)
         print("[EVAL DEBUG] pred shape after forward:", pred.shape)
-        sys.stdout.flush()
 
-        # ---- Motion diagnostic ----
-        try:
-            if pred.ndim == 4:
-                vel_pred = pred[:, 1:] - pred[:, :-1]
-                motion_delta = vel_pred.abs().mean().item()
-                print(f"[MOTION CHECK] pred Δ mean: {motion_delta:.5f}")
-            else:
-                print(f"[MOTION CHECK] skipped (pred.ndim={pred.ndim})")
-        except Exception as e:
-            print(f"[MOTION CHECK ERROR] {e}")
+        if pred.ndim == 4:
+            vel_pred = pred[:, 1:] - pred[:, :-1]
+            vel_gt   = fut[:, 1:] - fut[:, :-1]
+            motion_delta = vel_pred.abs().mean().item()
+            print(f"[MOTION CHECK] pred Δ mean: {motion_delta:.5f}")
+            print("[VEL CHECK] mean |vel_pred| =",
+                  vel_pred.abs().mean().item(),
+                  " |vel_gt| =",
+                  vel_gt.abs().mean().item())
+        else:
+            print(f"[MOTION CHECK] skipped (pred.ndim={pred.ndim})")
 
-        try:
-            if pred.ndim == 4:
-                B, T, J, C = pred.shape
-                print(f"[EVAL DEBUG] pred dims: B={B}, T={T}, J={J}, C={C}")
-                sys.stdout.flush()
+        dtw_val = masked_dtw(pred, fut, mask_bt).item()
+        print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
 
-                if J >= 178:
-                    left_idx = torch.arange(133, 133 + 21, device=pred.device)
-                    right_idx = torch.arange(154, 154 + 21, device=pred.device)
-
-                    left_xyz = torch.index_select(pred[0], 1, left_idx).detach().cpu()
-                    right_xyz = torch.index_select(pred[0], 1, right_idx).detach().cpu()
-
-                    print("[EVAL DEBUG] left hand mean/std:",
-                        round(left_xyz.mean().item(), 5),
-                        round(left_xyz.std().item(), 5),
-                        "min/max:",
-                        round(left_xyz.min().item(), 3),
-                        round(left_xyz.max().item(), 3))
-
-                    print("[EVAL DEBUG] right hand mean/std:",
-                        round(right_xyz.mean().item(), 5),
-                        round(right_xyz.std().item(), 5),
-                        "min/max:",
-                        round(right_xyz.min().item(), 3),
-                        round(right_xyz.max().item(), 3))
-                else:
-                    print(f"[EVAL DEBUG] skipped hand stats (too few joints, J={J})")
-            else:
-                print(f"[EVAL DEBUG] skipped hand stats (unexpected pred.ndim={pred.ndim})")
-
-        except Exception as e:
-            print(f"[EVAL DEBUG] hand stats failed: {e}")
-
-        sys.stdout.flush()
-
-        print("[EVAL] pred (teacher-forced) mean/std:", pred.mean().item(), pred.std().item())
-        sys.stdout.flush()
-
+        print("[EVAL] pred (teacher-forced) mean/std:",
+              pred.mean().item(), pred.std().item())
         pj_std = pred[0, :, :, :2].std(dim=0).mean(dim=1)
         print("[DBG] per-joint std head:", pj_std[:12].tolist())
         print("[DBG] avg joint std:", pj_std.mean().item())
-        sys.stdout.flush()
 
-        dtw_val = masked_dtw(pred, fut, mask).item()
-        vel_pred = pred[:, 1:] - pred[:, :-1]
-        vel_gt = fut[:, 1:] - fut[:, :-1]
-        if hasattr(vel_pred, "zero_filled"):
-            vel_pred = vel_pred.zero_filled()
-        if hasattr(vel_gt, "zero_filled"):
-            vel_gt = vel_gt.zero_filled()
-
-        print("[VEL CHECK] mean |vel_pred| =", vel_pred.abs().mean().item(),
-            " |vel_gt| =", vel_gt.abs().mean().item())
-
-        print(f"[EVAL] masked_dtw = {dtw_val:.4f}")
-
-        # ---- plain tensors ----
-        for name in ["fut", "pred"]:
-            x = locals()[name]
-            if hasattr(x, "tensor"):
-                x = x.tensor
-            if hasattr(x, "zero_filled"):
-                x = x.zero_filled()
-            if x.dim() == 5 and x.shape[2] == 1:
-                x = x.squeeze(2)
-            locals()[name] = x
-
-        # ---- range check (normalized space) ----
-        print(f"[CHECK fut range]  min={fut.min().item():.2f}, max={fut.max().item():.2f}, "
-              f"mean={fut.mean().item():.2f}, std={fut.std().item():.2f}")
-        print(f"[CHECK pred range] min={pred.min().item():.2f}, max={pred.max().item():.2f}, "
-              f"mean={pred.mean().item():.2f}, std={pred.std().item():.2f}")
-
-        # ---- clamp ----
-        pred = torch.clamp(pred, -3, 3)
-        print(f"[CHECK clamp] pred min={pred.min().item():.3f}, max={pred.max().item():.3f}")
-
-        # ---- unnormalize ----
-        mean_std = _unwrap_mean_std(base_ds.mean_std)
-        fut_un  = unnormalize_tensor_with_global_stats(fut,  mean_std)
-        pred_un = unnormalize_tensor_with_global_stats(pred, mean_std)
-        print("[UNNORM] Applied FluentPose-style unnormalize ✅")
+        fut_un  = model.unnormalize_pose(fut.clone())
+        pred_un = model.unnormalize_pose(pred.clone())
+        print("[UNNORM] Applied model.unnormalize_pose ✅")
         print("[DEBUG unnorm] fut mean/std:", fut_un.mean().item(), fut_un.std().item())
         print("[DEBUG unnorm] pred mean/std:", pred_un.mean().item(), pred_un.std().item())
 
-        # ---- temporal smooth ----
-        fut_un  = temporal_smooth(fut_un)
-        pred_un = temporal_smooth(pred_un)
-
-        # --- region-wise temporal smoothing ---
-        alpha_face, alpha_hand, alpha_torso = 0.75, 0.7, 0.55
-        pred_smooth = pred_un.clone()
-        if pred_smooth.dim() == 4:
-            pred_smooth = pred_smooth[0]  # [T, J, C]
-
-        # Face (0:33)
-        pred_smooth[1:, :33] = alpha_face * pred_smooth[1:, :33] + (1 - alpha_face) * pred_smooth[:-1, :33]
-        # Hands (133:175)
-        pred_smooth[1:, 133:175] = alpha_hand * pred_smooth[1:, 133:175] + (1 - alpha_hand) * pred_smooth[:-1, 133:175]
-        # Torso & others
-        pred_smooth[1:, 33:133] = alpha_torso * pred_smooth[1:, 33:133] + (1 - alpha_torso) * pred_smooth[:-1, 33:133]
-
-        pred_un = pred_smooth.unsqueeze(0)
-        print("[ANTI-JITTER] Applied region-wise smoothing ✅")
-
-        # ---- axis-wise stats ----
         def axis_stats(t):
-            if t.dim() == 4: t = t[0]
-            m = t.mean(dim=(0,1)); s = t.std(dim=(0,1))
+            if t.dim() == 4:
+                t = t[0]        # [T,J,C]
+            m = t.mean(dim=(0, 1))
+            s = t.std(dim=(0, 1))
             return [round(v, 3) for v in m.tolist()], [round(v, 3) for v in s.tolist()]
         m_gt, s_gt = axis_stats(fut_un)
         m_pr, s_pr = axis_stats(pred_un)
@@ -360,10 +248,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[ERROR] Failed to load or reduce header: {e}")
         raise
-
-# ============================================================
-# === COMPONENT DIAG ===
-# ============================================================
 
     print("\n=== COMPONENT DIAG ===")
     print("[HEADER COMPONENTS]", [c.name for c in header.components])
@@ -424,9 +308,6 @@ if __name__ == "__main__":
 
     print("=== COMPONENT DIAG END ===\n")
 
-    # ---- recenter for visualization ----
-    #fut_for_save  = recenter_for_view(fut_un)
-    #pred_for_save = recenter_for_view(pred_un)
     fut_for_save  = fut_un
     pred_for_save = pred_un
 

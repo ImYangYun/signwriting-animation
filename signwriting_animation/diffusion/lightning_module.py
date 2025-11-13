@@ -180,24 +180,29 @@ class LitMinimal(pl.LightningModule):
             std=self.std_pose
         )
 
-    def normalize_pose(self, x):
-        frame_mean = x.mean(dim=(2,3), keepdim=True)
-        frame_std = x.std(dim=(2,3), keepdim=True)
-        return (x - frame_mean) / (frame_std + 1e-6)
-
+    def normalize_pose(self, x_btjc):
+        x = sanitize_btjc(x_btjc)
+        mean = self.mean_pose.view(1, 1, 1, -1)
+        std  = self.std_pose.view(1, 1, 1, -1)
+        return (x - mean) / (std + 1e-6)
 
     def unnormalize_pose(self, x_btjc):
-        x_btjc = x_btjc * self.std_pose + self.mean_pose
+        x = sanitize_btjc(x_btjc)
+        mean = self.mean_pose.view(1, 1, 1, -1)
+        std  = self.std_pose.view(1, 1, 1, -1)
+        x = x * std + mean
+
         try:
             from pose_anonymization.data.normalization import unshift_hands
             from pose_format.pose import Pose
             dummy = Pose(header=None, body=None)
-            dummy.body.data = x_btjc[0].detach().cpu().numpy()
+            dummy.body.data = x[0].detach().cpu().numpy()
             unshift_hands(dummy)
-            x_btjc[0] = torch.tensor(dummy.body.data, device=x_btjc.device)
+            x[0] = torch.tensor(dummy.body.data, device=x.device)
         except Exception as e:
             print(f"[WARN] unshift_hands failed: {e}")
-        return x_btjc
+
+        return x
 
 
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
@@ -211,8 +216,8 @@ class LitMinimal(pl.LightningModule):
 
     def training_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
-        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
+        fut  = self.normalize_pose(batch["data"])
+        past = self.normalize_pose(cond["input_pose"])
         mask = (cond["target_mask"].float().sum(dim=(2, 3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
@@ -262,8 +267,8 @@ class LitMinimal(pl.LightningModule):
 
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-        fut  = self.normalize_pose(sanitize_btjc(batch["data"]))
-        past = self.normalize_pose(sanitize_btjc(cond["input_pose"]))
+        fut  = self.normalize_pose(batch["data"])
+        past = self.normalize_pose(cond["input_pose"])
         mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() \
             if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
         sign = cond["sign_image"].float()
@@ -324,7 +329,7 @@ class LitMinimal(pl.LightningModule):
     def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
         print("[GEN/full] ENTER generate_full_sequence", flush=True)
         self.eval()
-        ctx  = self.normalize_pose(sanitize_btjc(past_btjc)).to(self.device)  # 🟩 normalize context
+        ctx  = self.normalize_pose(past_btjc).to(self.device)
         sign = sign_img.to(self.device)
         B, _, J, C = ctx.shape
 
