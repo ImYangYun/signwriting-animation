@@ -252,68 +252,31 @@ class LitMinimal(pl.LightningModule):
         w[:, :, 133:154, :] = 1.8  # left hand
         w[:, :, 154:175, :] = 1.8 # right hand
         w[:, :, 175:, :] = 0.8
-        diff = (pred - fut) ** 2
-        mask_4d = mask[:, :, None, None].float()
-        loss_pos = ((diff * w) * mask_4d).mean()
 
-        if T > 2:
-            vel_mask = mask[:, 1:]
-            vel_pred = pred[:, 1:] - pred[:, :-1]
-            vel_gt   = fut[:, 1:] - fut[:, :-1]
-            acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-            acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
-            loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-            loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
-            cos_sim = torch.nn.functional.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
-            motion_consistency = (1 - cos_sim)
-            direction_loss = (vel_pred[:, 1:] * vel_pred[:, :-1] < 0).float().mean()
-            smooth_acc_loss = (acc_pred ** 2).mean()
-            temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
-            temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
-            loss = (loss_pos
-                    + 0.4 * loss_vel
-                    + 0.15 * loss_acc
-                    + 0.3 * motion_consistency
-                    + 0.02 * direction_loss
-                    + 0.03 * smooth_acc_loss
-                    + 0.02 * temporal_smooth_loss)
-        else:
-            loss = loss_pos
-            vel_pred = vel_gt = torch.zeros_like(fut[:, :1])
+        loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
 
-        # === Regularizers ===
-        motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
-        loss += 0.15 * motion_amp
-        vel_align = 1 - torch.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
-        loss += 0.08 * vel_align  # stronger weight
-        self.log("train/vel_align_loss", vel_align, prog_bar=True)
+        # 2. Velocity loss
+        vel_pred = pred[:, 1:] - pred[:, :-1]
+        vel_gt   = fut[:, 1:] - fut[:, :-1]
+        vel_mask = mask[:, 1:]
+        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
 
-        if fut.size(2) > 150:
-            face_pred = pred[:, :, :33, :]
-            hand_pred = pred[:, :, 133:175, :]
-            local_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean() * 0.6 \
-                        + ((hand_pred[:, 1:] - hand_pred[:, :-1]) ** 2).mean() * 0.4
-            loss += 0.020 * local_smooth
-            self.log("train/local_smooth_loss", local_smooth, prog_bar=False)
+        # 3. Acceleration loss
+        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
+        acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
+        loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
 
-        if pred.size(1) > 2:
-            temporal_consistency = ((pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]) ** 2).mean()
-            loss += 0.05 * temporal_consistency
-            self.log("train/temporal_consistency", temporal_consistency, prog_bar=False)
+        # 4. Temporal smooth
+        temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
+        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean)**2).mean()
 
-        # ---- velocity smooth loss (reduce jitter) ----
-        if pred.size(1) > 1:
-            vel_pred = pred[:, 1:] - pred[:, :-1]
-            vel_fut = fut[:, 1:] - fut[:, :-1]
-            vel_smooth_loss = (vel_pred - vel_fut).abs().mean()
-            loss += 0.03 * vel_smooth_loss
-            self.log("train/vel_smooth_loss", vel_smooth_loss, prog_bar=False)
-
-        vel_std_pred = vel_pred.std(dim=1, unbiased=False)  # [B, J, C]
-        vel_std_gt   = vel_gt.std(dim=1, unbiased=False)
-        vel_std_loss = (vel_std_pred - vel_std_gt).abs().mean()
-        loss += 0.05 * vel_std_loss
-        self.log("train/vel_std_loss", vel_std_loss, prog_bar=False)
+        # --- total loss ---
+        loss = (
+            loss_pos
+            + 0.3 * loss_vel
+            + 0.1 * loss_acc
+            + 0.05 * temporal_smooth_loss
+        )
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
@@ -349,45 +312,31 @@ class LitMinimal(pl.LightningModule):
         w[:, :, 133:154, :] = 1.3
         w[:, :, 154:175, :] = 1.3
         w[:, :, 175:, :] = 0.8
-        diff = (pred - fut) ** 2
-        mask_4d = mask[:, :, None, None].float()
-        loss_pos = ((diff * w) * mask_4d).mean()
 
-        vel_mask = mask[:, 1:]
+        loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
+
+        # 2. Velocity loss
         vel_pred = pred[:, 1:] - pred[:, :-1]
         vel_gt   = fut[:, 1:] - fut[:, :-1]
+        vel_mask = mask[:, 1:]
+        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
+
+        # 3. Acceleration loss
         acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
         acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
-
-        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
         loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
-        cos_sim = torch.nn.functional.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
-        motion_consistency = (1 - cos_sim)
-        direction_loss = (vel_pred[:, 1:] * vel_pred[:, :-1] < 0).float().mean()
-        smooth_acc_loss = (acc_pred ** 2).mean()
+
+        # 4. Temporal smooth loss
         temporal_mean = (pred[:, 2:] + pred[:, :-2]) / 2
-        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean) ** 2).mean()
+        temporal_smooth_loss = ((pred[:, 1:-1] - temporal_mean)**2).mean()
 
-        loss = (loss_pos
-                + 0.35 * loss_vel
-                + 0.15 * loss_acc
-                + 0.35 * motion_consistency
-                + 0.02 * direction_loss
-                + 0.05 * smooth_acc_loss
-                + 0.03 * temporal_smooth_loss)
-
-        motion_amp = torch.clamp((vel_pred.abs().mean() - vel_gt.abs().mean()).abs(), 0, 1)
-        loss += 0.1 * motion_amp
-        vel_align = 1 - torch.cosine_similarity(vel_pred.flatten(2), vel_gt.flatten(2), dim=2).mean()
-        loss += 0.08 * vel_align
-
-        if fut.size(2) > 150:
-            face_pred = pred[:, :, :33, :]
-            hand_pred = pred[:, :, 133:175, :]
-            local_smooth = ((face_pred[:, 1:] - face_pred[:, :-1]) ** 2).mean() * 0.6 \
-                        + ((hand_pred[:, 1:] - hand_pred[:, :-1]) ** 2).mean() * 0.4
-            loss += 0.015 * local_smooth
-            self.log("val/local_smooth_loss", local_smooth, prog_bar=False)
+        # --- total validation loss ---
+        loss = (
+            loss_pos
+            + 0.3 * loss_vel
+            + 0.1 * loss_acc
+            + 0.05 * temporal_smooth_loss
+        )
 
         # === DTW metrics ===
         dtw_norm  = masked_dtw(pred, fut, mask)
@@ -402,7 +351,6 @@ class LitMinimal(pl.LightningModule):
         self.log("val/loss", loss, prog_bar=True)
 
         return {"val_loss": loss, "val_dtw": dtw_unorm}
-
 
 
     @torch.no_grad()
