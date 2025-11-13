@@ -63,37 +63,28 @@ class LitMinimal(pl.LightningModule):
         self.register_buffer("mean_pose", mean)
         self.register_buffer("std_pose",  std)
 
-        # ---- Initialize CAMDM-based model ----
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
-            mean=self.mean_pose,
-            std=self.std_pose,
         )
 
         print("[LitMinimal] CAMDM deterministic x0-prediction loaded ✔")
 
-    # -----------------------------------------------------
     # normalization helpers
-    # -----------------------------------------------------
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
 
     def unnormalize(self, x):
         return x * self.std_pose + self.mean_pose
 
-    # -----------------------------------------------------
     # forward wrapper
-    # -----------------------------------------------------
     def forward(self, x_btjc, ts, past_btjc, sign_img):
         x_bjct    = x_btjc.permute(0,2,3,1)
         past_bjct = past_btjc.permute(0,2,3,1)
         out_bjct  = self.model.forward(x_bjct, ts, past_bjct, sign_img)
         return out_bjct.permute(0,3,1,2).contiguous()
 
-    # -----------------------------------------------------
     # TRAINING STEP（MSE only, for stable overfit）
-    # -----------------------------------------------------
     def training_step(self, batch, _):
         cond = batch["conditions"]
 
