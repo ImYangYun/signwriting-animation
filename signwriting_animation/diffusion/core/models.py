@@ -137,11 +137,13 @@ class SignWritingToPoseDiffusion(nn.Module):
         with torch.no_grad():
             fut_time_std = future_motion_emb.float().std(dim=0).mean().item()  # time=dim 0
             print(f"[DBG/model] future_emb time-std={fut_time_std:.6f}", flush=True)
-        xseq = torch.cat((time_emb,
-                          signwriting_emb,
-                          past_motion_emb,
-                          future_motion_emb), axis=0)
 
+        Tf = future_motion_emb.shape[0]
+
+        time_cond = time_emb.repeat(Tf, 1, 1)
+        sign_cond = signwriting_emb.repeat(Tf, 1, 1)
+
+        xseq = future_motion_emb + time_cond + sign_cond
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)[-num_frames:]
         with torch.no_grad():

@@ -28,7 +28,7 @@ def tensor_to_pose(t_btjc, header):
         t = t_btjc[0]
     else:
         t = t_btjc
-    arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)
+    arr = np.ascontiguousarray(t.detach().cpu().numpy()[:, None, :, :], dtype=np.float32)
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
@@ -144,7 +144,6 @@ if __name__ == "__main__":
     ts = torch.zeros(1, dtype=torch.long, device=model.device)
     pred_norm = model.forward(past_norm, ts, past_norm, sign)
 
-        # ============================================================
     # Sanity Check (inside minimal loop)
     # ============================================================
     print("\n=== SANITY CHECK ===")
@@ -172,12 +171,28 @@ if __name__ == "__main__":
     std_per_joint = pred_norm[0].std(dim=0).mean(dim=1)  # shape [J]
     print(f"[JOINT STD] mean std across joints = {std_per_joint.mean().item():.6f}")
     print(f"[JOINT STD] first 10 joints std     = {[round(v,4) for v in std_per_joint[:10].tolist()]}")
+    if pred_norm.size(1) > 1:
+        vel_pred = pred_norm[:, 1:] - pred_norm[:, :-1]
+        vel_gt   = gt_norm[:, 1:]  - gt_norm[:, :-1]
+
+        print(f"[VEL norm] |pred_vel| mean = {vel_pred.abs().mean().item():.6f}")
+        print(f"[VEL norm] |gt_vel|   mean = {vel_gt.abs().mean().item():.6f}")
+    else:
+        print("[VEL norm] skipped (T=1)")
     print("=== SANITY CHECK END ===\n")
 
     # Unnormalize
     gt_un   = model.unnormalize(gt_norm)
     pred_un = model.unnormalize(pred_norm)
 
+    if pred_un.size(1) > 1:
+        vel_pred_un = pred_un[:, 1:] - pred_un[:, :-1]
+        vel_gt_un   = gt_un[:, 1:]  - gt_un[:, :-1]
+
+        print(f"[VEL unnorm] |pred_vel| mean = {vel_pred_un.abs().mean().item():.3f}")
+        print(f"[VEL unnorm] |gt_vel|   mean = {vel_gt_un.abs().mean().item():.3f}")
+    else:
+        print("[VEL unnorm] skipped (T=1)")
     # Save only valid frames
     T_valid = int(mask_bt[0].sum().item())
     gt_un   = gt_un[:, :T_valid]
