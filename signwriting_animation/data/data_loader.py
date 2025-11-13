@@ -63,7 +63,7 @@ class DynamicPosePredictionDataset(Dataset):
         with_metadata: bool = True,
         clip_model_name: str = "openai/clip-vit-base-patch32",
         split: Literal["train", "dev", "test"] = "train",
-        reduce_holistic: bool = False,
+        reduce_holistic: bool = True,
     ):
         super().__init__()
         assert split in ["train", "dev", "test"]

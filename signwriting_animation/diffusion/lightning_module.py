@@ -215,6 +215,7 @@ class LitMinimal(pl.LightningModule):
         return pred_btjc
 
     def training_step(self, batch, _):
+        print("TRAIN data shape:", batch["data"].shape)
         cond = batch["conditions"]
         fut  = self.normalize_pose(batch["data"])
         past = self.normalize_pose(cond["input_pose"])
