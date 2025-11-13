@@ -314,6 +314,7 @@ class LitMinimal(pl.LightningModule):
         w[:, :, 154:175, :] = 1.3
         w[:, :, 175:, :] = 0.8
 
+        mask_4d = mask[:, :, None, None].float()
         loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
 
         # 2. Velocity loss
