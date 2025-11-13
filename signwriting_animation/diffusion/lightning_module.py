@@ -194,7 +194,7 @@ class LitMinimal(pl.LightningModule):
         global_std = x_btjc.std(dim=(1, 2, 3), keepdim=True)
         mixed_std = 0.8 * frame_std + 0.2 * global_std
 
-        return (x_btjc - mixed_mean) / (mixed_std + 1e-6)
+        return (x_btjc - self.mean_pose) / (self.std_pose + 1e-6)
 
 
     def unnormalize_pose(self, x_btjc):
@@ -242,7 +242,7 @@ class LitMinimal(pl.LightningModule):
             noise = noise * hand_face_mask
 
         past = past[:, -T:, :, :]
-        in_seq = 0.1 * noise + 0.1 * t_ramp + 0.55 * past + 0.25 * fut
+        in_seq = 0.05 * noise + 0.05 * t_ramp + 0.4 * past + 0.5 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
 
@@ -304,7 +304,7 @@ class LitMinimal(pl.LightningModule):
             hand_face_mask[:, :, :33, :] = 1.3
             noise = noise * hand_face_mask
         past = past[:, -T:, :, :]
-        in_seq = 0.25 * noise + 0.25 * t_ramp + 0.35 * past + 0.15 * fut
+        in_seq = 0.1 * noise + 0.1 * t_ramp + 0.3 * past + 0.5 * fut
 
         pred = self.forward(in_seq, ts, past, sign)
         B, T, J, C = pred.shape
