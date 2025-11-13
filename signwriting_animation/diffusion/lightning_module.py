@@ -107,258 +107,122 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 
 class LitMinimal(pl.LightningModule):
-    """
-    Minimal Lightning module with global mean/std normalization.
-    Uses precomputed global statistics for consistent scale across samples.
-    """
 
-    def __init__(self, num_keypoints=586, num_dims=3, lr=1e-4, log_dir="logs",
-                stats_path="/data/yayun/pose_data/mean_std_178.pt",
-                data_dir="/data/yayun/pose_data",
-                csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):
+    def __init__(self, num_keypoints=178, num_dims=3, lr=1e-4, log_dir="logs",
+                 stats_path="/data/yayun/pose_data/mean_std_178.pt",
+                 data_dir="/data/yayun/pose_data",
+                 csv_path="/data/yayun/signwriting-animation/data_fixed.csv"):
         super().__init__()
         self.save_hyperparameters()
 
         self.lr = lr
         self.log_dir = log_dir
-        self.train_losses, self.val_losses, self.val_dtws = [], [], []
 
-        if os.path.exists(stats_path):
-            stats = torch.load(stats_path, map_location="cpu")
-            mean = stats["mean"].float()
-            std  = stats["std"].float()
-            print(f"[Loaded mean/std] mean={mean.mean():.4f}, std={std.mean():.4f}")
-        else:
-            print(f"[WARN] stats not found → computing global mean/std from {csv_path}")
-            from pose_format import Pose
-            import pandas as pd, random
+        stats = torch.load(stats_path, map_location="cpu")
+        mean = stats["mean"].float()   # [178,3]
+        std  = stats["std"].float()    # [178,3]
 
-            df = pd.read_csv(csv_path)
-            df = df[df["split"] == "train"].reset_index(drop=True)
-            records = df.to_dict(orient="records")
-            random.shuffle(records)
-            sample_size = min(500, len(records))
-            records = records[:sample_size]
-            print(f"[INFO] Using {sample_size} samples to estimate mean/std")
-
-            sum_all = torch.zeros(3)
-            sum_sq_all = torch.zeros(3)
-            count = 0
-
-            for i, rec in enumerate(records):
-                pose_path = os.path.join(data_dir, rec["pose"])
-                if not os.path.exists(pose_path):
-                    continue
-                try:
-                    with open(pose_path, "rb") as f:
-                        p = Pose.read(f)
-                    arr = torch.tensor(p.body.data, dtype=torch.float32)  # [T,P,J,C]
-                    arr = arr.view(-1, arr.shape[-1])                     # [T*P*J, C]
-                    sum_all += arr.sum(dim=0)
-                    sum_sq_all += (arr ** 2).sum(dim=0)
-                    count += arr.shape[0]
-                except Exception as e:
-                    print(f"[WARN] Failed on {pose_path}: {e}")
-                    continue
-
-                if (i + 1) % 50 == 0 or (i + 1) == sample_size:
-                    print(f"[INFO] Processed {i+1}/{sample_size} files...")
-
-            mean = sum_all / count
-            std  = torch.sqrt(sum_sq_all / count - mean ** 2).clamp_min(1e-6)
-            torch.save({"mean": mean, "std": std}, stats_path)
-            print(f"[Saved new mean/std] → {stats_path}")
+        # reshape to broadcast with [B,T,J,C]
+        mean = mean.view(1,1,-1,3)
+        std  = std.view(1,1,-1,3)
 
         self.register_buffer("mean_pose", mean)
         self.register_buffer("std_pose", std)
-        print(f"[LitMinimal] Using mean={mean.tolist()} std={std.tolist()}")
+
+        print(f"[Loaded 178 stats] mean={mean.mean():.4f}, std={std.mean():.4f}")
 
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
             mean=self.mean_pose,
-            std=self.std_pose
+            std=self.std_pose,
         )
 
-    def normalize_pose(self, x_btjc):
-        x = sanitize_btjc(x_btjc)
-        mean = self.mean_pose.view(1, 1, 1, -1)
-        std  = self.std_pose.view(1, 1, 1, -1)
-        return (x - mean) / (std + 1e-6)
+    def normalize_pose(self, x):
+        """Global normalization"""
+        x = sanitize_btjc(x)
+        return (x - self.mean_pose) / (self.std_pose + 1e-6)
 
-    def unnormalize_pose(self, x_btjc):
-        x = sanitize_btjc(x_btjc)
-        mean = self.mean_pose.view(1, 1, 1, -1)
-        std  = self.std_pose.view(1, 1, 1, -1)
-        x = x * std + mean
-
-        try:
-            from pose_anonymization.data.normalization import unshift_hands
-            from pose_format.pose import Pose
-            dummy = Pose(header=None, body=None)
-            dummy.body.data = x[0].detach().cpu().numpy()
-            unshift_hands(dummy)
-            x[0] = torch.tensor(dummy.body.data, device=x.device)
-        except Exception as e:
-            print(f"[WARN] unshift_hands failed: {e}")
-
-        return x
-
+    def unnormalize_pose(self, x):
+        """Global unnorm"""
+        return x * self.std_pose + self.mean_pose
 
     def forward(self, x_btjc, timesteps, past_btjc, sign_img):
-        x_bjct    = btjc_to_bjct(sanitize_btjc(x_btjc))
+        x_bjct = btjc_to_bjct(sanitize_btjc(x_btjc))
         past_bjct = btjc_to_bjct(sanitize_btjc(past_btjc))
-        if timesteps.dtype != torch.long:
-            timesteps = timesteps.long()
-        out_bjct  = self.model.forward(x_bjct, timesteps, past_bjct, sign_img)
-        pred_btjc = bjct_to_btjc(out_bjct)
-        return pred_btjc
+        out_bjct = self.model.forward(x_bjct, timesteps, past_bjct, sign_img)
+        return bjct_to_btjc(out_bjct)
 
     def training_step(self, batch, _):
-        print("TRAIN data shape:", batch["data"].shape)
-        cond = batch["conditions"]
         fut  = self.normalize_pose(batch["data"])
-        past = self.normalize_pose(cond["input_pose"])
-        mask = (cond["target_mask"].float().sum(dim=(2, 3)) > 0).float() \
-            if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
-        sign = cond["sign_image"].float()
+        past = self.normalize_pose(batch["conditions"]["input_pose"])
+        mask = batch["conditions"]["target_mask"].float()
+        sign = batch["conditions"]["sign_image"].float()
 
         B, T = fut.size(0), fut.size(1)
         ts = torch.zeros(B, dtype=torch.long, device=fut.device)
-        t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        t_ramp = torch.linspace(0,1,T,device=fut.device).view(1,T,1,1)
 
-        velocity = fut[:, 1:] - fut[:, :-1]
-        temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        noise = 0.1 * torch.randn_like(fut) + 0.1 * temporal_noise
-        if fut.size(2) > 150:
-            hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, 130:, :] = 1.2
-            noise = noise * hand_face_mask
+        # noise injection
+        velocity = fut[:,1:] - fut[:,:-1]
+        temporal_noise = 0.6*velocity.mean(1,keepdim=True) + 0.4*torch.cat([velocity, velocity[:,-1:]],1).mean(1, keepdim=True)
+        noise = 0.1*torch.randn_like(fut) + 0.1*temporal_noise
 
-        past = past[:, -T:, :, :]
-        in_seq = 0.05 * noise + 0.05 * t_ramp + 0.4 * past + 0.5 * fut
+        in_seq = 0.05*noise + 0.05*t_ramp + 0.4*past[:, -T:] + 0.5*fut
 
-        pred = self.forward(in_seq, ts, past, sign)
+        pred = self.forward(in_seq, ts, past[:, -T:], sign)
 
-        B, T, J, C = pred.shape
-        w = torch.ones(B, T, J, 1, device=pred.device)
-        w[:, :, :33, :] = 0.4      # face
-        w[:, :, 133:154, :] = 1.8  # left hand
-        w[:, :, 154:175, :] = 1.8 # right hand
-        w[:, :, 175:, :] = 0.8
+        # loss
+        mask4 = mask[:,:,None,None]
+        loss_pos = ((pred - fut)**2 * mask4).mean()
 
-        mask_4d = mask[:, :, None, None].float()
-        loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
+        vel_pred = pred[:,1:] - pred[:,:-1]
+        vel_gt   = fut[:,1:] - fut[:,:-1]
+        loss_vel = ((vel_pred - vel_gt)**2 * mask[:,1:,None,None]).mean()
 
-        vel_pred = pred[:, 1:] - pred[:, :-1]
-        vel_gt   = fut[:, 1:] - fut[:, :-1]
-        vel_mask = mask[:, 1:]
-        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-
-        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-        acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
-        loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
-
-        loss = 1.0 * loss_pos + 0.1 * loss_vel + 0.05 * loss_acc
+        loss = 1.0*loss_pos + 0.1*loss_vel
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
-
     def validation_step(self, batch, _):
-        cond = batch["conditions"]
         fut  = self.normalize_pose(batch["data"])
-        past = self.normalize_pose(cond["input_pose"])
-        mask = (cond["target_mask"].float().sum(dim=(2,3)) > 0).float() \
-            if cond["target_mask"].dim() == 4 else cond["target_mask"].float()
-        sign = cond["sign_image"].float()
-        ts   = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
+        past = self.normalize_pose(batch["conditions"]["input_pose"])
+        sign = batch["conditions"]["sign_image"].float()
+        mask = batch["conditions"]["target_mask"].float()
+        ts = torch.zeros(fut.size(0), dtype=torch.long, device=fut.device)
+
         T = fut.size(1)
-        t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        noise = 0.1*torch.randn_like(fut)
+        in_seq = 0.1*noise + 0.1 + 0.3*past[:, -T:] + 0.5*fut
 
-        velocity = fut[:, 1:] - fut[:, :-1]
-        temporal_noise = torch.cat([velocity, velocity[:, -1:]], dim=1)
-        temporal_noise = 0.6 * velocity.mean(dim=1, keepdim=True) + 0.4 * temporal_noise.mean(dim=1, keepdim=True)
-        noise = 0.1 * torch.randn_like(fut) + 0.1 * temporal_noise
-        if fut.size(2) > 150:
-            hand_face_mask = torch.ones_like(fut)
-            hand_face_mask[:, :, 130:, :] = 1.2
-            hand_face_mask[:, :, :33, :] = 1.3
-            noise = noise * hand_face_mask
-        past = past[:, -T:, :, :]
-        in_seq = 0.1 * noise + 0.1 * t_ramp + 0.3 * past + 0.5 * fut
+        pred = self.forward(in_seq, ts, past[:, -T:], sign)
 
-        pred = self.forward(in_seq, ts, past, sign)
-        B, T, J, C = pred.shape
-        w = torch.ones(B, T, J, 1, device=pred.device)
-        w[:, :, :33, :] = 0.4
-        w[:, :, 133:154, :] = 1.3
-        w[:, :, 154:175, :] = 1.3
-        w[:, :, 175:, :] = 0.8
+        loss = ((pred - fut)**2 * mask[:,:,None,None]).mean()
 
-        mask_4d = mask[:, :, None, None].float()
-        loss_pos = ((pred - fut)**2 * w * mask_4d).mean()
-
-        vel_pred = pred[:, 1:] - pred[:, :-1]
-        vel_gt   = fut[:, 1:] - fut[:, :-1]
-        vel_mask = mask[:, 1:]
-        loss_vel = masked_mse(vel_pred, vel_gt, vel_mask)
-
-        acc_pred = vel_pred[:, 1:] - vel_pred[:, :-1]
-        acc_gt   = vel_gt[:, 1:] - vel_gt[:, :-1]
-        loss_acc = masked_mse(acc_pred, acc_gt, vel_mask[:, 1:])
-
-        loss = 1.0 * loss_pos + 0.3 * loss_vel + 0.1 * loss_acc
-
-        # === DTW metrics ===
-        dtw_norm  = masked_dtw(pred, fut, mask)
         dtw_unorm = masked_dtw(self.unnormalize_pose(pred), self.unnormalize_pose(fut), mask)
-        dtw_face  = masked_dtw(pred[:, :, :33, :], fut[:, :, :33, :], mask)
-        dtw_handR = masked_dtw(pred[:, :, 154:175, :], fut[:, :, 154:175, :], mask)
-
-        self.log("val/dtw_norm", dtw_norm, prog_bar=False)
         self.log("val/dtw_unorm", dtw_unorm, prog_bar=True)
-        self.log("val/dtw_face", dtw_face, prog_bar=False)
-        self.log("val/dtw_handR", dtw_handR, prog_bar=False)
         self.log("val/loss", loss, prog_bar=True)
 
         return {"val_loss": loss, "val_dtw": dtw_unorm}
 
-
     @torch.no_grad()
-    def generate_full_sequence(self, past_btjc, sign_img, target_mask=None, target_len=None):
-        print("[GEN/full] ENTER generate_full_sequence", flush=True)
-        self.eval()
-        ctx  = self.normalize_pose(past_btjc).to(self.device)
+    def generate_full_sequence(self, past_btjc, sign_img, target_len=30):
+        ctx  = self.normalize_pose(past_btjc)
         sign = sign_img.to(self.device)
-        B, _, J, C = ctx.shape
-
-        if target_len is not None:
-            if isinstance(target_len, (int, float)):
-                tf_list = [int(target_len)] * B
-            elif torch.is_tensor(target_len):
-                tf_list = target_len.view(-1).to(torch.long).cpu().tolist()
-            else:
-                tf_list = [int(x) for x in target_len]
-        else:
-            assert target_mask is not None, "Need target_len or target_mask"
-            mask_bt = (target_mask.float().sum(dim=(2,3)) > 0).float() if target_mask.dim() == 4 else target_mask.float()
-            tf_list = mask_bt.sum(dim=1).to(torch.long).view(-1).cpu().tolist()
+        B,_,J,C = ctx.shape
 
         outs = []
         for b in range(B):
-            Tf = max(1, int(tf_list[b]))
             preds = []
-            for t_idx in range(Tf):
-                t_norm = torch.tensor([[t_idx / Tf]], device=self.device)
-                x_query = 0.05 * torch.randn((1, 1, J, C), device=self.device)
+            for t in range(target_len):
+                t_norm = torch.tensor([[t/target_len]], device=self.device)
+                x_query = torch.zeros((1,1,J,C), device=self.device)
                 pred_t = self.forward(x_query, t_norm, ctx[b:b+1], sign[b:b+1])
                 preds.append(pred_t)
-            pred_seq = torch.cat(preds, dim=1)
-            outs.append(pred_seq)
-        out = torch.cat(outs, dim=0)
-        return self.unnormalize_pose(out)  # 🟩 restore to real coordinates
+            outs.append(torch.cat(preds,1))
+
+        return self.unnormalize_pose(torch.cat(outs,0))
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)

@@ -176,7 +176,7 @@ if __name__ == "__main__":
         sign     = cond["sign_image"][:1].to(model.device)
         mask_raw = cond["target_mask"][:1].to(model.device)
 
-        fut  = model.normalize_pose(sanitize_btjc(fut_raw))
+        fut = model.normalize_pose(sanitize_btjc(fut_raw))
         past = model.normalize_pose(sanitize_btjc(past_raw))
 
         T = fut.size(1)
@@ -192,7 +192,10 @@ if __name__ == "__main__":
         ts = torch.zeros(1, dtype=torch.long, device=fut.device)
         print("[EVAL DEBUG] ts shape / unique:", ts.shape, torch.unique(ts).tolist())
 
-        in_seq = past
+        t_ramp = torch.linspace(0, 1, steps=T, device=fut.device).view(1, T, 1, 1)
+        noise = 0.1 * torch.randn_like(fut)
+
+        in_seq = 0.05 * noise + 0.05 * t_ramp + 0.4 * past + 0.5 * fut
         pred   = model.forward(in_seq, ts, past, sign)
         print("[EVAL DEBUG] pred shape after forward:", pred.shape)
 
@@ -310,6 +313,13 @@ if __name__ == "__main__":
 
     fut_for_save  = fut_un
     pred_for_save = pred_un
+
+    # === Remove padded frames using mask_bt ===
+    T_valid = int(mask_bt[0].sum().item())
+    print(f"[SAVE] Using {T_valid} valid frames for saving.")
+
+    fut_for_save  = fut_un[:, :T_valid]
+    pred_for_save = pred_un[:, :T_valid]
 
     try:
         gt_pose   = tensor_to_pose(fut_for_save,  header)
