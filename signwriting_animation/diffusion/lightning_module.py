@@ -160,7 +160,12 @@ class LitMinimal(pl.LightningModule):
         vel_gt   = gt[:,1:]   - gt[:,:-1]
 
         vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
-        loss = pos_loss + 0.1 * vel_loss
+
+        acc_pred = vel_pred[:,1:] - vel_pred[:,:-1]
+        acc_gt   = vel_gt[:,1:] - vel_gt[:,:-1]
+        acc_loss = torch.nn.functional.l1_loss(acc_pred, acc_gt)
+
+        loss = pos_loss + 5.0 * vel_loss + 1.0 * acc_loss
 
         # ---- Debug info ----
         with torch.no_grad():
