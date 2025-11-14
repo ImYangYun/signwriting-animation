@@ -88,10 +88,14 @@ if __name__ == "__main__":
         reduce_holistic=True,    # 178 joints
     )
 
-    small_ds = torch.utils.data.Subset(base_ds, list(range(20)))
-    batch_size = 2
+    small_ds = torch.utils.data.Subset(base_ds, list(range(4)))
+    loader = DataLoader(
+        small_ds,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=zero_pad_collator
+    )
 
-    # read shapes
     batch0 = next(iter(loader))
     B,T,P,J,C = batch0["data"].shape
     print(f"[INFO] Overfit set shape = {B,T,P,J,C} (expected [4,30,1,178,3])")
