@@ -176,8 +176,16 @@ if __name__ == "__main__":
     check("PRED_norm", pred_norm)
 
     # ---- motion & collapse check ----
-    pred_un = model.unnormalize(pred_norm)
     gt_un   = model.unnormalize(gt_norm)
+    pred_un = model.unnormalize(pred_norm)
+
+    print(f"[RANGE] GT x[{gt_un[...,0].min():.1f},{gt_un[...,0].max():.1f}] "
+        f"y[{gt_un[...,1].min():.1f},{gt_un[...,1].max():.1f}] "
+        f"z[{gt_un[...,2].min():.1f},{gt_un[...,2].max():.1f}]")
+
+    print(f"[RANGE] PRED x[{pred_un[...,0].min():.1f},{pred_un[...,0].max():.1f}] "
+        f"y[{pred_un[...,1].min():.1f},{pred_un[...,1].max():.1f}] "
+        f"z[{pred_un[...,2].min():.1f},{pred_un[...,2].max():.1f}]")
 
     print(f"[UNNORM] pred  min={pred_un.min():.1f}, max={pred_un.max():.1f}, std={pred_un.std():.1f}")
 
@@ -214,6 +222,12 @@ if __name__ == "__main__":
         sign_img=sign_img,
         future_len=T
     )
+    # --- Check motion for generated sequence ---
+    if gen_un.size(1) > 1:
+        vel = gen_un[:, 1:] - gen_un[:, :-1]   # [1,29,178,3]
+        print(f"[GEN] mean|Δ| = {vel.abs().mean().item():.6f}, std(Δ) = {vel.std().item():.6f}")
+    else:
+        print("[GEN] skipped motion check (T=1)")
 
     print(f"[DEBUG] gen_un shape = {gen_un.shape} (should be [1,30,178,3])")
 

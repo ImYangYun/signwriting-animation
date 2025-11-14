@@ -146,7 +146,10 @@ class LitMinimal(pl.LightningModule):
         past = past[:, -T:]
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        pred = self.forward(past, ts, past, sign)   # shape: [B,T,J,C]
+        x_query = torch.randn((B,1,J,C), device=self.device) * 0.05
+        x_query = self.normalize(x_query)
+
+        pred = self.forward(x_query, ts, past, sign)
         pos_loss = masked_mse(pred, gt, mask)
 
         vel_pred = pred[:, 1:] - pred[:, :-1]    # [B,T-1,J,C]
