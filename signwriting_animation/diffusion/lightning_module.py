@@ -100,12 +100,8 @@ class LitMinimal(pl.LightningModule):
 
         B,T,J,C = gt.shape
         past = past[:, -T:]   # ensure aligned windows
-
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
-
-        # ---- teacher forcing ----
-        pred = self.forward(past, ts, past, sign)
-
+        pred = self.forward(gt, ts, past, sign)
         loss = masked_mse(pred, gt, mask)
 
         self.log("train/loss", loss, prog_bar=True)
@@ -129,11 +125,8 @@ class LitMinimal(pl.LightningModule):
 
         B,T,J,C = gt.shape
         past = past[:, -T:]
-
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
-
-        pred = self.forward(past, ts, past, sign)
-
+        pred = self.forward(gt, ts, past, sign)
         loss = masked_mse(pred, gt, mask)
 
         # ---- DTW on unnormalized sequences ----

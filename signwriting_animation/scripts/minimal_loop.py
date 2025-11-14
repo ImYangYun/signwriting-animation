@@ -142,8 +142,8 @@ if __name__ == "__main__":
         mask_bt = mask_raw.float()
 
     ts = torch.zeros(1, dtype=torch.long, device=model.device)
-    x_query = torch.randn_like(past_norm[:, :2]) * 0.05    # [1,2,J,C]
-    pred_norm = model.forward(x_query, ts, past_norm, sign)
+
+    pred_norm = model.forward(gt_norm, ts, past_norm, sign)
 
     # Sanity Check (inside minimal loop)
     # ============================================================
