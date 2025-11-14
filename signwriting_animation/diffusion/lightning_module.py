@@ -128,59 +128,68 @@ class LitMinimal(pl.LightningModule):
         return pred_btjc
 
 
-    # TRAINING STEP（MSE only, for stable overfit）
+    # TRAINING(T=30 sequence)
     def training_step(self, batch, _):
         cond = batch["conditions"]
 
-        gt   = self.normalize(sanitize_btjc(batch["data"]))
-        past = self.normalize(sanitize_btjc(cond["input_pose"]))
+        gt   = self.normalize(sanitize_btjc(batch["data"]))         # [B,30,J,C]
+        past = self.normalize(sanitize_btjc(cond["input_pose"]))    # [B,60,J,C]
         sign = cond["sign_image"].float()
 
         # mask
         if cond["target_mask"].dim() == 4:
-            mask = (cond["target_mask"].sum((2,3)) > 0).float()
+            mask = (cond["target_mask"].sum((2,3)) > 0).float()     # [B,30]
         else:
             mask = cond["target_mask"].float()
 
         B,T,J,C = gt.shape
-        past = past[:, -T:]
+        past = past[:, -T:]         # → [B,30,J,C]
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        x_query = torch.randn((B,1,J,C), device=self.device) * 0.05
+        # ---- Query noise for full 30 frames ----
+        x_query = torch.randn_like(gt) * 0.05
         x_query = self.normalize(x_query)
 
-        pred = self.forward(x_query, ts, past, sign)
+        # ---- Predict full 30-frame future ----
+        pred = self.forward(x_query, ts, past, sign)        # [B,30,178,3]
+
+        # ---- Losses ----
         pos_loss = masked_mse(pred, gt, mask)
 
-        vel_pred = pred[:, 1:] - pred[:, :-1]    # [B,T-1,J,C]
-        vel_gt   = gt[:, 1:]   - gt[:, :-1]
+        vel_pred = pred[:,1:] - pred[:,:-1]    # [B,29,J,C]
+        vel_gt   = gt[:,1:]   - gt[:,:-1]
 
         vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
         loss = pos_loss + 0.1 * vel_loss
 
+        # ---- Debug info ----
         with torch.no_grad():
             fut = self.model.future_motion_process(
                 past.permute(0,2,3,1)
-            )
+            )          # [T,B,D]
             fut_std = fut.float().std(dim=0).mean().item()
-            self.log("debug/future_emb_time_std", fut_std, prog_bar=False)
+            self.log("debug/future_emb_time_std", fut_std)
 
             enc = self.model.seqEncoder(self.model.sequence_pos_encoder(fut))
             enc_std = enc.float().std(dim=0).mean().item()
-            self.log("debug/encoder_out_time_std", enc_std, prog_bar=False)
+            self.log("debug/encoder_out_time_std", enc_std)
+
+            pred_std = pred.float().std().item()
+            pred_mean = pred.float().mean().item()
+            self.log("debug/pred/std", pred_std)
+            self.log("debug/pred/mean", pred_mean)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
-    # validation
+
+    # VALIDATION (same as training)
     def validation_step(self, batch, _):
         cond = batch["conditions"]
-
-        gt   = self.normalize(sanitize_btjc(batch["data"]))
-        past = self.normalize(sanitize_btjc(cond["input_pose"]))
+        gt   = self.normalize(sanitize_btjc(batch["data"]))         # [B,30,J,C]
+        past = self.normalize(sanitize_btjc(cond["input_pose"]))    # [B,60,J,C]
         sign = cond["sign_image"].float()
 
-        # mask
         if cond["target_mask"].dim() == 4:
             mask = (cond["target_mask"].sum((2,3)) > 0).float()
         else:
@@ -190,31 +199,29 @@ class LitMinimal(pl.LightningModule):
         past = past[:, -T:]
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        pred = self.forward(past, ts, past, sign)
+        x_query = torch.randn_like(gt) * 0.05
+        x_query = self.normalize(x_query)
+        pred = self.forward(x_query, ts, past, sign)
+
+        pos_loss = masked_mse(pred, gt, mask)
+        vel_pred = pred[:,1:] - pred[:,:-1]
+        vel_gt   = gt[:,1:]   - gt[:,:-1]
+        vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
+        loss = pos_loss + 0.1 * vel_loss
+
+        dtw_val = masked_dtw(self.unnormalize(pred), self.unnormalize(gt), mask)
 
         with torch.no_grad():
-            fut = self.model.future_motion_process(
-                past.permute(0,2,3,1)
-            )  
-            fut_std = fut.float().std(dim=0).mean().item()
-            self.log("debug_val/future_emb_time_std", fut_std, prog_bar=False)
-
-            enc = self.model.seqEncoder(
-                self.model.sequence_pos_encoder(fut)
-            )
-            enc_std = enc.float().std(dim=0).mean().item()
-            self.log("debug_val/encoder_out_time_std", enc_std, prog_bar=False)
-
-        loss = masked_mse(pred, gt, mask)
-
-        dtw_val = masked_dtw(self.unnormalize(pred),
-                            self.unnormalize(gt),
-                            mask)
+            pred_std = pred.float().std().item()
+            pred_mean = pred.float().mean().item()
+            self.log("debug_val/pred/std", pred_std)
+            self.log("debug_val/pred/mean", pred_mean)
 
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/dtw", dtw_val, prog_bar=True)
 
         return loss
+
 
     # -----------------------------------------------------
     # Optimizer
