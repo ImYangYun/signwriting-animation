@@ -146,28 +146,30 @@ class LitMinimal(pl.LightningModule):
         past = past[:, -T:]
         ts = torch.zeros(B, dtype=torch.long, device=self.device)
 
-        pred = self.forward(past, ts, past, sign)
+        pred = self.forward(past, ts, past, sign)   # shape: [B,T,J,C]
+        pos_loss = masked_mse(pred, gt, mask)
+
+        vel_pred = pred[:, 1:] - pred[:, :-1]    # [B,T-1,J,C]
+        vel_gt   = gt[:, 1:]   - gt[:, :-1]
+
+        vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
+        loss = pos_loss + 0.1 * vel_loss
 
         with torch.no_grad():
             fut = self.model.future_motion_process(
-                past.permute(0,2,3,1)  # BJCT
-            )  # [T,B,D]
+                past.permute(0,2,3,1)
+            )
             fut_std = fut.float().std(dim=0).mean().item()
             self.log("debug/future_emb_time_std", fut_std, prog_bar=False)
 
-            enc = self.model.seqEncoder(
-                self.model.sequence_pos_encoder(fut)
-            )  # [T,B,D]
+            enc = self.model.seqEncoder(self.model.sequence_pos_encoder(fut))
             enc_std = enc.float().std(dim=0).mean().item()
             self.log("debug/encoder_out_time_std", enc_std, prog_bar=False)
-        # ======================================================
-
-        loss = masked_mse(pred, gt, mask)
 
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
-    # -----------------------------------------------------
+    # validation
     def validation_step(self, batch, _):
         cond = batch["conditions"]
 

@@ -88,8 +88,8 @@ if __name__ == "__main__":
         reduce_holistic=True,    # 178 joints
     )
 
-    small_ds = torch.utils.data.Subset(base_ds, list(range(4)))
-    loader = DataLoader(small_ds, batch_size=4, shuffle=True, collate_fn=zero_pad_collator)
+    small_ds = torch.utils.data.Subset(base_ds, list(range(20)))
+    batch_size = 2
 
     # read shapes
     batch0 = next(iter(loader))
@@ -107,12 +107,12 @@ if __name__ == "__main__":
 
     # ---------------- Train ----------------
     trainer = pl.Trainer(
-        max_epochs=50,
+        max_epochs=400,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        limit_train_batches=1,
-        limit_val_batches=1,
-        log_every_n_steps=1,
+        limit_train_batches=None,
+        limit_val_batches=None,
+        log_every_n_steps=10,
         enable_checkpointing=False,
         deterministic=True,
     )
