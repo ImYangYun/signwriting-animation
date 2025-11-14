@@ -77,12 +77,56 @@ class LitMinimal(pl.LightningModule):
     def unnormalize(self, x):
         return x * self.std_pose + self.mean_pose
 
-    # forward wrapper
     def forward(self, x_btjc, ts, past_btjc, sign_img):
-        x_bjct    = x_btjc.permute(0,2,3,1)
-        past_bjct = past_btjc.permute(0,2,3,1)
-        out_bjct  = self.model.forward(x_bjct, ts, past_bjct, sign_img)
-        return out_bjct.permute(0,3,1,2).contiguous()
+        """
+        x_btjc:   [B,T,J,C]  →  model query frames
+        past_btjc: [B,T,J,C] → past motion (teacher forcing)
+        ts:       [B]        → diffusion timestep index
+        sign_img: [B,3,224,224]
+        """
+
+        # ---- permute to BJCT for CAMDM core ----
+        x_bjct    = x_btjc.permute(0, 2, 3, 1).contiguous()
+        past_bjct = past_btjc.permute(0, 2, 3, 1).contiguous()
+
+        # ---- run CAMDM core ----
+        out_bjct = self.model.forward(
+            x_bjct, 
+            ts, 
+            past_bjct,
+            sign_img
+        )  # [B,J,C,T]
+
+        # ---- back to BTJC ----
+        pred_btjc = out_bjct.permute(0, 3, 1, 2).contiguous()
+
+        # ======================================
+        # DEBUG (only during validation/inference)
+        # ======================================
+        if not self.training:
+            try:
+                # 1) check NaN/Inf
+                if torch.isnan(pred_btjc).any() or torch.isinf(pred_btjc).any():
+                    print("[DBG] pred contains NaN/Inf !!!", flush=True)
+
+                # 2) output stats
+                std = pred_btjc.float().std().item()
+                mean = pred_btjc.float().mean().item()
+                print(f"[DBG] pred std={std:.6f}, mean={mean:.6f}", flush=True)
+
+                # 3) motion check
+                if pred_btjc.size(1) > 1:
+                    vel = pred_btjc[:,1:] - pred_btjc[:,:-1]
+                    vel_mean = vel.abs().mean().item()
+                    print(f"[DBG] velocity mean={vel_mean:.6f}", flush=True)
+                else:
+                    print("[DBG] velocity skipped (T=1)", flush=True)
+
+            except Exception as e:
+                print("[DBG ERROR]", e, flush=True)
+
+        return pred_btjc
+
 
     # TRAINING STEP（MSE only, for stable overfit）
     def training_step(self, batch, _):

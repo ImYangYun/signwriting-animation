@@ -16,14 +16,9 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal
 from signwriting_animation.diffusion.lightning_module import sanitize_btjc, masked_dtw
 
-
-# ============================================================
-# Utility: convert [T,J,C] → Pose object
-# ============================================================
+ 
+# Convert BTJC tensor → Pose object  
 def tensor_to_pose(t_btjc, header):
-    """
-    t_btjc: [1,T,J,C] or [T,J,C]
-    """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
@@ -34,15 +29,13 @@ def tensor_to_pose(t_btjc, header):
     return Pose(header=header, body=body)
 
 
-# ============================================================
-# Autoregressive inference method B
-# ============================================================
+# Correct autoregressive generator
 @torch.no_grad()
-def autoregressive_generate(model, past_btjc, sign_img, future_len=30):
+def autoregressive_generate(model, past_btjc, sign_img, future_len):
     """
-    Past_btjc : [1,Tp,J,C] (unnormalized)
-    sign_img  : [1,3,224,224]
-    Return    : [1, future_len, J, C] (unnormalized)
+    past_btjc: [1,Tp,J,C]  (unnormalized)
+    sign_img : [1,3,224,224]
+    returns  : [1,future_len,J,C] (unnormalized)
     """
     device = model.device
     model.eval()
@@ -53,21 +46,24 @@ def autoregressive_generate(model, past_btjc, sign_img, future_len=30):
     B, Tp, J, C = past_norm.shape
     ts = torch.zeros(B, dtype=torch.long, device=device)
 
-    generated = []
+    frames = []
 
     for t in range(future_len):
-        # Small random query for diffusion x_t
+        # diffuse query x_t — always 1 frame
         x_query = torch.randn((B,1,J,C), device=device) * 0.05
         x_query = model.normalize(x_query)
 
         pred_next = model.forward(x_query, ts, past_norm, sign)  # [B,1,J,C]
-        generated.append(pred_next)
+        frames.append(pred_next)
+
+        # grow past
         past_norm = torch.cat([past_norm, pred_next], dim=1)
 
-    gen_norm = torch.cat(generated, dim=1)
+    gen_norm = torch.cat(frames, dim=1)
     return model.unnormalize(gen_norm)
 
 
+# main
 if __name__ == "__main__":
     pl.seed_everything(42)
 
@@ -76,7 +72,7 @@ if __name__ == "__main__":
     out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---------------------- Dataset ----------------------
+    # ---------------- Dataset ----------------  
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -84,7 +80,7 @@ if __name__ == "__main__":
         num_future_frames=30,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,
+        reduce_holistic=True,   # 178 joints
     )
 
     small_ds = torch.utils.data.Subset(base_ds, list(range(4)))
@@ -92,9 +88,9 @@ if __name__ == "__main__":
 
     batch0 = next(iter(loader))
     B,T,P,J,C = batch0["data"].shape
-    print(f"[INFO] Overfit set shape = {B,T,P,J,C}")
+    print(f"[INFO] Overfit set shape = {B,T,P,J,C}  (should be [4,30,1,178,3])")
 
-    # ---------------------- Model ----------------------
+    # ---------------- Model ----------------  
     model = LitMinimal(
         num_keypoints=J,
         num_dims=C,
@@ -102,162 +98,91 @@ if __name__ == "__main__":
         stats_path=os.path.join(data_dir, "mean_std_178.pt")
     )
 
-
-    # ---------------------- Train ----------------------
+    # ---------------- Train ----------------  
     trainer = pl.Trainer(
-        max_epochs=500,
+        max_epochs=50,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         limit_train_batches=1,
         limit_val_batches=1,
-        log_every_n_steps=10,
+        log_every_n_steps=1,
         enable_checkpointing=False,
         deterministic=True,
     )
     print("[TRAIN] Start overfit 4 samples")
     trainer.fit(model, loader, loader)
 
-
+    # ==============================================================  
+    # EVALUATION  
+    # ==============================================================  
     print("\n=== Evaluation ===")
+
     model.eval()
     batch  = next(iter(loader))
     cond   = batch["conditions"]
 
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,30,178,3]
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,178,3]
     sign     = cond["sign_image"][:1].to(model.device)
     mask_raw = cond["target_mask"][:1].to(model.device)
 
-    # normalize
-    gt_norm   = model.normalize(fut_raw)
+    gt_norm = model.normalize(fut_raw)
     past_norm = model.normalize(past_raw)
 
-    # ---- align length ----
+    # alignment
     T = gt_norm.size(1)
-    past_norm = past_norm[:, -T:]
+    past_norm = past_norm[:, -T:]   # [1,30,178,3]
 
-    # ---- mask ----
+    # correct mask
     if mask_raw.dim() == 4:
         mask_bt = (mask_raw.sum((2,3)) > 0).float()
     else:
         mask_bt = mask_raw.float()
 
-    # ---- compute T_valid ----
-    T_valid = int(mask_bt[0].sum().item())
-    print(f"[INFO] T_valid = {T_valid}")
+    future_len = T     # always 30
+    print(f"[INFO] future_len = {future_len}")
 
-    ts = torch.zeros(1, dtype=torch.long, device=model.device)
-
-    # random query with T_valid frames
-    x_query = torch.randn((1, T_valid, J, C), device=model.device) * 0.05
+    # --------------------------------------------------------------
+    # Teacher forcing sanity check: 1-frame prediction only  
+    # --------------------------------------------------------------
+    x_query = torch.randn((1,1,J,C), device=model.device)*0.05
     x_query = model.normalize(x_query)
+    pred_norm = model.forward(x_query, torch.zeros(1,device=model.device), past_norm, sign)
+    print(f"[DEBUG] pred_norm shape (should be [1,1,J,C]): {pred_norm.shape}")
 
-    pred_norm = model.forward(x_query, ts, past_norm, sign)
-    print("[INFO] Inference A done.")
-
-    # Sanity Check (inside minimal loop)
-    # ============================================================
-    print("\n=== SANITY CHECK ===")
-
-    # ---- 1. Check NaN / Inf / value ranges ----
-    def check_numeric(name, t):
-        t_cpu = t.detach().cpu()
-        print(f"[{name}] shape={tuple(t_cpu.shape)}")
-        print(f"  min={t_cpu.min():.4f}, max={t_cpu.max():.4f}, mean={t_cpu.mean():.4f}, std={t_cpu.std():.4f}")
-        print(f"  NaN%={(torch.isnan(t_cpu).float().mean()*100):.4f}%, "
-              f"Inf%={(torch.isinf(t_cpu).float().mean()*100):.4f}%")
-
-    check_numeric("GT_norm", gt_norm)
-    check_numeric("PRED_norm", pred_norm)
-
-    # ---- 2. Temporal change check (is there motion?) ----
-    if pred_norm.size(1) > 1:
-        vel = pred_norm[:, 1:] - pred_norm[:, :-1]
-        print(f"[MOTION] mean |Δpred_norm| = {vel.abs().mean().item():.6f}")
-        print(f"[MOTION] std(Δpred_norm)   = {vel.std().item():.6f}")
-    else:
-        print("[MOTION] skipped (T=1)")
-
-    # ---- 3. Per-joint STD check (is output collapsing?) ----
-    std_per_joint = pred_norm[0].std(dim=0).mean(dim=1)  # shape [J]
-    print(f"[JOINT STD] mean std across joints = {std_per_joint.mean().item():.6f}")
-    print(f"[JOINT STD] first 10 joints std     = {[round(v,4) for v in std_per_joint[:10].tolist()]}")
-    if pred_norm.size(1) > 1:
-        vel_pred = pred_norm[:, 1:] - pred_norm[:, :-1]
-        vel_gt   = gt_norm[:, 1:]  - gt_norm[:, :-1]
-
-        print(f"[VEL norm] |pred_vel| mean = {vel_pred.abs().mean().item():.6f}")
-        print(f"[VEL norm] |gt_vel|   mean = {vel_gt.abs().mean().item():.6f}")
-    else:
-        print("[VEL norm] skipped (T=1)")
-    print("=== SANITY CHECK END ===\n")
-
-    # Unnormalize
+    # ==============================================================  
+    # Save GT / 1-frame pred  
+    # ==============================================================  
     gt_un   = model.unnormalize(gt_norm)
     pred_un = model.unnormalize(pred_norm)
 
-    if pred_un.size(1) > 1:
-        vel_pred_un = pred_un[:, 1:] - pred_un[:, :-1]
-        vel_gt_un   = gt_un[:, 1:]  - gt_un[:, :-1]
-
-        print(f"[VEL unnorm] |pred_vel| mean = {vel_pred_un.abs().mean().item():.3f}")
-        print(f"[VEL unnorm] |gt_vel|   mean = {vel_gt_un.abs().mean().item():.3f}")
-    else:
-        print("[VEL unnorm] skipped (T=1)")
-    # Save only valid frames
-    #T_valid = int(mask_bt[0].sum().item())
-    #gt_un   = gt_un[:, :T_valid]
-    #pred_un = pred_un[:, :T_valid]
-
-    T_valid = gt_un.shape[1]
-    print(f"[SAVE] Valid frames = {T_valid}")
-
-    # ============================================================
-    # Load header from reference pose file
-    # ============================================================
     pose_path = base_ds.records[0]["pose"]
     src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
-
     with open(src, "rb") as f:
         ref_pose = Pose.read(f)
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = reduce_holistic(ref_pose).header
 
-    # ============================================================
-    # Save gt / pred
-    # ============================================================
     gt_pose   = tensor_to_pose(gt_un, header)
     pred_pose = tensor_to_pose(pred_un, header)
 
-    out_gt   = os.path.join(out_dir, "gt_178.pose")
-    out_pred = os.path.join(out_dir, "pred_178.pose")
+    gt_pose.write(open(os.path.join(out_dir,"gt_178.pose"), "wb"))
+    pred_pose.write(open(os.path.join(out_dir,"pred_178.pose"), "wb"))
+    print("[SAVE] GT and pred_1frame saved.")
 
-    for p in [out_gt, out_pred]:
-        if os.path.exists(p):
-            os.remove(p)
-
-    gt_pose.write(open(out_gt, "wb"))
-    pred_pose.write(open(out_pred, "wb"))
-
-    print("[SAVE] GT and Pred saved.")
-
-
-    # ============================================================
-    # B-version autoregressive generation
-    # ============================================================
+    # ==============================================================  
+    # Autoregressive sequence generation (Method B)  
+    # ==============================================================  
     print("\n=== Inference B (autoregressive) ===")
 
     gen_un = autoregressive_generate(
         model=model,
-        past_btjc=past_raw,     # unnormalized
+        past_btjc=past_raw,
         sign_img=sign,
-        future_len=T_valid
+        future_len=future_len
     )
+    print(f"[DEBUG] gen_un shape (should be [1,30,178,3]): {gen_un.shape}")
 
     gen_pose = tensor_to_pose(gen_un, header)
-    out_gen = os.path.join(out_dir, "gen_178.pose")
-    if os.path.exists(out_gen):
-        os.remove(out_gen)
-    gen_pose.write(open(out_gen, "wb"))
-
+    gen_pose.write(open(os.path.join(out_dir, "gen_178.pose"), "wb"))
     print("[SAVE] gen_178.pose saved.")
