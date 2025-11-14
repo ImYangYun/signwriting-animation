@@ -135,8 +135,11 @@ class SignWritingToPoseDiffusion(nn.Module):
         #future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
         with torch.no_grad():
-            fut_time_std = future_motion_emb.float().std(dim=0).mean().item()  # time=dim 0
-            print(f"[DBG/model] future_emb time-std={fut_time_std:.6f}", flush=True)
+            if future_motion_emb.size(0) > 1:
+                fut_time_std = future_motion_emb.float().std(dim=0).mean().item()
+                print(f"[DBG/model] future_emb time-std={fut_time_std:.6f}")
+            else:
+                print("[DBG/model] future_emb time-std=SKIPPED (T=1)")
 
         Tf = future_motion_emb.shape[0]
 
@@ -147,8 +150,11 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)[-num_frames:]
         with torch.no_grad():
-            enc_time_std = output.float().std(dim=0).mean().item()
-            print(f"[DBG/model] encoder_out time-std={enc_time_std:.6f}", flush=True)
+            if output.size(0) > 1:
+                enc_time_std = output.float().std(dim=0).mean().item()
+                print(f"[DBG/model] encoder_out time-std={enc_time_std:.6f}")
+            else:
+                print("[DBG/model] encoder_out time-std=SKIPPED (T=1)")
         output = self.pose_projection(output)
         return output
 
