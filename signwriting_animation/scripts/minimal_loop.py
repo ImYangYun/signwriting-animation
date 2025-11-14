@@ -195,10 +195,11 @@ if __name__ == "__main__":
     else:
         print("[VEL unnorm] skipped (T=1)")
     # Save only valid frames
-    T_valid = int(mask_bt[0].sum().item())
-    gt_un   = gt_un[:, :T_valid]
-    pred_un = pred_un[:, :T_valid]
+    #T_valid = int(mask_bt[0].sum().item())
+    #gt_un   = gt_un[:, :T_valid]
+    #pred_un = pred_un[:, :T_valid]
 
+    T_valid = gt_un.shape[1]
     print(f"[SAVE] Valid frames = {T_valid}")
 
     # ============================================================
