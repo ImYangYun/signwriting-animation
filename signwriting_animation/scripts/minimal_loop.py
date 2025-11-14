@@ -128,22 +128,32 @@ if __name__ == "__main__":
     sign     = cond["sign_image"][:1].to(model.device)
     mask_raw = cond["target_mask"][:1].to(model.device)
 
-    gt_norm = model.normalize(fut_raw)
+    # normalize
+    gt_norm   = model.normalize(fut_raw)
     past_norm = model.normalize(past_raw)
 
-    # Align lengths
+    # ---- align length ----
     T = gt_norm.size(1)
     past_norm = past_norm[:, -T:]
 
-    # Mask
+    # ---- mask ----
     if mask_raw.dim() == 4:
         mask_bt = (mask_raw.sum((2,3)) > 0).float()
     else:
         mask_bt = mask_raw.float()
 
+    # ---- compute T_valid ----
+    T_valid = int(mask_bt[0].sum().item())
+    print(f"[INFO] T_valid = {T_valid}")
+
     ts = torch.zeros(1, dtype=torch.long, device=model.device)
 
-    pred_norm = model.forward(gt_norm, ts, past_norm, sign)
+    # random query with T_valid frames
+    x_query = torch.randn((1, T_valid, J, C), device=model.device) * 0.05
+    x_query = model.normalize(x_query)
+
+    pred_norm = model.forward(x_query, ts, past_norm, sign)
+    print("[INFO] Inference A done.")
 
     # Sanity Check (inside minimal loop)
     # ============================================================
