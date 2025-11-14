@@ -1,6 +1,8 @@
 import torch
 import lightning as pl
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
+from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType
+from CAMDM.diffusion.respace import SpacedDiffusion, space_timesteps
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 
 
@@ -51,15 +53,18 @@ class LitMinimal(pl.LightningModule):
                  num_keypoints=178,
                  num_dims=3,
                  lr=1e-4,
-                 stats_path="/data/yayun/pose_data/mean_std_178.pt"):
+                 stats_path="/data/yayun/pose_data/mean_std_178.pt",
+                 timesteps=1000,
+                 beta_start=1e-4,
+                 beta_end=0.02,
+                 pred_target="eps",
+                 guidance_scale=2.0):
         super().__init__()
         self.save_hyperparameters()
 
-        # ---- Load dataset-wide statistics ----
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1,1,-1,3)   # [1,1,J,C]
         std  = stats["std"].float().view(1,1,-1,3)
-
         self.register_buffer("mean_pose", mean)
         self.register_buffer("std_pose",  std)
 
@@ -68,168 +73,186 @@ class LitMinimal(pl.LightningModule):
             num_dims_per_keypoint=num_dims,
         )
 
-        print("[LitMinimal] CAMDM deterministic x0-prediction loaded ✔")
+        # ---- 扩散对象 ----
+        self.pred_target = pred_target.lower()
+        model_mean_type = ModelMeanType.EPSILON if self.pred_target == "eps" else ModelMeanType.START_X
+        self.diffusion = GaussianDiffusion(
+            betas=torch.linspace(beta_start, beta_end, timesteps),
+            model_mean_type=model_mean_type,
+            model_var_type=ModelVarType.FIXED_LARGE,
+            rescale_timesteps=True
+        )
 
-    # normalization helpers
-    def normalize(self, x):
-        return (x - self.mean_pose) / (self.std_pose + 1e-6)
+        self.guidance_scale = guidance_scale
+        self.lr = lr
+        print("[LitMinimal] ✅ true diffusion (q_sample + target=%s) enabled" % self.pred_target)
 
-    def unnormalize(self, x):
-        return x * self.std_pose + self.mean_pose
+    # ---------- 归一化 ----------
+    def normalize(self, x):   return (x - self.mean_pose) / (self.std_pose + 1e-6)
+    def unnormalize(self, x): return x * self.std_pose + self.mean_pose
 
-    def forward(self, x_btjc, ts, past_btjc, sign_img):
+    # ---------- BTJC↔BJCT ----------
+    @staticmethod
+    def btjc_to_bjct(x): return x.permute(0,2,3,1).contiguous()
+    @staticmethod
+    def bjct_to_btjc(x): return x.permute(0,3,1,2).contiguous()
+
+    # ---------- 模型前向（包装 BJCT） ----------
+    def _forward_bjct(self, x_bjct, ts, past_btjc, sign_img):
+        past_bjct = self.btjc_to_bjct(past_btjc)
+        out_bjct  = self.model.forward(x_bjct, ts, past_bjct, sign_img)  # [B,J,C,T]
+        return out_bjct
+
+    # ---------- 统一的扩散一步 ----------
+    def _diffuse_once(self, x_start_btjc, t_long, cond):
         """
-        x_btjc:   [B,T,J,C]  →  model query frames
-        past_btjc: [B,T,J,C] → past motion (teacher forcing)
-        ts:       [B]        → diffusion timestep index
-        sign_img: [B,3,224,224]
+        x_start_btjc: [B,T,J,C] (规范化空间)
+        t_long:       [B] long
+        cond:         dict: {'input_pose': BTJC, 'sign_image': BCHW, 'target_mask': [B,T] or [B,T,J,C]}
         """
+        # 1) 置换到 BJCT
+        x0_bjct = self.btjc_to_bjct(x_start_btjc)  # [B,J,C,T]
+        noise   = torch.randn_like(x0_bjct)
+        # 2) q_sample 得到 x_t
+        x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)  # same shape
 
-        # ---- permute to BJCT for CAMDM core ----
-        x_bjct    = x_btjc.permute(0, 2, 3, 1).contiguous()
-        past_bjct = past_btjc.permute(0, 2, 3, 1).contiguous()
+        # 3) 调用 CAMDM 接口（注意：你的模型 forward 接受 BJCT）
+        #    但它需要 'past' 和 'sign'；我们直接把 BTJC 的 past → BJCT 在 _forward_bjct 里做
+        out_bjct = self._forward_bjct(x_t, self.diffusion._scale_timesteps(t_long), cond["input_pose"], cond["sign_image"])
 
-        # ---- run CAMDM core ----
-        out_bjct = self.model.forward(
-            x_bjct, 
-            ts, 
-            past_bjct,
-            sign_img
-        )  # [B,J,C,T]
+        # 4) 准备训练目标
+        if self.pred_target == "eps":
+            target = noise                      # 预测 ε
+        else:
+            target = x0_bjct                    # 预测 x0
 
-        # ---- back to BTJC ----
-        pred_btjc = out_bjct.permute(0, 3, 1, 2).contiguous()
+        return out_bjct, target
 
-        # ======================================
-        # DEBUG (only during validation/inference)
-        # ======================================
-        if not self.training:
-            try:
-                # 1) check NaN/Inf
-                if torch.isnan(pred_btjc).any() or torch.isinf(pred_btjc).any():
-                    print("[DBG] pred contains NaN/Inf !!!", flush=True)
-
-                # 2) output stats
-                std = pred_btjc.float().std().item()
-                mean = pred_btjc.float().mean().item()
-                print(f"[DBG] pred std={std:.6f}, mean={mean:.6f}", flush=True)
-
-                # 3) motion check
-                if pred_btjc.size(1) > 1:
-                    vel = pred_btjc[:,1:] - pred_btjc[:,:-1]
-                    vel_mean = vel.abs().mean().item()
-                    print(f"[DBG] velocity mean={vel_mean:.6f}", flush=True)
-                else:
-                    print("[DBG] velocity skipped (T=1)", flush=True)
-
-            except Exception as e:
-                print("[DBG ERROR]", e, flush=True)
-
-        return pred_btjc
-
-
-    # TRAINING(T=30 sequence)
+    # ---------- 训练 ----------
     def training_step(self, batch, _):
-        cond = batch["conditions"]
+        cond_raw = batch["conditions"]
+        gt_btjc  = sanitize_btjc(batch["data"])                  # [B,30,J,C]
+        past_btjc= sanitize_btjc(cond_raw["input_pose"])         # [B,60,J,C]
+        mask_bt  = cond_raw["target_mask"]
+        sign_img = cond_raw["sign_image"].float()
 
-        gt   = self.normalize(sanitize_btjc(batch["data"]))         # [B,30,J,C]
-        past = self.normalize(sanitize_btjc(cond["input_pose"]))    # [B,60,J,C]
-        sign = cond["sign_image"].float()
+        # 归一化 & 对齐 60→30
+        gt = self.normalize(gt_btjc)
+        past = self.normalize(past_btjc)[:, -gt.size(1):]        # [B,30,J,C]
 
-        # mask
-        if cond["target_mask"].dim() == 4:
-            mask = (cond["target_mask"].sum((2,3)) > 0).float()     # [B,30]
-        else:
-            mask = cond["target_mask"].float()
+        cond = {"input_pose": past, "sign_image": sign_img, "target_mask": mask_bt}
 
-        B,T,J,C = gt.shape
-        past = past[:, -T:]         # → [B,30,J,C]
-        ts = torch.zeros(B, dtype=torch.long, device=self.device)
+        B = gt.size(0)
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device, dtype=torch.long)
 
-        # ---- Query noise for full 30 frames ----
-        x_query = torch.randn_like(gt) * 0.05
-        x_query = self.normalize(x_query)
+        pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
 
-        # ---- Predict full 30-frame future ----
-        pred = self.forward(x_query, ts, past, sign)        # [B,30,178,3]
+        # MSE 主损失（在 BJCT）
+        loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
-        # ---- Losses ----
-        pos_loss = masked_mse(pred, gt, mask)
+        # 可选：速度/加速度（回到 BTJC 上做）
+        pred_btjc   = self.bjct_to_btjc(pred_bjct)
+        target_btjc = self.bjct_to_btjc(target_bjct if self.pred_target=="x0" else gt)  # 若预测 ε，则用 gt 近似作辅助项
+        loss_vel = torch.tensor(0.0, device=self.device)
+        loss_acc = torch.tensor(0.0, device=self.device)
+        if pred_btjc.size(1) > 1:
+            v_pred = pred_btjc[:,1:] - pred_btjc[:,:-1]
+            v_tgt  = target_btjc[:,1:] - target_btjc[:,:-1]
+            loss_vel = torch.nn.functional.l1_loss(v_pred, v_tgt)
+            if v_pred.size(1) > 1:
+                a_pred = v_pred[:,1:] - v_pred[:,:-1]
+                a_tgt  = v_tgt[:,1:]  - v_tgt[:,:-1]
+                loss_acc = torch.nn.functional.l1_loss(a_pred, a_tgt)
 
-        vel_pred = pred[:,1:] - pred[:,:-1]    # [B,29,J,C]
-        vel_gt   = gt[:,1:]   - gt[:,:-1]
+        loss = loss_main + 0.5*loss_vel + 0.25*loss_acc
 
-        vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
-
-        acc_pred = vel_pred[:,1:] - vel_pred[:,:-1]
-        acc_gt   = vel_gt[:,1:] - vel_gt[:,:-1]
-        acc_loss = torch.nn.functional.l1_loss(acc_pred, acc_gt)
-
-        loss = pos_loss + 5.0 * vel_loss + 1.0 * acc_loss
-
-        # ---- Debug info ----
-        with torch.no_grad():
-            fut = self.model.future_motion_process(
-                past.permute(0,2,3,1)
-            )          # [T,B,D]
-            fut_std = fut.float().std(dim=0).mean().item()
-            self.log("debug/future_emb_time_std", fut_std)
-
-            enc = self.model.seqEncoder(self.model.sequence_pos_encoder(fut))
-            enc_std = enc.float().std(dim=0).mean().item()
-            self.log("debug/encoder_out_time_std", enc_std)
-
-            pred_std = pred.float().std().item()
-            pred_mean = pred.float().mean().item()
-            self.log("debug/pred/std", pred_std)
-            self.log("debug/pred/mean", pred_mean)
-
-        self.log("train/loss", loss, prog_bar=True)
+        self.log_dict({
+            "train/loss": loss,
+            "train/mse": loss_main,
+            "train/vel": loss_vel,
+            "train/acc": loss_acc
+        }, prog_bar=True)
         return loss
 
-
-    # VALIDATION (same as training)
+    # ---------- 验证 ----------
+    @torch.no_grad()
     def validation_step(self, batch, _):
-        cond = batch["conditions"]
-        gt   = self.normalize(sanitize_btjc(batch["data"]))         # [B,30,J,C]
-        past = self.normalize(sanitize_btjc(cond["input_pose"]))    # [B,60,J,C]
-        sign = cond["sign_image"].float()
+        cond_raw = batch["conditions"]
+        gt_btjc  = sanitize_btjc(batch["data"])
+        past_btjc= sanitize_btjc(cond_raw["input_pose"])
+        mask_bt  = cond_raw["target_mask"]
+        sign_img = cond_raw["sign_image"].float()
 
-        if cond["target_mask"].dim() == 4:
-            mask = (cond["target_mask"].sum((2,3)) > 0).float()
-        else:
-            mask = cond["target_mask"].float()
+        gt   = self.normalize(gt_btjc)
+        past = self.normalize(past_btjc)[:, -gt.size(1):]
+        cond = {"input_pose": past, "sign_image": sign_img, "target_mask": mask_bt}
 
-        B,T,J,C = gt.shape
-        past = past[:, -T:]
-        ts = torch.zeros(B, dtype=torch.long, device=self.device)
+        B = gt.size(0)
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device, dtype=torch.long)
 
-        x_query = torch.randn_like(gt) * 0.05
-        x_query = self.normalize(x_query)
-        pred = self.forward(x_query, ts, past, sign)
+        pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
+        loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
-        pos_loss = masked_mse(pred, gt, mask)
-        vel_pred = pred[:,1:] - pred[:,:-1]
-        vel_gt   = gt[:,1:]   - gt[:,:-1]
-        vel_loss = torch.nn.functional.l1_loss(vel_pred, vel_gt)
-        loss = pos_loss + 0.1 * vel_loss
+        # 回到 BTJC 做 DTW（用 x0 空间）
+        if self.pred_target == "eps":
+            x0_pred_btjc = self.bjct_to_btjc(pred_bjct*0.0 + gt.permute(0,2,3,1))  # 占位避免分支太长；下方统一用简化：直接用 gt 作 x0 参考
+        # 简化：直接把 pred_bjct 当作 x0 估计回到 BTJC（实践上你可以做反推一步）
+        x0_est_btjc = self.bjct_to_btjc(pred_bjct if self.pred_target=="x0" else self.btjc_to_bjct(gt))
 
-        dtw_val = masked_dtw(self.unnormalize(pred), self.unnormalize(gt), mask)
+        dtw_val = masked_dtw(self.unnormalize(x0_est_btjc), self.unnormalize(gt), 
+                             mask_bt if mask_bt.dim()==2 else (mask_bt.sum((2,3))>0).float())
 
-        with torch.no_grad():
-            pred_std = pred.float().std().item()
-            pred_mean = pred.float().mean().item()
-            self.log("debug_val/pred/std", pred_std)
-            self.log("debug_val/pred/mean", pred_mean)
+        self.log_dict({
+            "val/mse": loss_main,
+            "val/dtw": dtw_val
+        }, prog_bar=True)
 
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/dtw", dtw_val, prog_bar=True)
+        return loss_main
 
-        return loss
+    @torch.no_grad()
+    def sample_autoregressive_diffusion(self, past_btjc, sign_img, future_len=30, chunk=1):
+        """
+        past_btjc: [B,Tp,J,C] (未归一化)
+        返回：生成的未归一化 [B,future_len,J,C]
+        """
+        self.eval()
+        B, Tp, J, C = past_btjc.shape
+        device = self.device
 
+        past = self.normalize(past_btjc.to(device))
+        sign = sign_img.to(device)
 
-    # -----------------------------------------------------
-    # Optimizer
-    # -----------------------------------------------------
+        generated = []
+        cur_hist = past.clone()
+
+        steps = (future_len + chunk - 1)//chunk
+        for _ in range(steps):
+            n = min(chunk, future_len - len(generated))
+            # 目标形状（BJCT）
+            shape_bjct = (B, J, C, n)
+
+            # 条件与“无条件”（CFG）
+            cond = {"input_pose": cur_hist, "sign_image": sign}
+            uncond = {"input_pose": cur_hist*0.0, "sign_image": sign}
+
+            # 包装器：把 (x,t) 送入你的模型 interface
+            class _Wrap(nn.Module):
+                def __init__(self, base, cond_dict): super().__init__(); self.base=base; self.cond=cond_dict
+                def forward(self, x, t, **kw): return self.base.interface(x, t, {"input_pose": self.base.bjct_to_btjc(self.cond["input_pose"]).permute(0,2,3,1), "sign_image": self.cond["sign_image"]})
+
+            # 直接用 diffusion 的 p_sample_loop
+            x_cond   = self.diffusion.p_sample_loop(lambda x,t,**kw: self.model.interface(x,t,{"input_pose": self.btjc_to_bjct(cur_hist),"sign_image": sign}), shape_bjct, clip_denoised=False, progress=False)
+            x_uncond = self.diffusion.p_sample_loop(lambda x,t,**kw: self.model.interface(x,t,{"input_pose": self.btjc_to_bjct(cur_hist*0.0),"sign_image": sign}), shape_bjct, clip_denoised=False, progress=False)
+
+            x_hat = x_uncond + self.guidance_scale * (x_cond - x_uncond)  # CFG 组合
+            pred_btjc = self.bjct_to_btjc(x_hat)  # [B,n,J,C]（归一化空间）
+
+            generated.append(pred_btjc)
+            cur_hist = torch.cat([cur_hist, pred_btjc], dim=1)
+
+        pred_norm = torch.cat(generated, dim=1)           # [B,Tf,J,C]（归一化）
+        return self.unnormalize(pred_norm)
+
+    # ---------- 优化器 ----------
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)

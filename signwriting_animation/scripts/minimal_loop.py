@@ -167,16 +167,9 @@ if __name__ == "__main__":
     print("=== SANITY CHECK END ===\n")
 
 
-    # ============================================================
-    # Autoregressive generation (30 frames)
-    # ============================================================
     print("=== Inference B (autoregressive, 30 frames) ===")
-    gen_un = autoregressive_generate(
-        model=model,
-        past_btjc=past_raw,
-        sign_img=sign_img,
-        future_len=T,
-    )
+    gen_un = model.sample_autoregressive_diffusion(past_btjc=past_raw, sign_img=sign_img, future_len=T, chunk=1)
+
     if gen_un.size(1) > 1:
         vel = gen_un[:, 1:] - gen_un[:, :-1]
         print(f"[GEN MOTION] mean |Δ| = {vel.abs().mean().item():.6f}, std = {vel.std().item():.6f}")
