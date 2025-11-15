@@ -107,6 +107,8 @@ if __name__ == "__main__":
         limit_val_batches=1,
         enable_checkpointing=False,
         deterministic=True,
+        enable_progress_bar=False,   # ← 关键：关掉 tqdm 覆盖行
+        log_every_n_steps=1,
     )
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)

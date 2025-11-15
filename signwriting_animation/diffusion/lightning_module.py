@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import lightning as pl
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
@@ -214,56 +215,73 @@ class LitMinimal(pl.LightningModule):
 
         return loss_main
 
-    # ---------- 采样（自回归 + 可选 CFG） ----------
     @torch.no_grad()
-    def sample_autoregressive_diffusion(self, past_btjc, sign_img, future_len=30, chunk=1):
+    def sample_autoregressive_diffusion(
+        self,
+        past_btjc: torch.Tensor,      # [B,Tp,J,C]（未归一化）
+        sign_img: torch.Tensor,       # [B,3,224,224]
+        future_len: int = 30,
+        chunk: int = 1,
+        guidance_scale: float = None,
+    ) -> torch.Tensor:
         """
-        输入: past_btjc [B,Tp,J,C] (未归一化)
-        输出: 生成的未归一化 [B,future_len,J,C]
+        用真正的 diffusion 自回归采样，支持 CFG。
+        返回未归一化空间的生成序列 [B,future_len,J,C]
         """
         self.eval()
         device = self.device
-        B, Tp, J, C = past_btjc.shape
+        if guidance_scale is None:
+            guidance_scale = self.guidance_scale
 
-        # 归一化到模型空间，并把历史转为 BJCT
-        past_norm_btjc = self.normalize(past_btjc.to(device))       # [B,Tp,J,C]
-        cur_hist_bjct  = self.btjc_to_bjct(past_norm_btjc)          # [B,J,C,Tp]
-        sign = sign_img.to(device)
+        past_norm = self.normalize(past_btjc.to(device))      # [B,Tp,J,C]
+        sign      = sign_img.to(device)                       # [B,3,224,224]
+        B, Tp, J, C = past_norm.shape
 
-        frames_norm_btjc = []
+        class _Wrapper(nn.Module):
+            def __init__(self, base_model: nn.Module, cond: dict):
+                super().__init__()
+                self.base_model = base_model
+                self.cond = cond          # {'sign_image': BCHW, 'input_pose': BJCT}
+            def forward(self, x, t, **kwargs):
+                return self.base_model.interface(x, t, self.cond)
+
+        frames = []
         remain = int(future_len)
+        cur_hist = past_norm.clone()      # BTJC（归一化）
+
         while remain > 0:
             n = min(chunk, remain)
-            shape_bjct = (B, J, C, n)  # 扩散内部形状
+            shape_bjct = (B, J, C, n)     # diffusion 期望 BJCT
 
-            # 条件与无条件（CFG）
-            def _call_model(x, t, cond_bjct):
-                return self.model.interface(x, t, {"sign_image": sign, "input_pose": cond_bjct})
+            # 条件 / 无条件（CFG）
+            cond_dict = {
+                "sign_image": sign,
+                "input_pose": self.btjc_to_bjct(cur_hist)        # 转 BJCT
+            }
+            uncond_dict = {
+                "sign_image": sign,
+                "input_pose": torch.zeros_like(cond_dict["input_pose"])
+            }
 
-            x_cond = self.diffusion.p_sample_loop(
-                model=lambda x, t, **kw: _call_model(x, t, cur_hist_bjct),
-                shape=shape_bjct, clip_denoised=False, progress=False
+            wrapped_cond   = _Wrapper(self.model, cond_dict).to(device)
+            wrapped_uncond = _Wrapper(self.model, uncond_dict).to(device)
+
+            x_cond   = self.diffusion.p_sample_loop(
+                model=wrapped_cond, shape=shape_bjct, clip_denoised=False, progress=False
             )
+            x_uncond = self.diffusion.p_sample_loop(
+                model=wrapped_uncond, shape=shape_bjct, clip_denoised=False, progress=False
+            )
+            x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
 
-            if self.guidance_scale > 0:
-                x_uncond = self.diffusion.p_sample_loop(
-                    model=lambda x, t, **kw: _call_model(x, t, torch.zeros_like(cur_hist_bjct)),
-                    shape=shape_bjct, clip_denoised=False, progress=False
-                )
-                x_bjct = x_uncond + self.guidance_scale * (x_cond - x_uncond)
-            else:
-                x_bjct = x_cond
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)  # [B,n,J,C]
+            frames.append(x_btjc_norm)
 
-            # BJCT → BTJC（归一化空间）
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)                 # [B,n,J,C]
-            frames_norm_btjc.append(x_btjc_norm)
-            # 自回归：把生成帧（BJCT）接到历史
-            cur_hist_bjct = torch.cat([cur_hist_bjct, x_bjct], dim=3)
+            cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
             remain -= n
 
-        pred_norm_btjc = torch.cat(frames_norm_btjc, dim=1)         # [B,Tf,J,C]
-        return self.unnormalize(pred_norm_btjc)
+        pred_norm = torch.cat(frames, dim=1)        # [B,future_len,J,C]（归一化）
+        return self.unnormalize(pred_norm)
 
-    # ---------- 优化器 ----------
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
