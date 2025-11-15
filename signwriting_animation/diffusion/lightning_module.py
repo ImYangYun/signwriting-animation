@@ -215,73 +215,72 @@ class LitMinimal(pl.LightningModule):
 
         return loss_main
 
+
     @torch.no_grad()
     def sample_autoregressive_diffusion(
-        self,
-        past_btjc: torch.Tensor,      # [B,Tp,J,C]（未归一化）
-        sign_img: torch.Tensor,       # [B,3,224,224]
-        future_len: int = 30,
-        chunk: int = 1,
-        guidance_scale: float = None,
-    ) -> torch.Tensor:
-        """
-        用真正的 diffusion 自回归采样，支持 CFG。
-        返回未归一化空间的生成序列 [B,future_len,J,C]
-        """
+        self, past_btjc, sign_img, future_len: int = 30, chunk: int = 1, guidance_scale: float = None
+    ):
         self.eval()
         device = self.device
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
 
-        past_norm = self.normalize(past_btjc.to(device))      # [B,Tp,J,C]
-        sign      = sign_img.to(device)                       # [B,3,224,224]
+        past_norm = self.normalize(past_btjc.to(device))  # [B,Tp,J,C]
+        sign      = sign_img.to(device)
         B, Tp, J, C = past_norm.shape
 
         class _Wrapper(nn.Module):
-            def __init__(self, base_model: nn.Module, cond: dict):
+            def __init__(self, base_model: nn.Module):
                 super().__init__()
                 self.base_model = base_model
-                self.cond = cond          # {'sign_image': BCHW, 'input_pose': BJCT}
             def forward(self, x, t, **kwargs):
-                return self.base_model.interface(x, t, self.cond)
+                y = kwargs.get("y", None)
+                assert y is not None, "model_kwargs['y'] is required"
+                return self.base_model.interface(x, t, y)
+
+        wrapped = _Wrapper(self.model).to(device)
 
         frames = []
         remain = int(future_len)
-        cur_hist = past_norm.clone()      # BTJC（归一化）
+        cur_hist = past_norm.clone()  # BTJC (norm)
 
         while remain > 0:
             n = min(chunk, remain)
-            shape_bjct = (B, J, C, n)     # diffusion 期望 BJCT
+            shape_bjct = (B, J, C, n)
 
-            # 条件 / 无条件（CFG）
             cond_dict = {
                 "sign_image": sign,
-                "input_pose": self.btjc_to_bjct(cur_hist)        # 转 BJCT
+                "input_pose": self.btjc_to_bjct(cur_hist),        # BJCT
             }
             uncond_dict = {
                 "sign_image": sign,
-                "input_pose": torch.zeros_like(cond_dict["input_pose"])
+                "input_pose": torch.zeros_like(cond_dict["input_pose"]),
             }
 
-            wrapped_cond   = _Wrapper(self.model, cond_dict).to(device)
-            wrapped_uncond = _Wrapper(self.model, uncond_dict).to(device)
-
-            x_cond   = self.diffusion.p_sample_loop(
-                model=wrapped_cond, shape=shape_bjct, clip_denoised=False, progress=False
+            x_cond = self.diffusion.p_sample_loop(
+                model=wrapped,
+                shape=shape_bjct,
+                model_kwargs={"y": cond_dict},
+                clip_denoised=False,
+                progress=False,
             )
             x_uncond = self.diffusion.p_sample_loop(
-                model=wrapped_uncond, shape=shape_bjct, clip_denoised=False, progress=False
+                model=wrapped,
+                shape=shape_bjct,
+                model_kwargs={"y": uncond_dict},
+                clip_denoised=False,
+                progress=False,
             )
             x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
 
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)  # [B,n,J,C]
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)  # [B,n,J,C]（norm）
             frames.append(x_btjc_norm)
-
             cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
             remain -= n
 
-        pred_norm = torch.cat(frames, dim=1)        # [B,future_len,J,C]（归一化）
+        pred_norm = torch.cat(frames, dim=1)
         return self.unnormalize(pred_norm)
+
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
