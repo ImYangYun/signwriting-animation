@@ -48,7 +48,7 @@ def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: to
 
 @torch.no_grad()
 def autoregressive_generate(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor, future_len: int):
-    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=5)  # chunk=5 稍稳
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=1)  # chunk=5 稍稳
 
 
 # ---------------------- Main ----------------------
