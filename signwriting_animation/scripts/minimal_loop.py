@@ -12,45 +12,45 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
+from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
 
 np.set_printoptions(suppress=True, linewidth=120, precision=4)
 torch.set_printoptions(sci_mode=False, precision=4)
 
 
-def tensor_to_pose(t_btjc, header, scale: float = 300.0):  # ← 新增 scale
+# ---------------------- robust tensor → Pose (center + scale) ----------------------
+def tensor_to_pose(t_btjc, header):
     if t_btjc.dim() == 4:
-        t = t_btjc[0]  # [T,J,C]
+        t = t_btjc[0]        # [T,J,C]
     else:
-        t = t_btjc
-    arr = t.detach().cpu().numpy().astype(np.float32)
+        t = t_btjc           # [T,J,C]
+    arr = t.detach().cpu().numpy().astype(np.float32)  # [T,J,C]
+    ctr = np.median(arr[:, :, :2], axis=1, keepdims=True)     # [T,1,2]
+    arr[:, :, :2] -= ctr
 
-    if arr.shape[-1] >= 2:
-        arr[..., :2] *= scale
-        arr[..., 2:3] *= (scale / 10)
+    r = np.sqrt((arr[:, :, 0]**2 + arr[:, :, 1]**2))          # [T,J]
+    s = np.percentile(r, 95) + 1e-6
+    scale = 120.0 / s
+    arr[:, :, :2] *= scale
+    if arr.shape[-1] >= 3:
+        arr[:, :, 2] *= scale
 
-    center_offset = np.array([150.0, 150.0, 0.0], dtype=np.float32)
-    if arr.shape[-1] >= 2:
-        arr[..., :3] += center_offset
+    arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
 
-    arr = arr[:, None, :, :].astype(np.float32)
-    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
-    body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
+    arr4 = arr[:, None, :, :]                                 # [T,1,J,C]
+    conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
+    body = NumPyPoseBody(fps=25, data=arr4.astype(np.float32), confidence=conf)
     return Pose(header=header, body=body)
 
 
 @torch.no_grad()
 def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor):
-    gen_un = model.sample_autoregressive_diffusion(
-        past_btjc=past_btjc, sign_img=sign_img, future_len=1, chunk=1
-    )
-    return gen_un
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=1, chunk=1)
 
 @torch.no_grad()
 def autoregressive_generate(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor, future_len: int):
-    return model.sample_autoregressive_diffusion(
-        past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=1
-    )
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=5)  # chunk=5 稍稳
+
 
 # ---------------------- Main ----------------------
 if __name__ == "__main__":
@@ -81,11 +81,9 @@ if __name__ == "__main__":
         pin_memory=False
     )
 
-
     batch0 = next(iter(loader))
     B, T, P, J, C = batch0["data"].shape
     print(f"[INFO] Overfit set shape = {B, T, P, J, C}")
-
 
     model = LitMinimal(
         num_keypoints=J,
@@ -96,27 +94,19 @@ if __name__ == "__main__":
         beta_start=1e-4,
         beta_end=2e-2,
         pred_target="x0",
-        guidance_scale=2.0,
+        guidance_scale=0.0,
     )
-    # ===== mean/std 匹配检查（以及可选一键校准）=====
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device).eval()
 
-    # 取一个样本做探针（未归一化 → 归一化 → 看 std）
-    probe_btjc = sanitize_btjc(batch0["data"][:1]).to(device)  # [1,T,J,C]
-    gt_norm_probe = model.normalize(probe_btjc)                # 使用当前 mean/std
-    std_probe = gt_norm_probe.float().std().item()
-
+    model_cpu = model.eval()     # 不 .to(device)
+    probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C] on CPU
+    std_probe = model_cpu.normalize(probe_btjc).float().std().item()
     status = "OK" if 0.5 <= std_probe <= 2.0 else "MISMATCH"
     print(f"[CHECK] GT_norm.std = {std_probe:.2f} → {status}")
-
-    # （可选）自动校准：若不匹配，把 std_pose 乘以这个系数，让归一化后 std≈1
     if status == "MISMATCH":
-        factor = max(std_probe, 1e-3)  # 避免除0
+        factor = max(std_probe, 1e-3)
         with torch.no_grad():
-            model.std_pose *= factor
-        # 复检
-        std_after = model.normalize(probe_btjc).float().std().item()
+            model_cpu.std_pose *= factor
+        std_after = model_cpu.normalize(probe_btjc).float().std().item()
         print(f"[Calib] scaled std_pose by {factor:.3f} → recheck std={std_after:.2f}")
 
     try:
@@ -127,7 +117,7 @@ if __name__ == "__main__":
         pass
 
     trainer = pl.Trainer(
-        max_epochs=200,
+        max_epochs=100,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         limit_train_batches=1,
@@ -135,7 +125,7 @@ if __name__ == "__main__":
         enable_checkpointing=False,
         deterministic=True,
         enable_progress_bar=False,
-        log_every_n_steps=10,
+        log_every_n_steps=1,
     )
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)
@@ -160,24 +150,21 @@ if __name__ == "__main__":
     header = reduce_holistic(ref_pose).header
     print("[HEADER] limbs per component:", [len(c.limbs) for c in header.components])
 
-    gt_pose_raw = tensor_to_pose(fut_raw, header)
     with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
-        gt_pose_raw.write(f)
+        tensor_to_pose(fut_raw, header).write(f)
     print("[SAVE] gt_raw_178.pose saved")
 
     gt_norm = model.normalize(fut_raw)
     gt_un   = model.unnormalize(gt_norm)
-    gt_pose = tensor_to_pose(gt_un, header)
     with open(os.path.join(out_dir, "gt_178.pose"), "wb") as f:
-        gt_pose.write(f)
+        tensor_to_pose(gt_un, header).write(f)
     print("[SAVE] gt_178.pose saved")
 
     # ---------------------- 1-frame prediction ----------------------
     pred_un = inference_one_frame(model, past_raw, sign_img)  # [1,1,J,C]
     print(f"[DEBUG] pred_1frame: min={pred_un.min().item():.2f}, max={pred_un.max().item():.2f}")
-    pred_pose = tensor_to_pose(pred_un, header)
     with open(os.path.join(out_dir, "pred_1frame_178.pose"), "wb") as f:
-        pred_pose.write(f)
+        tensor_to_pose(pred_un, header).write(f)
     print("[SAVE] pred_1frame_178.pose saved")
 
     print("\n=== SANITY CHECK (1-frame detailed) ===")
@@ -199,9 +186,8 @@ if __name__ == "__main__":
         print("[GEN MOTION] skipped (T=1)")
     print(f"[DEBUG] gen_un shape = {gen_un.shape} (should be [1,{T_future},178,3])")
 
-    gen_pose = tensor_to_pose(gen_un, header)
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
-        gen_pose.write(f)
+        tensor_to_pose(gen_un, header).write(f)
     print("[SAVE] gen_178.pose saved")
 
     # ========================= SUMMARY =========================
@@ -221,10 +207,7 @@ if __name__ == "__main__":
 
     def l2_error(a, b):
         d = ((a - b) ** 2).sum(dim=-1).sqrt()  # [1,T,J]
-        full = d.mean().item()
-        first5 = d[:, :5].mean().item()
-        last5  = d[:, -5:].mean().item()
-        return full, first5, last5
+        return d.mean().item(), d[:, :5].mean().item(), d[:, -5:].mean().item()
 
     l2_full, l2_early, l2_late = l2_error(pred_un, fut_raw[:, :1])  # pred_un is 1 frame
     print(f"[L2 Error 1-frame] full={l2_full:.6f}, first5={l2_early:.6f}, last5={l2_late:.6f}")
