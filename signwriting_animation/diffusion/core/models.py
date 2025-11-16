@@ -56,7 +56,7 @@ class SignWritingToPoseDiffusion(nn.Module):
                 Probability of masking conditional inputs for classifier-free guidance (CFG).
         """
         super().__init__()
-
+        self.verbose = False
         self.cond_mask_prob = cond_mask_prob
 
         # local conditions

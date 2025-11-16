@@ -62,6 +62,7 @@ class LitMinimal(pl.LightningModule):
                  guidance_scale: float = 0.0):
         super().__init__()
         self.save_hyperparameters()
+        self.verbose = False
 
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)  # [1,1,J,C]
@@ -139,7 +140,16 @@ class LitMinimal(pl.LightningModule):
         past_btjc = sanitize_btjc(cond_raw["input_pose"])         # [B,60,J,C]
         sign_img  = cond_raw["sign_image"].float()
 
-        # 归一化 & 对齐历史长度
+        if not hasattr(self, "_std_calibrated"):
+            with torch.no_grad():
+                raw_gt = sanitize_btjc(batch["data"]).to(self.device)
+                tmp = (raw_gt - self.mean_pose) / (self.std_pose + 1e-6)
+                cur = tmp.float().std().item()
+                factor = max(cur, 1e-3)
+                self.std_pose[:] = self.std_pose * factor
+                print(f"[Calib] normalized std was {cur:.3f} → scaled std_pose by {factor:.3f}")
+                self._std_calibrated = True
+
         gt   = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)[:, -gt.size(1):]         # [B,30,J,C]
 

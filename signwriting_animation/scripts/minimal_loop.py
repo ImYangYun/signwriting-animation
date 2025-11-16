@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import glob
 import torch
 import numpy as np
 import lightning as pl
@@ -13,51 +14,43 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
 
+np.set_printoptions(suppress=True, linewidth=120, precision=4)
+torch.set_printoptions(sci_mode=False, precision=4)
 
-# ---------------------- tensor → Pose ----------------------
-def tensor_to_pose(t_btjc, header):
+
+def tensor_to_pose(t_btjc, header, scale: float = 300.0):  # ← 新增 scale
     if t_btjc.dim() == 4:
-        t = t_btjc[0]   # [T,J,C]
+        t = t_btjc[0]  # [T,J,C]
     else:
         t = t_btjc
     arr = t.detach().cpu().numpy().astype(np.float32)
 
-    # 简单平移到画布中央（避免原点太偏）
+    if arr.shape[-1] >= 2:
+        arr[..., :2] *= scale
+        arr[..., 2:3] *= (scale / 10)
+
     center_offset = np.array([150.0, 150.0, 0.0], dtype=np.float32)
     if arr.shape[-1] >= 2:
         arr[..., :3] += center_offset
 
-    # [T,1,J,C] + 置信度
     arr = arr[:, None, :, :].astype(np.float32)
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
 
-# ---------------------- 推理工具：1 帧 ----------------------
 @torch.no_grad()
 def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor):
-    """
-    使用扩散采样（future_len=1, chunk=1）生成 1 帧（未归一化空间）。
-    返回形状：[B,1,J,C]
-    """
     gen_un = model.sample_autoregressive_diffusion(
         past_btjc=past_btjc, sign_img=sign_img, future_len=1, chunk=1
     )
-    return gen_un  # [B,1,J,C]
+    return gen_un
 
-
-# ---------------------- 推理工具：多帧自回归 ----------------------
 @torch.no_grad()
 def autoregressive_generate(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor, future_len: int):
-    """
-    使用扩散采样自回归生成 future_len 帧（未归一化空间）。
-    返回形状：[B,future_len,J,C]
-    """
     return model.sample_autoregressive_diffusion(
         past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=1
     )
-
 
 # ---------------------- Main ----------------------
 if __name__ == "__main__":
@@ -79,36 +72,62 @@ if __name__ == "__main__":
         reduce_holistic=True,
     )
     small_ds = torch.utils.data.Subset(base_ds, list(range(10)))
-    loader = DataLoader(small_ds, batch_size=2, shuffle=True, collate_fn=zero_pad_collator)
+    loader = DataLoader(small_ds, batch_size=2, shuffle=True, collate_fn=zero_pad_collator, num_workers=2, pin_memory=True)
 
     batch0 = next(iter(loader))
     B, T, P, J, C = batch0["data"].shape
     print(f"[INFO] Overfit set shape = {B, T, P, J, C}")
 
-    # Model（建议：x0 目标 + 适中 CFG）
+
     model = LitMinimal(
         num_keypoints=J,
         num_dims=C,
         lr=1e-4,
         stats_path=os.path.join(data_dir, "mean_std_178.pt"),
-        diffusion_steps=1000,
+        diffusion_steps=200,
         beta_start=1e-4,
         beta_end=2e-2,
-        pred_target="x0",          # 验证可计算 DTW；若用 "eps" 就不算 DTW
-        guidance_scale=2.0,        # 0 关掉 CFG；1~3 之间可试
+        pred_target="x0",
+        guidance_scale=2.0,
     )
+    # ===== mean/std 匹配检查（以及可选一键校准）=====
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device).eval()
 
-    # Train（1 个 batch 反复过拟合）
+    # 取一个样本做探针（未归一化 → 归一化 → 看 std）
+    probe_btjc = sanitize_btjc(batch0["data"][:1]).to(device)  # [1,T,J,C]
+    gt_norm_probe = model.normalize(probe_btjc)                # 使用当前 mean/std
+    std_probe = gt_norm_probe.float().std().item()
+
+    status = "OK" if 0.5 <= std_probe <= 2.0 else "MISMATCH"
+    print(f"[CHECK] GT_norm.std = {std_probe:.2f} → {status}")
+
+    # （可选）自动校准：若不匹配，把 std_pose 乘以这个系数，让归一化后 std≈1
+    if status == "MISMATCH":
+        factor = max(std_probe, 1e-3)  # 避免除0
+        with torch.no_grad():
+            model.std_pose *= factor
+        # 复检
+        std_after = model.normalize(probe_btjc).float().std().item()
+        print(f"[Calib] scaled std_pose by {factor:.3f} → recheck std={std_after:.2f}")
+
+    try:
+        if hasattr(model, "verbose"): model.verbose = False
+        if hasattr(model, "model") and hasattr(model.model, "verbose"):
+            model.model.verbose = False
+    except Exception:
+        pass
+
     trainer = pl.Trainer(
-        max_epochs=800,
+        max_epochs=200,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         limit_train_batches=1,
         limit_val_batches=1,
         enable_checkpointing=False,
         deterministic=True,
-        enable_progress_bar=False,   # ← 关键：关掉 tqdm 覆盖行
-        log_every_n_steps=1,
+        enable_progress_bar=False,
+        log_every_n_steps=10,
     )
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)
@@ -133,7 +152,11 @@ if __name__ == "__main__":
     header = reduce_holistic(ref_pose).header
     print("[HEADER] limbs per component:", [len(c.limbs) for c in header.components])
 
-    # ---------------------- GT (unnorm) ----------------------
+    gt_pose_raw = tensor_to_pose(fut_raw, header)
+    with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
+        gt_pose_raw.write(f)
+    print("[SAVE] gt_raw_178.pose saved")
+
     gt_norm = model.normalize(fut_raw)
     gt_un   = model.unnormalize(gt_norm)
     gt_pose = tensor_to_pose(gt_un, header)
@@ -220,5 +243,12 @@ if __name__ == "__main__":
     print(f"[XYZ GT ] mean={gt_m}, std={gt_s}")
     print(f"[XYZ PRED] mean={pr_m}, std={pr_s}")
     print(f"[XYZ GEN ] mean={gen_m}, std={gen_s}")
-
     print("================== END SUMMARY ====================\n")
+
+    print("\n=== Saved files in", out_dir, "===")
+    for p in sorted(glob.glob(os.path.join(out_dir, "*.pose"))):
+        try:
+            print("[POSE]", os.path.basename(p), "size=", os.path.getsize(p), "bytes")
+        except Exception:
+            print("[POSE]", os.path.basename(p))
+    print("====================================\n")
