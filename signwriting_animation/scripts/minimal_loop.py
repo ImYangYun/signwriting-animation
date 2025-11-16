@@ -72,7 +72,15 @@ if __name__ == "__main__":
         reduce_holistic=True,
     )
     small_ds = torch.utils.data.Subset(base_ds, list(range(10)))
-    loader = DataLoader(small_ds, batch_size=2, shuffle=True, collate_fn=zero_pad_collator, num_workers=2, pin_memory=True)
+    loader = DataLoader(
+        small_ds,
+        batch_size=2,
+        shuffle=True,
+        collate_fn=zero_pad_collator,
+        num_workers=0,
+        pin_memory=False
+    )
+
 
     batch0 = next(iter(loader))
     B, T, P, J, C = batch0["data"].shape
