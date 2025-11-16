@@ -17,6 +17,19 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitiz
 np.set_printoptions(suppress=True, linewidth=120, precision=4)
 torch.set_printoptions(sci_mode=False, precision=4)
 
+# ============ 新增：可视化与快跑开关 ============
+FLIP_Y   = True         # 常见2D坐标是“向下为正Y”，反一下通常能把人形“正过来”
+SWAP_XY  = False        # 仍90°错位时把它改成 True 再试；两者不要同时开
+TARGET_R = 200.0        # 画面目标半径（原来120太小）
+CENTER_TO = np.array([150.0, 150.0], dtype=np.float32)
+
+MAX_EPOCHS = 1          # 30分钟内快跑
+TRAIN_STEPS = 200       # 每轮训练迭代数（limit_train_batches）
+VAL_STEPS   = 20
+LR = 1e-3               # 提高一点，便于小样本快速收敛
+DIFF_STEPS = 200        # 扩散步数，推理也会更快
+PRED_TARGET = "eps"     # 小样本更好学；若要和你之前一致可改回 "x0"
+GUIDANCE = 2.0          # 采样时的CFG；若模型内部用到cond_mask_prob才生效
 
 # ---------------------- robust tensor → Pose (center + scale) ----------------------
 def tensor_to_pose(t_btjc, header):
@@ -24,23 +37,30 @@ def tensor_to_pose(t_btjc, header):
     t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc
     arr = t.detach().cpu().numpy().astype(np.float32)  # [T,J,C]
 
+    # 轴向修正（最小化改动，只在可视化时处理）
+    if FLIP_Y:
+        arr[:, :, 1] *= -1.0
+    if SWAP_XY:
+        arr = arr.copy()
+        arr[:, :, [0, 1]] = arr[:, :, [1, 0]]
+
+    # 居中 + 缩放（以时序×关节的95分位为半径）
     ctr_xy = np.median(arr[:, :, :2].reshape(-1, 2), axis=0, keepdims=True)  # [1,2]
     arr[:, :, :2] -= ctr_xy
 
     r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2)       # [T,J]
     s = np.percentile(r, 95) + 1e-6
-    scale = 120.0 / s
+    scale = TARGET_R / s
     arr[:, :, :2] *= scale
     if arr.shape[-1] >= 3:
         arr[:, :, 2] *= scale
 
-    arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
+    arr[:, :, :2] += CENTER_TO[None, None, :]
 
     arr4 = arr[:, None, :, :]  # [T,1,J,C]
     conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
     body = NumPyPoseBody(fps=25, data=arr4, confidence=conf)
     return Pose(header=header, body=body)
-
 
 @torch.no_grad()
 def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor):
@@ -48,8 +68,8 @@ def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: to
 
 @torch.no_grad()
 def autoregressive_generate(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor, future_len: int):
-    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=1)  # chunk=5 稍稳
-
+    # 先用 chunk=1 保守稳定；确认“动起来”后再提到 5
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=1)
 
 # ---------------------- Main ----------------------
 if __name__ == "__main__":
@@ -87,15 +107,24 @@ if __name__ == "__main__":
     model = LitMinimal(
         num_keypoints=J,
         num_dims=C,
-        lr=3e-4,
+        lr=LR,
         stats_path=os.path.join(data_dir, "mean_std_178.pt"),
-        diffusion_steps=200,
+        diffusion_steps=DIFF_STEPS,
         beta_start=1e-4,
         beta_end=2e-2,
-        pred_target="x0",
-        guidance_scale=0.0,
+        pred_target=PRED_TARGET,     # ← 改这里：默认 "eps"
+        guidance_scale=GUIDANCE,
     )
 
+    # 关闭冗余打印（如果有）
+    try:
+        if hasattr(model, "verbose"): model.verbose = False
+        if hasattr(model, "model") and hasattr(model.model, "verbose"):
+            model.model.verbose = False
+    except Exception:
+        pass
+
+    # ===== mean/std 快速匹配检查（必要时自校准）=====
     model_cpu = model.eval()
     probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C] on CPU
     std_probe = model_cpu.normalize(probe_btjc).float().std().item()
@@ -108,24 +137,18 @@ if __name__ == "__main__":
         std_after = model_cpu.normalize(probe_btjc).float().std().item()
         print(f"[Calib] scaled std_pose by {factor:.3f} → recheck std={std_after:.2f}")
 
-    try:
-        if hasattr(model, "verbose"): model.verbose = False
-        if hasattr(model, "model") and hasattr(model.model, "verbose"):
-            model.model.verbose = False
-    except Exception:
-        pass
-
+    # 训练：按 steps 而不是 epochs，保证半小时内能出结果
     trainer = pl.Trainer(
-        max_epochs=100,
+        max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         precision="16-mixed" if torch.cuda.is_available() else 32,
-        limit_train_batches=10,
-        limit_val_batches=2,
+        limit_train_batches=TRAIN_STEPS,
+        limit_val_batches=VAL_STEPS,
         enable_checkpointing=False,
         deterministic=True,
         enable_progress_bar=False,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
     )
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)
@@ -201,7 +224,7 @@ if __name__ == "__main__":
         return d.abs().mean().item(), d.std().item()
 
     gt_motion   = motion_stats(gt_un)
-    pred_motion = motion_stats(pred_un)
+    pred_motion = motion_stats(pred_un)   # ← 这里是1帧，所以必然为 0（正常）
     gen_motion  = motion_stats(gen_un)
     print(f"[Motion GT ] meanΔ={gt_motion[0]:.6f}, stdΔ={gt_motion[1]:.6f}")
     print(f"[Motion PRED] meanΔ={pred_motion[0]:.6f}, stdΔ={pred_motion[1]:.6f}")
