@@ -20,15 +20,14 @@ torch.set_printoptions(sci_mode=False, precision=4)
 
 # ---------------------- robust tensor → Pose (center + scale) ----------------------
 def tensor_to_pose(t_btjc, header):
-    if t_btjc.dim() == 4:
-        t = t_btjc[0]        # [T,J,C]
-    else:
-        t = t_btjc           # [T,J,C]
+    # t_btjc: [T,J,C] or [1,T,J,C]
+    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc
     arr = t.detach().cpu().numpy().astype(np.float32)  # [T,J,C]
-    ctr = np.median(arr[:, :, :2], axis=1, keepdims=True)     # [T,1,2]
-    arr[:, :, :2] -= ctr
 
-    r = np.sqrt((arr[:, :, 0]**2 + arr[:, :, 1]**2))          # [T,J]
+    ctr_xy = np.median(arr[:, :, :2].reshape(-1, 2), axis=0, keepdims=True)  # [1,2]
+    arr[:, :, :2] -= ctr_xy
+
+    r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2)       # [T,J]
     s = np.percentile(r, 95) + 1e-6
     scale = 120.0 / s
     arr[:, :, :2] *= scale
@@ -37,9 +36,9 @@ def tensor_to_pose(t_btjc, header):
 
     arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
 
-    arr4 = arr[:, None, :, :]                                 # [T,1,J,C]
+    arr4 = arr[:, None, :, :]  # [T,1,J,C]
     conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
-    body = NumPyPoseBody(fps=25, data=arr4.astype(np.float32), confidence=conf)
+    body = NumPyPoseBody(fps=25, data=arr4, confidence=conf)
     return Pose(header=header, body=body)
 
 
@@ -88,7 +87,7 @@ if __name__ == "__main__":
     model = LitMinimal(
         num_keypoints=J,
         num_dims=C,
-        lr=1e-4,
+        lr=3e-4,
         stats_path=os.path.join(data_dir, "mean_std_178.pt"),
         diffusion_steps=200,
         beta_start=1e-4,
@@ -97,7 +96,7 @@ if __name__ == "__main__":
         guidance_scale=0.0,
     )
 
-    model_cpu = model.eval()     # 不 .to(device)
+    model_cpu = model.eval()
     probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C] on CPU
     std_probe = model_cpu.normalize(probe_btjc).float().std().item()
     status = "OK" if 0.5 <= std_probe <= 2.0 else "MISMATCH"
@@ -120,8 +119,9 @@ if __name__ == "__main__":
         max_epochs=100,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        limit_train_batches=1,
-        limit_val_batches=1,
+        precision="16-mixed" if torch.cuda.is_available() else 32,
+        limit_train_batches=10,
+        limit_val_batches=2,
         enable_checkpointing=False,
         deterministic=True,
         enable_progress_bar=False,
@@ -149,6 +149,8 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = reduce_holistic(ref_pose).header
     print("[HEADER] limbs per component:", [len(c.limbs) for c in header.components])
+    joint_counts = [len(c.points) for c in header.components]
+    print("[HEADER] joints per component:", joint_counts, " total_joints=", sum(joint_counts))
 
     with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
         tensor_to_pose(fut_raw, header).write(f)
