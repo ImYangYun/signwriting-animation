@@ -2,6 +2,7 @@
 import os
 import glob
 import torch
+from copy import deepcopy
 import numpy as np
 import lightning as pl
 from torch.utils.data import DataLoader
@@ -13,6 +14,13 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
+import sys, atexit
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+atexit.register(lambda: sys.stdout.flush())
+
 
 np.set_printoptions(suppress=True, linewidth=120, precision=4)
 torch.set_printoptions(sci_mode=False, precision=4)
@@ -219,7 +227,10 @@ if __name__ == "__main__":
         tensor_to_pose(gt_un, header).write(f)
     print("[SAVE] gt_178.pose saved")
 
-    header_points_only = header.without_limbs()
+    header_points_only = deepcopy(header)
+    for comp in header_points_only.components:
+        comp.limbs = []
+
     with open(os.path.join(out_dir, "gt_points_only.pose"), "wb") as f:
         tensor_to_pose(gt_un, header_points_only).write(f)
     print("[SAVE] gt_points_only.pose saved")
