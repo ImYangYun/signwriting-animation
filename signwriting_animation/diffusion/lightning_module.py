@@ -207,7 +207,6 @@ class LitMinimal(pl.LightningModule):
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
         self.log("val/mse", loss_main, prog_bar=True)
 
-        # 只在预测 x0 时计算 DTW（eps 目标没有直接的坐标）
         if self.pred_target == "x0":
             x0_pred_btjc = self.bjct_to_btjc(pred_bjct)
             # 掩码处理（兼容 [B,T] 或 [B,T,J,C]）
@@ -252,7 +251,7 @@ class LitMinimal(pl.LightningModule):
 
         frames = []
         remain = int(future_len)
-        cur_hist = past_norm.clone()  # BTJC (norm)
+        cur_hist = past_norm.clone()  # [B,Tp,J,C] (norm)
 
         while remain > 0:
             n = min(chunk, remain)
@@ -263,34 +262,47 @@ class LitMinimal(pl.LightningModule):
                 "input_pose": self.btjc_to_bjct(cur_hist),        # BJCT
             }
             uncond_dict = {
-                "sign_image": sign,
+                "sign_image": torch.zeros_like(sign),
                 "input_pose": torch.zeros_like(cond_dict["input_pose"]),
             }
 
             x_cond = self.diffusion.p_sample_loop(
-                model=wrapped,
-                shape=shape_bjct,
+                model=wrapped, shape=shape_bjct,
                 model_kwargs={"y": cond_dict},
-                clip_denoised=False,
-                progress=False,
+                clip_denoised=False, progress=False,
             )
-            x_uncond = self.diffusion.p_sample_loop(
-                model=wrapped,
-                shape=shape_bjct,
-                model_kwargs={"y": uncond_dict},
-                clip_denoised=False,
-                progress=False,
-            )
-            x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
 
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)  # [B,n,J,C]（norm）
+            if guidance_scale is not None and guidance_scale > 0:
+                x_uncond = self.diffusion.p_sample_loop(
+                    model=wrapped, shape=shape_bjct,
+                    model_kwargs={"y": uncond_dict},
+                    clip_denoised=False, progress=False,
+                )
+                x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
+            else:
+                x_bjct = x_cond
+
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)  # [B,n,J,C]
+
             frames.append(x_btjc_norm)
-            cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
+
+            cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)  # [B,Tp+n,J,C]
+            if cur_hist.size(1) > Tp:
+                cur_hist = cur_hist[:, -Tp:, ...]
+
             remain -= n
 
-        pred_norm = torch.cat(frames, dim=1)
-        return self.unnormalize(pred_norm)
+        pred_norm = torch.cat(frames, dim=1)   # [B,Tf,J,C] (norm)
+        pred = self.unnormalize(pred_norm)
 
+        try:
+            if pred.size(1) > 1:
+                d = ((pred[:,1:] - pred[:,:-1])**2).sum(dim=-1).sqrt().mean(dim=-1)  # [B]
+                print(f"[GEN framewise L2] mean={d.mean().item():.6f}")
+        except Exception:
+            pass
+
+        return pred
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
