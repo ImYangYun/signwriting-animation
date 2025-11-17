@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
-from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.utils.generic import reduce_holistic
+from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
@@ -17,77 +17,85 @@ from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitiz
 np.set_printoptions(suppress=True, linewidth=120, precision=4)
 torch.set_printoptions(sci_mode=False, precision=4)
 
-# ---------------------- robust tensor → Pose (center+scale over whole sequence) ----------------------
+# ---------- one-time flag to avoid repeated "SKIPPED (T=1)" ----------
+_PRINTED_T1 = {"future_emb": False, "encoder_out": False}
+
+def _maybe_print_t1(tag, T):
+    if T <= 1 and not _PRINTED_T1[tag]:
+        print(f"[DBG/model] {tag} time-std=SKIPPED (T=1)")
+        _PRINTED_T1[tag] = True
+
+# ---------- torso-aware normalization for visualization ----------
+def _find_indices_by_name(header, names):
+    name2idx = {}
+    base = 0
+    for comp in header.components:
+        for i, n in enumerate(comp.points):
+            name2idx[n] = base + i
+        base += len(comp.points)
+    idx = [name2idx[n] for n in names if n in name2idx]
+    return idx
+
 def tensor_to_pose(t_btjc, header, fps=25):
-    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc          # [T,J,C]
-    arr = t.detach().cpu().numpy().astype(np.float32)       # [T,J,C]
+    """
+    可视化用：以躯干为中心 + 肩宽定尺度，序列内统一尺度与中心。
+    - 中心: mid_hip + 0.5*(mid_shoulder - mid_hip)
+    - 尺度: 全序列肩宽的中位数
+    """
+    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc           # [T,J,C]
+    arr = t.detach().cpu().numpy().astype(np.float32)        # [T,J,C]
+    T, J, C = arr.shape
 
-    xy = arr[:, :, :2].reshape(-1, 2)
-    ctr_xy = np.median(xy, axis=0, keepdims=True)           # [1,2]
-    arr[:, :, :2] -= ctr_xy
+    # 取躯干关键点（若缺失则回退到全体95分位）
+    torso_names = ["LEFT_SHOULDER","RIGHT_SHOULDER","LEFT_HIP","RIGHT_HIP"]
+    idxs = _find_indices_by_name(header, torso_names)
 
-    r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
-    s = np.percentile(r, 95) + 1e-6
-    scale = 120.0 / s
+    if len(idxs) == 4 and J > max(idxs):
+        LSH, RSH, LHP, RHP = idxs
+        mid_sh = (arr[:, LSH, :2] + arr[:, RSH, :2]) * 0.5    # [T,2]
+        mid_hp = (arr[:, LHP, :2] + arr[:, RHP, :2]) * 0.5
+        center = mid_hp + 0.5 * (mid_sh - mid_hp)             # [T,2]
+        # 序列统一中心：用时间中位
+        ctr_xy = np.median(center, axis=0, keepdims=True)     # [1,2]
+        arr[:, :, :2] -= ctr_xy
+
+        # 肩宽（随时间） -> 中位数
+        shoulder_width = np.linalg.norm(arr[:, LSH, :2] - arr[:, RSH, :2], axis=-1)  # [T]
+        sw = np.median(shoulder_width)
+        if sw <= 1e-6:  # 回退：95分位半径
+            r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
+            sw = np.percentile(r, 95)
+        target = 120.0
+        scale = (target / sw) if sw > 1e-6 else 1.0
+    else:
+        # 回退策略（旧版）：95分位半径
+        ctr_xy = np.median(arr[:, :, :2].reshape(-1, 2), axis=0, keepdims=True)
+        arr[:, :, :2] -= ctr_xy
+        r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
+        scale = (120.0 / (np.percentile(r, 95) + 1e-6))
+
     arr[:, :, :2] *= scale
-    if arr.shape[-1] >= 3:
+    if C >= 3:
         arr[:, :, 2] *= scale
 
-    # shift to canvas center
+    # 移到画布中心
     arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
 
-    arr4 = arr[:, None, :, :]                                # [T,1,J,C]
-    conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
+    arr4 = arr[:, None, :, :]  # [T,1,J,C]
+    conf = np.ones((T, 1, J, 1), dtype=np.float32)
     body = NumPyPoseBody(fps=fps, data=arr4, confidence=conf)
     return Pose(header=header, body=body)
 
-# ---------------------- header helpers（保证与 dataloader 一致） ----------------------
-def load_header_178_from_file(pose_path: str):
-    with open(pose_path, "rb") as f:
-        ref_pose = Pose.read(f)
-    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    return reduce_holistic(ref_pose).header
-
-def dump_header_info(header):
-    comp_names = [c.name for c in header.components]
-    pts_counts = [len(c.points) for c in header.components]
-    limb_counts = [len(c.limbs) for c in header.components]
-    print(f"[HEADER] components={comp_names}")
-    print(f"[HEADER] joints per component={pts_counts}  total_joints= {sum(pts_counts)}")
-    print(f"[HEADER] limbs   per component={limb_counts}")
-    first10 = []
-    for c in header.components:
-        first10.extend(c.points)
-        if len(first10) >= 10: break
-    print("[HEADER] first 10 point names:", first10[:10])
-
-def assert_limb_indices_valid(header, J: int):
-    for ci, c in enumerate(header.components):
-        for (a, b) in c.limbs:
-            assert 0 <= a < J and 0 <= b < J, f"Invalid limb ({a},{b}) in comp#{ci} for J={J}"
-    print("[CHECK] All limb indices < J ✅")
-
-def points_only_pose(t_btjc, header, save_path, fps=25):
-    backups = [list(c.limbs) for c in header.components]
-    for c in header.components:
-        c.limbs.clear()
-    p = tensor_to_pose(t_btjc, header, fps=fps)
-    with open(save_path, "wb") as f:
-        p.write(f)
-    for c, limbs in zip(header.components, backups):
-        c.limbs[:] = limbs
-
-# ---------------------- sampling wrappers ----------------------
 @torch.no_grad()
 def inference_one_frame(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor):
-    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img, future_len=1, chunk=1)
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img,
+                                                 future_len=1, chunk=1)
 
 @torch.no_grad()
 def autoregressive_generate(model: LitMinimal, past_btjc: torch.Tensor, sign_img: torch.Tensor, future_len: int):
-    chunk = max(2, min(5, future_len))
-    return model.sample_autoregressive_diffusion(
-        past_btjc=past_btjc, sign_img=sign_img, future_len=future_len, chunk=chunk
-    )
+    # 稳定些：多帧采样用较大的 chunk
+    return model.sample_autoregressive_diffusion(past_btjc=past_btjc, sign_img=sign_img,
+                                                 future_len=future_len, chunk=5)
 
 # ---------------------- Main ----------------------
 if __name__ == "__main__":
@@ -95,9 +103,10 @@ if __name__ == "__main__":
 
     data_dir = "/data/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
-    out_dir  = "logs/overfit_178"
+    out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
+    # Dataset（小样本过拟合）
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -105,7 +114,7 @@ if __name__ == "__main__":
         num_future_frames=30,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,  # 和 header 路径严格一致
+        reduce_holistic=True,     # 保持你的设定
     )
     small_ds = torch.utils.data.Subset(base_ds, list(range(10)))
     loader = DataLoader(
@@ -121,6 +130,7 @@ if __name__ == "__main__":
     B, T, P, J, C = batch0["data"].shape
     print(f"[INFO] Overfit set shape = {B, T, P, J, C}")
 
+    # --------- Model ---------
     model = LitMinimal(
         num_keypoints=J,
         num_dims=C,
@@ -130,21 +140,12 @@ if __name__ == "__main__":
         beta_start=1e-4,
         beta_end=2e-2,
         pred_target="x0",
-        guidance_scale=0.0,
+        guidance_scale=1.0,        # ← 避免采样塌成一条直线
     )
 
-    try:
-        if hasattr(model, "verbose"): model.verbose = False
-        if hasattr(model, "model") and hasattr(model.model, "verbose"):
-            model.model.verbose = False
-        for attr in ("dbg", "log", "logger"):
-            if hasattr(model, attr) and callable(getattr(model, attr)):
-                setattr(model, attr, lambda *a, **k: None)
-    except Exception:
-        pass
-
+    # 归一化自检 + 单次自校准
     model_cpu = model.eval()
-    probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C]
+    probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C] on CPU
     std_probe = model_cpu.normalize(probe_btjc).float().std().item()
     status = "OK" if 0.5 <= std_probe <= 2.0 else "MISMATCH"
     print(f"[CHECK] GT_norm.std = {std_probe:.2f} → {status}")
@@ -155,6 +156,7 @@ if __name__ == "__main__":
         std_after = model_cpu.normalize(probe_btjc).float().std().item()
         print(f"[Calib] scaled std_pose by {factor:.3f} → recheck std={std_after:.2f}")
 
+    # Trainer
     trainer = pl.Trainer(
         max_epochs=100,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -176,37 +178,57 @@ if __name__ == "__main__":
     batch = next(iter(loader))
     cond  = batch["conditions"]
 
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,30,J,3]
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,J,3]
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,30,178,3]
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,178,3]
     sign_img = cond["sign_image"][:1].to(model.device)
     T_future = fut_raw.size(1)
 
-    # ---------------------- Header：严格与 dataloader 同源 ----------------------
+    # ---------------------- Header ----------------------
     pose_path = base_ds.records[0]["pose"]
     src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
-    header_178 = load_header_178_from_file(src)
-    dump_header_info(header_178)
+    with open(src, "rb") as f:
+        ref_pose = Pose.read(f)
+    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+    header = reduce_holistic(ref_pose).header
 
-    # 验证 J 与 limb 索引
-    J_from_header = sum(len(c.points) for c in header_178.components)
-    assert J_from_header == J, f"Header J={J_from_header} but batch J={J} (mismatch!)"
-    assert_limb_indices_valid(header_178, J)
+    comps = [c.name for c in header.components]
+    limbc = [len(c.limbs) for c in header.components]
+    jointc = [len(c.points) for c in header.components]
+    print("[HEADER] components=", comps)
+    print("[HEADER] joints per component:", jointc, " total_joints=", sum(jointc))
+    print("[HEADER] limbs   per component:", limbc)
 
-    # ---------- GT：只画点（排查顺序/坐标），再画带 limb 的 ----------
-    points_only_pose(fut_raw, header_178, os.path.join(out_dir, "gt_points_only.pose"))
-    print("[SAVE] gt_points_only.pose saved")
+    all_ok = True
+    base = 0
+    for c in header.components:
+        for (a,b) in c.limbs:
+            if not (0 <= a < len(c.points) and 0 <= b < len(c.points)):
+                all_ok = False
+                break
+        base += len(c.points)
+    print(f"[CHECK] All limb indices < J {'✅' if all_ok else '❌'}")
+
+    # ---------------------- 保存 GT（raw & unnorm） ----------------------
+    with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
+        tensor_to_pose(fut_raw, header).write(f)
+    print("[SAVE] gt_raw_178.pose saved")
 
     gt_norm = model.normalize(fut_raw)
     gt_un   = model.unnormalize(gt_norm)
     with open(os.path.join(out_dir, "gt_178.pose"), "wb") as f:
-        tensor_to_pose(gt_un, header_178).write(f)
+        tensor_to_pose(gt_un, header).write(f)
     print("[SAVE] gt_178.pose saved")
 
-    # ---------- 1-frame prediction ----------
+    header_points_only = header.without_limbs()
+    with open(os.path.join(out_dir, "gt_points_only.pose"), "wb") as f:
+        tensor_to_pose(gt_un, header_points_only).write(f)
+    print("[SAVE] gt_points_only.pose saved")
+
+    # ---------------------- 1-frame prediction ----------------------
     pred_un = inference_one_frame(model, past_raw, sign_img)  # [1,1,J,C]
     print(f"[DEBUG] pred_1frame: min={pred_un.min().item():.2f}, max={pred_un.max().item():.2f}")
     with open(os.path.join(out_dir, "pred_1frame_178.pose"), "wb") as f:
-        tensor_to_pose(pred_un, header_178).write(f)
+        tensor_to_pose(pred_un, header).write(f)
     print("[SAVE] pred_1frame_178.pose saved")
 
     print("\n=== SANITY CHECK (1-frame detailed) ===")
@@ -218,36 +240,35 @@ if __name__ == "__main__":
     print(f"[UNNORM pred] min={pred_un.min().item():.4f}, max={pred_un.max().item():.4f}, std={pred_un.std().item():.4f}")
     print("=== SANITY CHECK END ===\n")
 
-    # ---------- Autoregressive generation (multi-frames) ----------
+    # ---------------------- Autoregressive generation (30 frames) ----------------------
     print("=== Inference B (autoregressive, multi-frames) ===")
-    gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,T,J,3]
+    _maybe_print_t1("future_emb", T_future)
+    _maybe_print_t1("encoder_out", T_future)
+    gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,30,178,3]
     if gen_un.size(1) > 1:
         vel = gen_un[:, 1:] - gen_un[:, :-1]
         print(f"[GEN MOTION] mean |Δ| = {vel.abs().mean().item():.6f}, std = {vel.std().item():.6f}")
-    else:
-        print("[GEN MOTION] skipped (T=1)")
-    print(f"[DEBUG] gen_un shape = {tuple(gen_un.shape)} (should be [1,{T_future},{J},{C}])")
+    print(f"[DEBUG] gen_un shape = {gen_un.shape} (should be [1,{T_future},178,3])")
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
-        tensor_to_pose(gen_un, header_178).write(f)
+        tensor_to_pose(gen_un, header).write(f)
     print("[SAVE] gen_178.pose saved")
 
     # ========================= SUMMARY =========================
     print("\n==================== ACTION SUMMARY ====================")
-
     def motion_stats(x):
         if x.size(1) <= 1: return 0.0, 0.0
         d = x[:, 1:] - x[:, :-1]
         return d.abs().mean().item(), d.std().item()
 
     gt_motion   = motion_stats(gt_un)
-    pred_motion = motion_stats(pred_un)   # 这里T=1，mean/std 为 0 属于正常现象
+    pred_motion = motion_stats(pred_un)    # 1帧 → 0
     gen_motion  = motion_stats(gen_un)
     print(f"[Motion GT ] meanΔ={gt_motion[0]:.6f}, stdΔ={gt_motion[1]:.6f}")
     print(f"[Motion PRED] meanΔ={pred_motion[0]:.6f}, stdΔ={pred_motion[1]:.6f}")
     print(f"[Motion GEN ] meanΔ={gen_motion[0]:.6f}, stdΔ={gen_motion[1]:.6f}")
 
     def l2_error(a, b):
-        d = ((a - b) ** 2).sum(dim=-1).sqrt()  # [1,T,J]
+        d = ((a - b) ** 2).sum(dim=-1).sqrt()
         return d.mean().item(), d[:, :5].mean().item(), d[:, -5:].mean().item()
 
     l2_full, l2_early, l2_late = l2_error(pred_un, fut_raw[:, :1])  # pred_un is 1 frame
@@ -258,7 +279,7 @@ if __name__ == "__main__":
     gen_center  = gen_un.mean().item()
     print(f"[Drift] GT_center={gt_center:.4f}, Pred_center={pred_center:.4f}, Gen_center={gen_center:.4f}")
 
-    gt_norm_stats   = (gt_norm.mean().item(), gt_norm.std().item())
+    gt_norm_stats = (gt_norm.mean().item(), gt_norm.std().item())
     pred_norm_stats = (pred_norm.mean().item(), pred_norm.std().item())
     print(f"[Norm GT ] mean={gt_norm_stats[0]:.4f}, std={gt_norm_stats[1]:.4f}")
     print(f"[Norm PRED] mean={pred_norm_stats[0]:.4f}, std={pred_norm_stats[1]:.4f}")
@@ -269,8 +290,8 @@ if __name__ == "__main__":
         s = x.std(dim=(0, 1))
         return m.tolist(), s.tolist()
 
-    gt_m, gt_s   = axis_stats(gt_un)
-    pr_m, pr_s   = axis_stats(pred_un)
+    gt_m, gt_s = axis_stats(gt_un)
+    pr_m, pr_s = axis_stats(pred_un)
     gen_m, gen_s = axis_stats(gen_un)
     print(f"[XYZ GT ] mean={gt_m}, std={gt_s}")
     print(f"[XYZ PRED] mean={pr_m}, std={pr_s}")
