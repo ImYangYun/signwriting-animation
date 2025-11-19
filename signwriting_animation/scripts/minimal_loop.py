@@ -148,10 +148,9 @@ if __name__ == "__main__":
         beta_start=1e-4,
         beta_end=2e-2,
         pred_target="x0",
-        guidance_scale=1.0,        # ← 避免采样塌成一条直线
+        guidance_scale=5.0,
     )
 
-    # 归一化自检 + 单次自校准
     model_cpu = model.eval()
     probe_btjc = sanitize_btjc(batch0["data"][:1])           # [1,T,J,C] on CPU
     std_probe = model_cpu.normalize(probe_btjc).float().std().item()

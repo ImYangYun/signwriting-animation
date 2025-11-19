@@ -201,6 +201,9 @@ def main():
         split="train",
         reduce_holistic=True,  # turn on to speed up testing
     )
+    stats = torch.load("/data/yayun/pose_data/mean_std_178.pt")
+    dataset.mean_std = stats
+
     loader = DataLoader(
         dataset,
         batch_size=4,

@@ -51,10 +51,10 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 class LitMinimal(pl.LightningModule):
     def __init__(self,
-                 num_keypoints=178,
+                 num_keypoints=586,
                  num_dims=3,
                  lr=1e-4,
-                 stats_path="/data/yayun/pose_data/mean_std_178.pt",
+                 stats_path="/data/yayun/pose_data/mean_std_586.pt",
                  diffusion_steps: int = 1000,
                  beta_start: float = 1e-4,
                  beta_end: float = 2e-2,
@@ -85,8 +85,8 @@ class LitMinimal(pl.LightningModule):
         self.diffusion = GaussianDiffusion(
             betas=betas,
             model_mean_type=model_mean_type,
-            model_var_type=ModelVarType.FIXED_SMALL,   # 常用设置；如需可改为 FIXED_LARGE
-            loss_type=LossType.MSE,                    # 关键：你报错缺少的参数
+            model_var_type=ModelVarType.FIXED_SMALL,
+            loss_type=LossType.MSE,
             rescale_timesteps=False
         )
 
@@ -161,9 +161,7 @@ class LitMinimal(pl.LightningModule):
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
-        # 速度 / 加速度正则（在 BTJC 上做）
         pred_btjc   = self.bjct_to_btjc(pred_bjct)
-        # 针对 ε 目标，速度/加速度与 “真实 x0(gt)” 对齐更合理
         x0_target_btjc = gt if self.pred_target == "x0" else gt
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
