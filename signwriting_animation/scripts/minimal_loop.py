@@ -45,16 +45,20 @@ def _find_indices_by_name(header, names):
     return idx
 
 def tensor_to_pose(t_btjc, header=None, fps=25):
-
-    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc     # [T,J,C]
+    # t: [T,J,C]
+    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc
     arr = t.detach().cpu().numpy().astype(np.float32)
 
-    min_xy = np.min(arr[:, :, :2])
-    arr[:, :, :2] -= min_xy - 10  # 留 10px margin
+    center = np.median(arr[:, :, :2].reshape(-1, 2), axis=0)  # [2]
+    arr[:, :, :2] -= center
 
+    r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
+    scale = 120 / (np.percentile(r, 95) + 1e-6)
+    arr[:, :, :2] *= scale
     if arr.shape[-1] > 2:
-        min_z = np.min(arr[:, :, 2])
-        arr[:, :, 2] -= min_z
+        arr[:, :, 2] *= scale
+
+    arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
 
     arr4 = arr[:, None, :, :]  # [T,1,J,C]
     conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
@@ -159,25 +163,12 @@ if __name__ == "__main__":
     T_future = fut_raw.size(1)
 
     # ---------------------- Header ----------------------
-    pose_path = base_ds.records[0]["pose"]
-    src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
-    with open(src, "rb") as f:
-        pose_raw = Pose.read(f)
-
-    print("\n[DEBUG] Original header (before reduce):")
-    print("components =", [c.name for c in pose_raw.header.components])
-    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
-    print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
-    print("limbs per component =", [len(c.limbs) for c in pose_raw.header.components])
-
-    pose_reduced = reduce_holistic(pose_raw)
-    header = pose_reduced.header
-
-    print("\n[DEBUG] Reduced header (after reduce_holistic):")
-    print("components =", [c.name for c in header.components])
-    print("joints per component =", [len(c.points) for c in header.components])
-    print("total_joints =", sum(len(c.points) for c in header.components))
-    print("limbs per component =", [len(c.limbs) for c in header.components])
+    header = base_ds.header
+    print("[DEBUG] Header from dataset:")
+    print("components =", [c.name for c in base_ds.header.components])
+    print("joints per component =", [len(c.points) for c in base_ds.header.components])
+    print("total_joints =", sum(len(c.points) for c in base_ds.header.components))
+    print("limbs per component =", [len(c.limbs) for c in base_ds.header.components])
 
     comps = [c.name for c in header.components]
     limbc = [len(c.limbs) for c in header.components]
