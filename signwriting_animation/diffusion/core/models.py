@@ -77,6 +77,15 @@ class SignWritingToPoseDiffusion(nn.Module):
                                               dropout=dropout,
                                               activation=activation)
 
+        # --- NEW: cross-attention to fuse past motion ---
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=num_latent_dims,
+            num_heads=4,
+            dropout=0.1,
+            batch_first=False  # because we use [T, B, D]
+        )
+        self.cross_ln = nn.LayerNorm(num_latent_dims)
+
         self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
 
         self.future_time_proj = nn.Sequential(
@@ -128,11 +137,12 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         Tf = future_motion_emb.size(0)
         B  = future_motion_emb.size(1)
-        t  = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)  # [Tf,1,1]
-        t_latent = self.future_time_proj(t)                  # [Tf,1,D]
-        t_latent = t_latent.expand(-1, B, -1)                # [Tf,B,D]
-        future_motion_emb = future_motion_emb + 0.2 * t_latent
-        #future_motion_emb = self.future_after_time_ln(future_motion_emb)
+        t = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
+        t_latent = self.future_time_proj(t).expand(-1, B, -1)
+
+        future_motion_emb = future_motion_emb + 0.02 * t_latent
+        future_motion_emb = self.future_after_time_ln(future_motion_emb)
+
 
         with torch.no_grad():
             if future_motion_emb.size(0) > 1:
@@ -148,6 +158,15 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         xseq = future_motion_emb + time_cond + sign_cond
         xseq = self.sequence_pos_encoder(xseq)
+        attn_out, _ = self.cross_attn(
+            query=future_motion_emb,
+            key=past_motion_emb,
+            value=past_motion_emb
+        )
+
+        # residual + layer norm
+        future_motion_emb = self.cross_ln(future_motion_emb + attn_out)
+        xseq = future_motion_emb + time_cond + sign_cond
         output = self.seqEncoder(xseq)[-num_frames:]
         with torch.no_grad():
             if output.size(0) > 1:
