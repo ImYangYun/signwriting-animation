@@ -44,53 +44,21 @@ def _find_indices_by_name(header, names):
     idx = [name2idx[n] for n in names if n in name2idx]
     return idx
 
-def tensor_to_pose(t_btjc, header, fps=25):
-    """
-    可视化用：以躯干为中心 + 肩宽定尺度，序列内统一尺度与中心。
-    - 中心: mid_hip + 0.5*(mid_shoulder - mid_hip)
-    - 尺度: 全序列肩宽的中位数
-    """
-    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc           # [T,J,C]
-    arr = t.detach().cpu().numpy().astype(np.float32)        # [T,J,C]
-    T, J, C = arr.shape
+def tensor_to_pose(t_btjc, header=None, fps=25):
 
-    # 取躯干关键点（若缺失则回退到全体95分位）
-    torso_names = ["LEFT_SHOULDER","RIGHT_SHOULDER","LEFT_HIP","RIGHT_HIP"]
-    idxs = _find_indices_by_name(header, torso_names)
+    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc     # [T,J,C]
+    arr = t.detach().cpu().numpy().astype(np.float32)
 
-    if len(idxs) == 4 and J > max(idxs):
-        LSH, RSH, LHP, RHP = idxs
-        mid_sh = (arr[:, LSH, :2] + arr[:, RSH, :2]) * 0.5    # [T,2]
-        mid_hp = (arr[:, LHP, :2] + arr[:, RHP, :2]) * 0.5
-        center = mid_hp + 0.5 * (mid_sh - mid_hp)             # [T,2]
-        # 序列统一中心：用时间中位
-        ctr_xy = np.median(center, axis=0, keepdims=True)     # [1,2]
-        arr[:, :, :2] -= ctr_xy
+    min_xy = np.min(arr[:, :, :2])
+    arr[:, :, :2] -= min_xy - 10  # 留 10px margin
 
-        # 肩宽（随时间） -> 中位数
-        shoulder_width = np.linalg.norm(arr[:, LSH, :2] - arr[:, RSH, :2], axis=-1)  # [T]
-        sw = np.median(shoulder_width)
-        if sw <= 1e-6:  # 回退：95分位半径
-            r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
-            sw = np.percentile(r, 95)
-        target = 120.0
-        scale = (target / sw) if sw > 1e-6 else 1.0
-    else:
-        # 回退策略（旧版）：95分位半径
-        ctr_xy = np.median(arr[:, :, :2].reshape(-1, 2), axis=0, keepdims=True)
-        arr[:, :, :2] -= ctr_xy
-        r = np.sqrt(arr[:, :, 0]**2 + arr[:, :, 1]**2).reshape(-1)
-        scale = (120.0 / (np.percentile(r, 95) + 1e-6))
-
-    arr[:, :, :2] *= scale
-    if C >= 3:
-        arr[:, :, 2] *= scale
-
-    # 移到画布中心
-    arr[:, :, :2] += np.array([150.0, 150.0], dtype=np.float32)[None, None, :]
+    if arr.shape[-1] > 2:
+        min_z = np.min(arr[:, :, 2])
+        arr[:, :, 2] -= min_z
 
     arr4 = arr[:, None, :, :]  # [T,1,J,C]
-    conf = np.ones((T, 1, J, 1), dtype=np.float32)
+    conf = np.ones((arr4.shape[0], 1, arr4.shape[2], 1), dtype=np.float32)
+
     body = NumPyPoseBody(fps=fps, data=arr4, confidence=conf)
     return Pose(header=header, body=body)
 
@@ -194,9 +162,22 @@ if __name__ == "__main__":
     pose_path = base_ds.records[0]["pose"]
     src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
     with open(src, "rb") as f:
-        ref_pose = Pose.read(f)
-    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    header = reduce_holistic(ref_pose).header
+        pose_raw = Pose.read(f)
+
+    print("\n[DEBUG] Original header (before reduce):")
+    print("components =", [c.name for c in pose_raw.header.components])
+    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
+    print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
+    print("limbs per component =", [len(c.limbs) for c in pose_raw.header.components])
+
+    pose_reduced = reduce_holistic(pose_raw)
+    header = pose_reduced.header
+
+    print("\n[DEBUG] Reduced header (after reduce_holistic):")
+    print("components =", [c.name for c in header.components])
+    print("joints per component =", [len(c.points) for c in header.components])
+    print("total_joints =", sum(len(c.points) for c in header.components))
+    print("limbs per component =", [len(c.limbs) for c in header.components])
 
     comps = [c.name for c in header.components]
     limbc = [len(c.limbs) for c in header.components]
