@@ -156,7 +156,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        xseq = future_motion_emb + time_cond + sign_cond
+        xseq = future_motion_emb + 0.1 * time_cond + 0.1 * sign_cond
         xseq = self.sequence_pos_encoder(xseq)
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
@@ -164,9 +164,10 @@ class SignWritingToPoseDiffusion(nn.Module):
             value=past_motion_emb
         )
 
-        # residual + layer norm
         future_motion_emb = self.cross_ln(future_motion_emb + attn_out)
-        xseq = future_motion_emb + time_cond + sign_cond
+
+        xseq = xseq + future_motion_emb
+
         output = self.seqEncoder(xseq)[-num_frames:]
         with torch.no_grad():
             if output.size(0) > 1:
