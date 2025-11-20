@@ -156,27 +156,26 @@ if __name__ == "__main__":
     batch = next(iter(loader))
     cond  = batch["conditions"]
 
-    # raw model outputs (still 586)
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,T,J586,C]
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,J586,C]
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))       # [1,T,586,3]
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))  # [1,60,586,3]
     sign_img = cond["sign_image"][:1].to(model.device)
     T_future = fut_raw.size(1)
 
-    # ---------------------- Load 586 header ----------------------
     pose_path = base_ds.records[0]["pose"]
     src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
 
     with open(src, "rb") as f:
-        pose_raw = Pose.read(f)                    # full 586
+        pose_raw = Pose.read(f)
+
     pose_raw = pose_raw.remove_components(["POSE_WORLD_LANDMARKS"])
+    header_raw = pose_raw.header
 
     print("\n[HEADER-RAW 586]")
-    print("components =", [c.name for c in pose_raw.header.components])
-    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
-    print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
+    print("components =", [c.name for c in header_raw.components])
+    print("joints per component =", [len(c.points) for c in header_raw.components])
+    print("total_joints =", sum(len(c.points) for c in header_raw.components))
 
-    # ---------------------- Reduce to 178 header ----------------------
-    pose_reduced = reduce_holistic(pose_raw)       # official 178 reducer
+    pose_reduced = reduce_holistic(pose_raw)
     header = pose_reduced.header
 
     print("\n[HEADER-REDUCED 178]")
@@ -184,30 +183,25 @@ if __name__ == "__main__":
     print("joints per component =", [len(c.points) for c in header.components])
     print("total_joints =", sum(len(c.points) for c in header.components))
 
-    # ---------------------- Build index mapping (586 → 178) ----------------------
-    # map joint names → raw indices
-    name_to_idx_raw = {}
-    base_idx = 0
-    for comp in pose_raw.header.components:
-        for i, name in enumerate(comp.points):
-            name_to_idx_raw[name] = base_idx + i
-        base_idx += len(comp.points)
+    name2idx = {}
+    base = 0
+    for comp in header_raw.components:
+        for i, pt in enumerate(comp.points):
+            name2idx[(comp.name, pt)] = base + i
+        base += len(comp.points)
 
-    # build index list in reduced order
-    index_map = []
+    idx_map = []
     for comp in header.components:
-        for name in comp.points:
-            index_map.append(name_to_idx_raw[name])
+        for pt in comp.points:
+            idx_map.append(name2idx[(comp.name, pt)])
 
-    index_map = torch.tensor(index_map, dtype=torch.long, device=model.device)
+    idx_map = torch.as_tensor(idx_map, device=model.device, dtype=torch.long)
+    print(f"[INDEX_MAP] first 30 = {idx_map[:30].tolist()}")
+    J_reduced = idx_map.numel()
+    print(f"[INFO] J_reduced = {J_reduced}")
 
-    print("[INDEX MAP] first 30 =", index_map[:30].tolist())
-    J_reduced = len(index_map)
-    print("[INFO] J_reduced =", J_reduced)
-
-    # ---------------------- Reduce fut_raw / past_raw using real mapping ----------------------
-    fut_reduced  = fut_raw.index_select(2, index_map)
-    past_reduced = past_raw.index_select(2, index_map)
+    fut_reduced  = fut_raw.index_select(dim=2, index=idx_map)   # [1,T,178,3]
+    past_reduced = past_raw.index_select(dim=2, index=idx_map)  # [1,60,178,3]
 
     # ---------------------- Save GT ----------------------
     with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
@@ -218,26 +212,27 @@ if __name__ == "__main__":
         tensor_to_pose(fut_reduced, header).write(f)
     print("[SAVE] gt_178.pose saved")
 
-    # points-only version
+    # points-only 版本
     header_points_only = deepcopy(header)
-    for c in header_points_only.components:
-        c.limbs = []
+    for comp in header_points_only.components:
+        comp.limbs = []
 
     with open(os.path.join(out_dir, "gt_points_only.pose"), "wb") as f:
         tensor_to_pose(fut_reduced, header_points_only).write(f)
     print("[SAVE] gt_points_only.pose saved")
 
-    # ---------------------- 1-frame prediction (still 586) ----------------------
-    pred_un = inference_one_frame(model, past_raw, sign_img)     # [1,1,586,3]
-    pred_reduced = pred_un.index_select(2, index_map)
+    # ---------------------- 1-frame prediction ----------------------
+    pred_un = inference_one_frame(model, past_raw, sign_img)      # [1,1,586,3]
+    pred_reduced = pred_un.index_select(dim=2, index=idx_map)     # [1,1,178,3]
 
     with open(os.path.join(out_dir, "pred_1frame_178.pose"), "wb") as f:
         tensor_to_pose(pred_reduced, header).write(f)
     print("[SAVE] pred_1frame_178.pose saved")
 
-    # ---------------------- Autoregressive generation ----------------------
+    # ---------------------- Autoregressive ----------------------
+    print("=== Inference B (autoregressive) ===")
     gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,T,586,3]
-    gen_reduced = gen_un.index_select(2, index_map)
+    gen_reduced = gen_un.index_select(dim=2, index=idx_map)                           # [1,T,178,3]
 
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
         tensor_to_pose(gen_reduced, header).write(f)
@@ -247,12 +242,12 @@ if __name__ == "__main__":
     print("\n==================== ACTION SUMMARY ====================")
 
     def motion_stats(x):
-        if x.size(1) <= 1: return (0.0, 0.0)
+        if x.size(1) <= 1:
+            return (0.0, 0.0)
         d = x[:, 1:] - x[:, :-1]
         return d.abs().mean().item(), d.std().item()
 
-    print("GT motion:   ", motion_stats(fut_reduced))
-    print("PRED motion: ", motion_stats(pred_reduced))
-    print("GEN motion:  ", motion_stats(gen_reduced))
-
+    print("GT motion:",   motion_stats(fut_reduced))
+    print("PRED motion:", motion_stats(pred_reduced))
+    print("GEN motion:",  motion_stats(gen_reduced))
     print("================== END SUMMARY ====================\n")
