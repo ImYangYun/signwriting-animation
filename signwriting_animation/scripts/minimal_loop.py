@@ -150,14 +150,14 @@ if __name__ == "__main__":
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)
 
-  # ========================= Evaluation =========================
-    print("\n=== Evaluation (586 -> 178 reduce) ===")
+ # ========================= Evaluation =========================
+    print("\n=== Evaluation (586 → 178 reduce) ===")
     model.eval()
     batch = next(iter(loader))
-    cond = batch["conditions"]
+    cond  = batch["conditions"]
 
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))       # [1, T, 586, 3]
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))  # [1, 60, 586, 3]
     sign_img = cond["sign_image"][:1].to(model.device)
     T_future = fut_raw.size(1)
 
@@ -169,55 +169,53 @@ if __name__ == "__main__":
 
     pose_raw = pose_raw.remove_components(["POSE_WORLD_LANDMARKS"])
 
-    print("\n[DEBUG] Full 586 header:")
-    print("components =", [c.name for c in pose_raw.header.components])
-    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
-    print("total =", sum(len(c.points) for c in pose_raw.header.components))
-
     # ---------------------- Reduce to 178 ----------------------
     pose_reduced = reduce_holistic(pose_raw)
-    header_178 = pose_reduced.header
-    idx = pose_reduced.body.index_map.astype(int)
+    header = pose_reduced.header
+    index_map = header.reduction_index
+    J_reduced = len(index_map)
 
-    print("\n[DEBUG] Reduced 178 header:")
-    print("components =", [c.name for c in header_178.components])
-    print("joints per component =", [len(c.points) for c in header_178.components])
-    print("total =", sum(len(c.points) for c in header_178.components))
+    print("\n[HEADER-RAW 586]")
+    print("components =", [c.name for c in pose_raw.header.components])
+    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
+    print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
 
-    print("\n[DEBUG] index_map head:", idx[:40])
-    print("[DEBUG] index_map len =", len(idx))
+    print("\n[HEADER-REDUCED 178]")
+    print("components =", [c.name for c in header.components])
+    print("joints per component =", [len(c.points) for c in header.components])
+    print("total_joints =", sum(len(c.points) for c in header.components))
 
-    print("\n[DEBUG] Reduced header limbs:")
-    for c in header_178.components:
-        print(f"  {c.name}: {len(c.limbs)} limbs")
+    print("\n[INDEX_MAP] first 40 =", index_map[:40])
+    print("[INDEX_MAP] len =", len(index_map))
 
-    # ---------------------- Apply reduce ----------------------
-    fut_178  = fut_raw[:, :, idx, :]
-    past_178 = past_raw[:, :, idx, :]
+    fut_reduced  = fut_raw[:, :, index_map, :]
+    past_reduced = past_raw[:, :, index_map, :]
 
     # ---------------------- Save GT ----------------------
     with open(os.path.join(out_dir, "gt_178.pose"), "wb") as f:
-        tensor_to_pose(fut_178, header_178).write(f)
+        tensor_to_pose(fut_reduced, header).write(f)
 
     # ---------------------- Predictions ----------------------
     pred_full = inference_one_frame(model, past_raw, sign_img)
-    pred_178 = pred_full[:, :, idx, :]
+    pred_reduced = pred_full[:, :, index_map, :]
 
     gen_full = autoregressive_generate(model, past_raw, sign_img, T_future)
-    gen_178 = gen_full[:, :, idx, :]
+    gen_reduced = gen_full[:, :, index_map, :]
 
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
-        tensor_to_pose(gen_178, header_178).write(f)
+        tensor_to_pose(gen_reduced, header).write(f)
 
-    print("\n[DEBUG] Prediction saved")
+    print("\n[DEBUG] Prediction saved to gen_178.pose")
 
     # ---------------------- Summary ----------------------
     def motion_stats(x):
-        if x.size(1) <= 1: return (0.0, 0.0)
-        d = x[:,1:] - x[:,:-1]
+        if x.size(1) <= 1: 
+            return (0.0, 0.0)
+        d = x[:, 1:] - x[:, :-1]
         return d.abs().mean().item(), d.std().item()
 
-    print("\n=== Motion Summary ===")
-    print("GT  motion:", motion_stats(fut_178))
-    print("PRED motion:", motion_stats(pred_178))
-    print("GEN motion :", motion_stats(gen_178))
+    print("\n=== MOTION SUMMARY ===")
+    print("GT   motion:", motion_stats(fut_reduced))
+    print("PRED motion:", motion_stats(pred_reduced))
+    print("GEN  motion:", motion_stats(gen_reduced))
+    print("=== END SUMMARY ===\n")
