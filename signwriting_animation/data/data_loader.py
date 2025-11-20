@@ -63,7 +63,7 @@ class DynamicPosePredictionDataset(Dataset):
         with_metadata: bool = True,
         clip_model_name: str = "openai/clip-vit-base-patch32",
         split: Literal["train", "dev", "test"] = "train",
-        reduce_holistic: bool = True,
+        reduce_holistic: bool = False,
     ):
         super().__init__()
         assert split in ["train", "dev", "test"]
@@ -199,9 +199,9 @@ def main():
         num_future_frames=30,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,  # turn on to speed up testing
+        reduce_holistic=False,
     )
-    stats = torch.load("/data/yayun/pose_data/mean_std_178.pt")
+    stats = torch.load("/data/yayun/pose_data/mean_std_586.pt")
     dataset.mean_std = stats
 
     loader = DataLoader(

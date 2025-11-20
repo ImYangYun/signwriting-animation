@@ -86,7 +86,6 @@ if __name__ == "__main__":
     out_dir = "logs/overfit_178"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Dataset（小样本过拟合）
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -94,7 +93,7 @@ if __name__ == "__main__":
         num_future_frames=30,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,     # 保持你的设定
+        reduce_holistic=False,
     )
     small_ds = torch.utils.data.Subset(base_ds, list(range(10)))
     loader = DataLoader(
@@ -115,7 +114,7 @@ if __name__ == "__main__":
         num_keypoints=J,
         num_dims=C,
         lr=3e-4,
-        stats_path=os.path.join(data_dir, "mean_std_178.pt"),
+        stats_path=os.path.join(data_dir, "mean_std_586.pt"),
         diffusion_steps=200,
         beta_start=1e-4,
         beta_end=2e-2,
@@ -151,154 +150,109 @@ if __name__ == "__main__":
     print("[TRAIN] Start overfit")
     trainer.fit(model, loader, loader)
 
-    # ========================= Evaluation =========================
-    print("\n=== Evaluation ===")
+  # ========================= Evaluation =========================
+    print("\n=== Evaluation (586→178 reduce) ===")
     model.eval()
     batch = next(iter(loader))
     cond  = batch["conditions"]
 
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,30,178,3]
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,178,3]
+    # raw model outputs (still 586)
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))      # [1,T,J586,C]
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device)) # [1,60,J586,C]
     sign_img = cond["sign_image"][:1].to(model.device)
     T_future = fut_raw.size(1)
 
-    # ---------------------- Header ----------------------
-    # ---------------------- Header ----------------------
+    # ---------------------- Load 586 header ----------------------
     pose_path = base_ds.records[0]["pose"]
     src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
 
     with open(src, "rb") as f:
-        pose_raw = Pose.read(f)
+        pose_raw = Pose.read(f)                    # full 586
+    pose_raw = pose_raw.remove_components(["POSE_WORLD_LANDMARKS"])
 
-    print("\n[DEBUG] Original header (before reduce):")
+    print("\n[HEADER-RAW 586]")
     print("components =", [c.name for c in pose_raw.header.components])
     print("joints per component =", [len(c.points) for c in pose_raw.header.components])
     print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
-    print("limbs per component =", [len(c.limbs) for c in pose_raw.header.components])
 
-    pose_reduced = reduce_holistic(pose_raw)
+    # ---------------------- Reduce to 178 header ----------------------
+    pose_reduced = reduce_holistic(pose_raw)       # official 178 reducer
     header = pose_reduced.header
 
-    print("\n[DEBUG] Reduced header (after reduce_holistic):")
+    print("\n[HEADER-REDUCED 178]")
     print("components =", [c.name for c in header.components])
     print("joints per component =", [len(c.points) for c in header.components])
     print("total_joints =", sum(len(c.points) for c in header.components))
-    print("limbs per component =", [len(c.limbs) for c in header.components])
 
-    comps = [c.name for c in header.components]
-    limbc = [len(c.limbs) for c in header.components]
-    jointc = [len(c.points) for c in header.components]
-    print("[HEADER] components=", comps)
-    print("[HEADER] joints per component:", jointc, " total_joints=", sum(jointc))
-    print("[HEADER] limbs   per component:", limbc)
+    # ---------------------- Build index mapping (586 → 178) ----------------------
+    # map joint names → raw indices
+    name_to_idx_raw = {}
+    base_idx = 0
+    for comp in pose_raw.header.components:
+        for i, name in enumerate(comp.points):
+            name_to_idx_raw[name] = base_idx + i
+        base_idx += len(comp.points)
 
-    all_ok = True
-    base = 0
-    for c in header.components:
-        for (a,b) in c.limbs:
-            if not (0 <= a < len(c.points) and 0 <= b < len(c.points)):
-                all_ok = False
-                break
-        base += len(c.points)
-    print(f"[CHECK] All limb indices < J {'✅' if all_ok else '❌'}")
+    # build index list in reduced order
+    index_map = []
+    for comp in header.components:
+        for name in comp.points:
+            index_map.append(name_to_idx_raw[name])
 
-    # ---------------------- 保存 GT（raw & unnorm） ----------------------
+    index_map = torch.tensor(index_map, dtype=torch.long, device=model.device)
+
+    print("[INDEX MAP] first 30 =", index_map[:30].tolist())
+    J_reduced = len(index_map)
+    print("[INFO] J_reduced =", J_reduced)
+
+    # ---------------------- Reduce fut_raw / past_raw using real mapping ----------------------
+    fut_reduced  = fut_raw.index_select(2, index_map)
+    past_reduced = past_raw.index_select(2, index_map)
+
+    # ---------------------- Save GT ----------------------
     with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
-        tensor_to_pose(fut_raw, header).write(f)
+        tensor_to_pose(fut_reduced, header).write(f)
     print("[SAVE] gt_raw_178.pose saved")
 
-    gt_norm = model.normalize(fut_raw)
-    gt_un   = model.unnormalize(gt_norm)
     with open(os.path.join(out_dir, "gt_178.pose"), "wb") as f:
-        tensor_to_pose(gt_un, header).write(f)
+        tensor_to_pose(fut_reduced, header).write(f)
     print("[SAVE] gt_178.pose saved")
 
+    # points-only version
     header_points_only = deepcopy(header)
-    for comp in header_points_only.components:
-        comp.limbs = []
+    for c in header_points_only.components:
+        c.limbs = []
 
     with open(os.path.join(out_dir, "gt_points_only.pose"), "wb") as f:
-        tensor_to_pose(gt_un, header_points_only).write(f)
+        tensor_to_pose(fut_reduced, header_points_only).write(f)
     print("[SAVE] gt_points_only.pose saved")
 
-    # ---------------------- 1-frame prediction ----------------------
-    pred_un = inference_one_frame(model, past_raw, sign_img)  # [1,1,J,C]
-    print(f"[DEBUG] pred_1frame: min={pred_un.min().item():.2f}, max={pred_un.max().item():.2f}")
+    # ---------------------- 1-frame prediction (still 586) ----------------------
+    pred_un = inference_one_frame(model, past_raw, sign_img)     # [1,1,586,3]
+    pred_reduced = pred_un.index_select(2, index_map)
+
     with open(os.path.join(out_dir, "pred_1frame_178.pose"), "wb") as f:
-        tensor_to_pose(pred_un, header).write(f)
+        tensor_to_pose(pred_reduced, header).write(f)
     print("[SAVE] pred_1frame_178.pose saved")
 
-    print("\n=== SANITY CHECK (1-frame detailed) ===")
-    pred_norm = model.normalize(pred_un)
-    gt_norm_1 = model.normalize(fut_raw[:, :1])
-    print(f"[DEBUG] pred_norm shape = {pred_norm.shape} (should be [1,1,J,C])")
-    print(f"[GT_norm] min={gt_norm_1.min().item():.4f}, max={gt_norm_1.max().item():.4f}, std={gt_norm_1.std().item():.4f}")
-    print(f"[PR_norm] min={pred_norm.min().item():.4f}, max={pred_norm.max().item():.4f}, std={pred_norm.std().item():.4f}")
-    print(f"[UNNORM pred] min={pred_un.min().item():.4f}, max={pred_un.max().item():.4f}, std={pred_un.std().item():.4f}")
-    print("=== SANITY CHECK END ===\n")
+    # ---------------------- Autoregressive generation ----------------------
+    gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,T,586,3]
+    gen_reduced = gen_un.index_select(2, index_map)
 
-    # ---------------------- Autoregressive generation (30 frames) ----------------------
-    print("=== Inference B (autoregressive, multi-frames) ===")
-    _maybe_print_t1("future_emb", T_future)
-    _maybe_print_t1("encoder_out", T_future)
-    gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,30,178,3]
-    if gen_un.size(1) > 1:
-        vel = gen_un[:, 1:] - gen_un[:, :-1]
-        print(f"[GEN MOTION] mean |Δ| = {vel.abs().mean().item():.6f}, std = {vel.std().item():.6f}")
-    print(f"[DEBUG] gen_un shape = {gen_un.shape} (should be [1,{T_future},178,3])")
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
-        tensor_to_pose(gen_un, header).write(f)
+        tensor_to_pose(gen_reduced, header).write(f)
     print("[SAVE] gen_178.pose saved")
 
-    # ========================= SUMMARY =========================
+    # ---------------------- Summary ----------------------
     print("\n==================== ACTION SUMMARY ====================")
+
     def motion_stats(x):
-        if x.size(1) <= 1: return 0.0, 0.0
+        if x.size(1) <= 1: return (0.0, 0.0)
         d = x[:, 1:] - x[:, :-1]
         return d.abs().mean().item(), d.std().item()
 
-    gt_motion   = motion_stats(gt_un)
-    pred_motion = motion_stats(pred_un)    # 1帧 → 0
-    gen_motion  = motion_stats(gen_un)
-    print(f"[Motion GT ] meanΔ={gt_motion[0]:.6f}, stdΔ={gt_motion[1]:.6f}")
-    print(f"[Motion PRED] meanΔ={pred_motion[0]:.6f}, stdΔ={pred_motion[1]:.6f}")
-    print(f"[Motion GEN ] meanΔ={gen_motion[0]:.6f}, stdΔ={gen_motion[1]:.6f}")
+    print("GT motion:   ", motion_stats(fut_reduced))
+    print("PRED motion: ", motion_stats(pred_reduced))
+    print("GEN motion:  ", motion_stats(gen_reduced))
 
-    def l2_error(a, b):
-        d = ((a - b) ** 2).sum(dim=-1).sqrt()
-        return d.mean().item(), d[:, :5].mean().item(), d[:, -5:].mean().item()
-
-    l2_full, l2_early, l2_late = l2_error(pred_un, fut_raw[:, :1])  # pred_un is 1 frame
-    print(f"[L2 Error 1-frame] full={l2_full:.6f}, first5={l2_early:.6f}, last5={l2_late:.6f}")
-
-    gt_center  = gt_un.mean().item()
-    pred_center = pred_un.mean().item()
-    gen_center  = gen_un.mean().item()
-    print(f"[Drift] GT_center={gt_center:.4f}, Pred_center={pred_center:.4f}, Gen_center={gen_center:.4f}")
-
-    gt_norm_stats = (gt_norm.mean().item(), gt_norm.std().item())
-    pred_norm_stats = (pred_norm.mean().item(), pred_norm.std().item())
-    print(f"[Norm GT ] mean={gt_norm_stats[0]:.4f}, std={gt_norm_stats[1]:.4f}")
-    print(f"[Norm PRED] mean={pred_norm_stats[0]:.4f}, std={pred_norm_stats[1]:.4f}")
-
-    def axis_stats(x):
-        if x.dim() == 4: x = x[0]
-        m = x.mean(dim=(0, 1))
-        s = x.std(dim=(0, 1))
-        return m.tolist(), s.tolist()
-
-    gt_m, gt_s = axis_stats(gt_un)
-    pr_m, pr_s = axis_stats(pred_un)
-    gen_m, gen_s = axis_stats(gen_un)
-    print(f"[XYZ GT ] mean={gt_m}, std={gt_s}")
-    print(f"[XYZ PRED] mean={pr_m}, std={pr_s}")
-    print(f"[XYZ GEN ] mean={gen_m}, std={gen_s}")
     print("================== END SUMMARY ====================\n")
-
-    print("\n=== Saved files in", out_dir, "===")
-    for p in sorted(glob.glob(os.path.join(out_dir, "*.pose"))):
-        try:
-            print("[POSE]", os.path.basename(p), "size=", os.path.getsize(p), "bytes")
-        except Exception:
-            print("[POSE]", os.path.basename(p))
-    print("====================================\n")
