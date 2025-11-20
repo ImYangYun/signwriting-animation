@@ -163,12 +163,27 @@ if __name__ == "__main__":
     T_future = fut_raw.size(1)
 
     # ---------------------- Header ----------------------
-    header = base_ds.header
-    print("[DEBUG] Header from dataset:")
-    print("components =", [c.name for c in base_ds.header.components])
-    print("joints per component =", [len(c.points) for c in base_ds.header.components])
-    print("total_joints =", sum(len(c.points) for c in base_ds.header.components))
-    print("limbs per component =", [len(c.limbs) for c in base_ds.header.components])
+    # ---------------------- Header ----------------------
+    pose_path = base_ds.records[0]["pose"]
+    src = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
+
+    with open(src, "rb") as f:
+        pose_raw = Pose.read(f)
+
+    print("\n[DEBUG] Original header (before reduce):")
+    print("components =", [c.name for c in pose_raw.header.components])
+    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
+    print("total_joints =", sum(len(c.points) for c in pose_raw.header.components))
+    print("limbs per component =", [len(c.limbs) for c in pose_raw.header.components])
+
+    pose_reduced = reduce_holistic(pose_raw)
+    header = pose_reduced.header
+
+    print("\n[DEBUG] Reduced header (after reduce_holistic):")
+    print("components =", [c.name for c in header.components])
+    print("joints per component =", [len(c.points) for c in header.components])
+    print("total_joints =", sum(len(c.points) for c in header.components))
+    print("limbs per component =", [len(c.limbs) for c in header.components])
 
     comps = [c.name for c in header.components]
     limbc = [len(c.limbs) for c in header.components]
