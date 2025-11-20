@@ -151,13 +151,13 @@ if __name__ == "__main__":
     trainer.fit(model, loader, loader)
 
   # ========================= Evaluation =========================
-    print("\n=== Evaluation (586→178 reduce) ===")
+    print("\n=== Evaluation (586 -> 178 reduce) ===")
     model.eval()
     batch = next(iter(loader))
-    cond  = batch["conditions"]
+    cond = batch["conditions"]
 
-    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))       # [1,T,586,3]
-    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))  # [1,60,586,3]
+    fut_raw  = sanitize_btjc(batch["data"][:1].to(model.device))
+    past_raw = sanitize_btjc(cond["input_pose"][:1].to(model.device))
     sign_img = cond["sign_image"][:1].to(model.device)
     T_future = fut_raw.size(1)
 
@@ -168,86 +168,56 @@ if __name__ == "__main__":
         pose_raw = Pose.read(f)
 
     pose_raw = pose_raw.remove_components(["POSE_WORLD_LANDMARKS"])
-    header_raw = pose_raw.header
 
-    print("\n[HEADER-RAW 586]")
-    print("components =", [c.name for c in header_raw.components])
-    print("joints per component =", [len(c.points) for c in header_raw.components])
-    print("total_joints =", sum(len(c.points) for c in header_raw.components))
+    print("\n[DEBUG] Full 586 header:")
+    print("components =", [c.name for c in pose_raw.header.components])
+    print("joints per component =", [len(c.points) for c in pose_raw.header.components])
+    print("total =", sum(len(c.points) for c in pose_raw.header.components))
 
+    # ---------------------- Reduce to 178 ----------------------
     pose_reduced = reduce_holistic(pose_raw)
-    header = pose_reduced.header
+    header_178 = pose_reduced.header
+    idx = pose_reduced.body.index_map.astype(int)
 
-    print("\n[HEADER-REDUCED 178]")
-    print("components =", [c.name for c in header.components])
-    print("joints per component =", [len(c.points) for c in header.components])
-    print("total_joints =", sum(len(c.points) for c in header.components))
+    print("\n[DEBUG] Reduced 178 header:")
+    print("components =", [c.name for c in header_178.components])
+    print("joints per component =", [len(c.points) for c in header_178.components])
+    print("total =", sum(len(c.points) for c in header_178.components))
 
-    name2idx = {}
-    base = 0
-    for comp in header_raw.components:
-        for i, pt in enumerate(comp.points):
-            name2idx[(comp.name, pt)] = base + i
-        base += len(comp.points)
+    print("\n[DEBUG] index_map head:", idx[:40])
+    print("[DEBUG] index_map len =", len(idx))
 
-    idx_map = []
-    for comp in header.components:
-        for pt in comp.points:
-            idx_map.append(name2idx[(comp.name, pt)])
+    print("\n[DEBUG] Reduced header limbs:")
+    for c in header_178.components:
+        print(f"  {c.name}: {len(c.limbs)} limbs")
 
-    idx_map = torch.as_tensor(idx_map, device=model.device, dtype=torch.long)
-    print(f"[INDEX_MAP] first 30 = {idx_map[:30].tolist()}")
-    J_reduced = idx_map.numel()
-    print(f"[INFO] J_reduced = {J_reduced}")
-
-    fut_reduced  = fut_raw.index_select(dim=2, index=idx_map)   # [1,T,178,3]
-    past_reduced = past_raw.index_select(dim=2, index=idx_map)  # [1,60,178,3]
+    # ---------------------- Apply reduce ----------------------
+    fut_178  = fut_raw[:, :, idx, :]
+    past_178 = past_raw[:, :, idx, :]
 
     # ---------------------- Save GT ----------------------
-    with open(os.path.join(out_dir, "gt_raw_178.pose"), "wb") as f:
-        tensor_to_pose(fut_reduced, header).write(f)
-    print("[SAVE] gt_raw_178.pose saved")
-
     with open(os.path.join(out_dir, "gt_178.pose"), "wb") as f:
-        tensor_to_pose(fut_reduced, header).write(f)
-    print("[SAVE] gt_178.pose saved")
+        tensor_to_pose(fut_178, header_178).write(f)
 
-    # points-only 版本
-    header_points_only = deepcopy(header)
-    for comp in header_points_only.components:
-        comp.limbs = []
+    # ---------------------- Predictions ----------------------
+    pred_full = inference_one_frame(model, past_raw, sign_img)
+    pred_178 = pred_full[:, :, idx, :]
 
-    with open(os.path.join(out_dir, "gt_points_only.pose"), "wb") as f:
-        tensor_to_pose(fut_reduced, header_points_only).write(f)
-    print("[SAVE] gt_points_only.pose saved")
-
-    # ---------------------- 1-frame prediction ----------------------
-    pred_un = inference_one_frame(model, past_raw, sign_img)      # [1,1,586,3]
-    pred_reduced = pred_un.index_select(dim=2, index=idx_map)     # [1,1,178,3]
-
-    with open(os.path.join(out_dir, "pred_1frame_178.pose"), "wb") as f:
-        tensor_to_pose(pred_reduced, header).write(f)
-    print("[SAVE] pred_1frame_178.pose saved")
-
-    # ---------------------- Autoregressive ----------------------
-    print("=== Inference B (autoregressive) ===")
-    gen_un = autoregressive_generate(model, past_raw, sign_img, future_len=T_future)  # [1,T,586,3]
-    gen_reduced = gen_un.index_select(dim=2, index=idx_map)                           # [1,T,178,3]
+    gen_full = autoregressive_generate(model, past_raw, sign_img, T_future)
+    gen_178 = gen_full[:, :, idx, :]
 
     with open(os.path.join(out_dir, "gen_178.pose"), "wb") as f:
-        tensor_to_pose(gen_reduced, header).write(f)
-    print("[SAVE] gen_178.pose saved")
+        tensor_to_pose(gen_178, header_178).write(f)
+
+    print("\n[DEBUG] Prediction saved")
 
     # ---------------------- Summary ----------------------
-    print("\n==================== ACTION SUMMARY ====================")
-
     def motion_stats(x):
-        if x.size(1) <= 1:
-            return (0.0, 0.0)
-        d = x[:, 1:] - x[:, :-1]
+        if x.size(1) <= 1: return (0.0, 0.0)
+        d = x[:,1:] - x[:,:-1]
         return d.abs().mean().item(), d.std().item()
 
-    print("GT motion:",   motion_stats(fut_reduced))
-    print("PRED motion:", motion_stats(pred_reduced))
-    print("GEN motion:",  motion_stats(gen_reduced))
-    print("================== END SUMMARY ====================\n")
+    print("\n=== Motion Summary ===")
+    print("GT  motion:", motion_stats(fut_178))
+    print("PRED motion:", motion_stats(pred_178))
+    print("GEN motion :", motion_stats(gen_178))
