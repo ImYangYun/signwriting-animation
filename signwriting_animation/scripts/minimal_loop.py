@@ -201,7 +201,7 @@ if __name__ == "__main__":
     )
 
     print("\n[TRAIN] Overfitting on subset...")
-    trainer.fit(model, loader, loader)
+    #trainer.fit(model, loader, loader)
 
     # ========================================================================
     # Build 178-joint header (reduce_holistic)
@@ -280,6 +280,37 @@ if __name__ == "__main__":
     fut_178  = fut_vis.index_select(2, idx_t)
     pred_178 = pred_vis.index_select(2, idx_t)
     gen_178  = gen_vis.index_select(2, idx_t)
+
+    # ================================
+    # DEBUG SHAPES —— 必须加！！！ 
+    # ================================
+    def dbg(name, x):
+        try:
+            print(f"[DEBUG] {name} shape =", tuple(x.shape))
+        except:
+            print(f"[DEBUG] {name} shape = <unprintable>")
+
+    dbg("fut_raw", fut_raw)
+    dbg("fut_178", fut_178)
+
+    dbg("pred_full", pred_full)
+    dbg("pred_178", pred_178)
+
+    dbg("gen_full", gen_full)
+    dbg("gen_178", gen_178)
+
+    # 如果你有 recenter_for_view，那也把 recenter 后的打印：
+    try:
+        fut_vis  = recenter_for_view(fut_178)
+        pred_vis = recenter_for_view(pred_178)
+        gen_vis  = recenter_for_view(gen_178)
+
+        dbg("fut_vis", fut_vis)
+        dbg("pred_vis", pred_vis)
+        dbg("gen_vis", gen_vis)
+    except Exception as e:
+        print("[DEBUG] recenter failed:", e)
+
 
     # ========================================================================
     # Save Pose Files
