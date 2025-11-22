@@ -163,6 +163,9 @@ if __name__ == "__main__":
         for p in comp.points:
             index_map.append(name2idx586[(comp.name, p)])
     idx_t = torch.tensor(index_map, dtype=torch.long)
+    print("\n=== INDEX MAP (586→178) ===")
+    for i,(comp,p) in enumerate([(c.name,p) for c in header_178.components for p in c.points]):
+        print(f"{i:3d}: {comp:25s} {p:30s} -> 586 index {index_map[i]}")
 
     print("\n[CHECK] index_map length =", len(index_map))
     print("================ END HEADER DEBUG ================\n")
