@@ -183,6 +183,47 @@ if __name__ == "__main__":
 
     print("past_raw shape =", past_raw.shape)
     print("fut_raw shape  =", fut_raw.shape)
+    print("\n================ HEADER DEBUG ================\n")
+
+    pose_path = base_ds.records[0]["pose"]
+    pose_abspath = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
+    with open(pose_abspath, "rb") as f:
+        pose_full = Pose.read(f)
+
+    print("[HEADER] Full components:")
+    for c in pose_full.header.components:
+        print(f" - {c.name:30s}  points={len(c.points):3d}  limbs={len(c.limbs):3d}")
+
+    pose_now = pose_full.remove_components(["POSE_WORLD_LANDMARKS"])
+    pose_178 = reduce_holistic(pose_now)
+
+    print("\n[HEADER] Reduced 178 components:")
+    for c in pose_178.header.components:
+        print(f" - {c.name:30s}  points={len(c.points):3d}  limbs={len(c.limbs):3d}")
+
+    print("\n[CHECK] component/point matching between 586 → 178")
+    name2idx = {}
+    base = 0
+    for comp in pose_full.header.components:
+        for p in comp.points:
+            name2idx[(comp.name, p)] = base
+            base += 1
+
+    missing = []
+    for comp in pose_178.header.components:
+        for p in comp.points:
+            if (comp.name, p) not in name2idx:
+                missing.append((comp.name, p))
+
+    print(f"\nMissing pairs = {len(missing)}")
+    for m in missing[:20]:
+        print("[MISSING]", m)
+    if missing:
+        print("❌ ERROR: Some joints exist in 178 header but not in 586 header!")
+    else:
+        print("✅ OK: All 178 joints exist in original 586 header.")
+
+    print("\n================ END HEADER DEBUG ================\n")
 
     raise SystemExit("STOP BEFORE TRAINING")
 
