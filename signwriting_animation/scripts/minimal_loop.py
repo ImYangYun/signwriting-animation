@@ -195,19 +195,6 @@ if __name__ == "__main__":
     fut_vis  = recenter_for_view(fut_un_178)
     pred_vis = recenter_for_view(pred_un_178)
 
-    # ===== clamp =====
-    # ===== 3) clamp =====
-    fut_un_178  = torch.clamp(fut_un_178,  -3,  3)
-    pred_un_178 = torch.clamp(pred_un_178, -3,  3)
-
-    # ===== 4) smooth =====
-    fut_un_178  = temporal_smooth(fut_un_178)
-    pred_un_178 = temporal_smooth(pred_un_178)
-
-    # ===== 5) recenter =====
-    fut_vis  = recenter_for_view(fut_un_178)
-    pred_vis = recenter_for_view(pred_un_178)
-
     # ====================================================================
     # SAVE pose files
     # ====================================================================
