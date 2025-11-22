@@ -171,20 +171,29 @@ if __name__ == "__main__":
     )
 
     # ====================================================================
-    # ************ 关键修复版 178 pipeline（正确顺序） ************
-    # ====================================================================
-    print("\n[STEP] Reducing to 178 joints FIRST")
+    print("\n[STEP] Unnormalize 586 → Reduce to 178")
 
-    fut_178_raw  = fut_raw.index_select(2, idx_t)
-    pred_178_raw = pred_full.index_select(2, idx_t)
-
-    print("fut_178_raw  shape =", fut_178_raw.shape)
-    print("pred_178_raw shape =", pred_178_raw.shape)
-
-    # ===== unnormalize =====
     mean_std = torch.load(os.path.join(data_dir, "mean_std_586.pt"))
-    fut_un  = unnormalize_tensor_with_global_stats(fut_178_raw, mean_std)
-    pred_un = unnormalize_tensor_with_global_stats(pred_178_raw, mean_std)
+    fut_un_full  = unnormalize_tensor_with_global_stats(fut_raw,  mean_std)    # [1,T,586,3]
+    pred_un_full = unnormalize_tensor_with_global_stats(pred_full, mean_std)   # [1,T,586,3]
+
+    print("fut_un_full  shape =", fut_un_full.shape)
+    print("pred_un_full shape =", pred_un_full.shape)
+
+    fut_un_178  = fut_un_full.index_select(2, idx_t)      # [1,T,178,3]
+    pred_un_178 = pred_un_full.index_select(2, idx_t)     # [1,T,178,3]
+
+    print("fut_un_178  shape =", fut_un_178.shape)
+    print("pred_un_178 shape =", pred_un_178.shape)
+
+    fut_un_178  = torch.clamp(fut_un_178,  -3,  3)
+    pred_un_178 = torch.clamp(pred_un_178, -3,  3)
+
+    fut_un_178  = temporal_smooth(fut_un_178)
+    pred_un_178 = temporal_smooth(pred_un_178)
+
+    fut_vis  = recenter_for_view(fut_un_178)
+    pred_vis = recenter_for_view(pred_un_178)
 
     # ===== clamp =====
     fut_un  = torch.clamp(fut_un,  -3,  3)
