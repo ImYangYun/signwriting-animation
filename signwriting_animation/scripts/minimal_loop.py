@@ -34,38 +34,32 @@ def unnormalize_tensor_with_global_stats(t, mean_std):
     return t * std + mean
 
 
-def prepare_pair_for_visualization(gt, pred):
-    gt = gt[0]
-    pred = pred[0]
+def prepare_for_visualization(x):
+    if x.dim() == 4:
+        x = x[0]    
 
-    # ===== 1) 合并两个序列 → 使用全局中心 & 全局 scale =====
-    combined = torch.cat([gt, pred], dim=0)   # [2T,J,3]
-    xy = combined[..., :2].reshape(-1,2)
+    x = torch.nan_to_num(x, nan=0.0)
 
-    # 全局中心
-    center = xy.mean(dim=0, keepdim=True)
+    # torso joints (586→178 reduce 后的 8 个 POSE_LANDMARKS)
+    torso = x[:, :8, :2]        # shape [T, 8, 2]
 
-    gt[..., :2] -= center
-    pred[..., :2] -= center
+    # 1) center using torso only
+    center = torso.reshape(-1,2).mean(dim=0, keepdim=True)
+    x[..., :2] -= center
 
-    # ===== 2) 全局 scale =====
-    min_xy = xy.min(dim=0).values
-    max_xy = xy.max(dim=0).values
+    # 2) scale by torso span only
+    min_xy = torso.reshape(-1,2).min(dim=0).values
+    max_xy = torso.reshape(-1,2).max(dim=0).values
     span = (max_xy - min_xy).max().clamp(min=1e-6)
 
     scale = 400.0 / span
+    x[..., :2] *= scale
 
-    gt[..., :2] *= scale
-    pred[..., :2] *= scale
+    # 3) shift to plot canvas center
+    x[..., 0] += 256
+    x[..., 1] += 256
 
-    # ===== 3) 平移到画布中心 =====
-    gt[..., 0] += 256
-    gt[..., 1] += 256
-    pred[..., 0] += 256
-    pred[..., 1] += 256
-
-    return gt, pred
-
+    return x.contiguous()
 
 
 def tensor_to_pose(t_btjc, header):
