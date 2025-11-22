@@ -134,6 +134,19 @@ if __name__ == "__main__":
     for c in header_178.components:
         print(f" - {c.name:30s} points={len(c.points):3d}")
 
+    # ====== FULL 586 HEADER DUMP ======
+    print("\n=== FULL 586 HEADER DUMP ===")
+    for comp in pose_full.header.components:
+        for p in comp.points:
+            print(f"{comp.name}::{p}")
+
+    # ====== REDUCED 178 HEADER DUMP ======
+    print("\n=== REDUCED 178 HEADER DUMP ===")
+    for comp in header_178.components:
+        for p in comp.points:
+            print(f"{comp.name}::{p}")
+    print("================ END HEADER DEBUG ================\n")
+
     # Build index_map
     name2idx586 = {}
     base = 0
