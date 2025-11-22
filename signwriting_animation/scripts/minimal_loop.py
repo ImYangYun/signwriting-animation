@@ -188,6 +188,7 @@ if __name__ == "__main__":
     fut_vis  = prepare_for_visualization(fut_un_178)
     pred_vis = prepare_for_visualization(pred_un_178)
     print("fut_vis shape =", fut_vis.shape)
+    print("pred_vis shape =", pred_vis.shape)
 
     # ====================================================================
     # SAVE pose files
@@ -195,8 +196,8 @@ if __name__ == "__main__":
     out_gt   = os.path.join(out_dir, "gt_178.pose")
     out_pred = os.path.join(out_dir, "pred_178.pose")
 
-    tensor_to_pose(fut_vis, header_178).write(open(out_gt, "wb"))
-    tensor_to_pose(pred_vis, header_178).write(open(out_pred, "wb"))
+    tensor_to_pose(fut_vis.unsqueeze(0), header_178).write(open(out_gt, "wb"))
+    tensor_to_pose(pred_vis.unsqueeze(0), header_178).write(open(out_pred, "wb"))
 
     print(f"\n[SAVE] Saved -> {out_gt}")
     print(f"[SAVE] Saved -> {out_pred}\n")
