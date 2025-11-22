@@ -34,31 +34,38 @@ def unnormalize_tensor_with_global_stats(t, mean_std):
     return t * std + mean
 
 
-def prepare_for_visualization(x):
-    """
-    Input:  x = [1,T,J,3]  or [T,J,3]
-    Output: [T,J,3] with stable human proportions for MediaPipe-like skeleton
-    """
+def prepare_pair_for_visualization(gt, pred):
+    gt = gt[0]
+    pred = pred[0]
 
-    if x.dim() == 4:
-        x = x[0]  # [T,J,3]
+    # ===== 1) 合并两个序列 → 使用全局中心 & 全局 scale =====
+    combined = torch.cat([gt, pred], dim=0)   # [2T,J,3]
+    xy = combined[..., :2].reshape(-1,2)
 
-    x = torch.nan_to_num(x, nan=0.0)
+    # 全局中心
+    center = xy.mean(dim=0, keepdim=True)
 
+    gt[..., :2] -= center
+    pred[..., :2] -= center
 
-    center_xy = x[:, 0, :2].mean(0)  # NOSE 平均位置
-    x[..., :2] -= center_xy
+    # ===== 2) 全局 scale =====
+    min_xy = xy.min(dim=0).values
+    max_xy = xy.max(dim=0).values
+    span = (max_xy - min_xy).max().clamp(min=1e-6)
 
-    left_ref = x[:, 2, :2]
-    right_ref = x[:, 5, :2]
-    shoulder_width = torch.norm((left_ref - right_ref).mean(0)).clamp(min=1e-6)
+    scale = 400.0 / span
 
-    scale = 180.0 / shoulder_width
-    x[..., :2] *= scale
-    x[..., 0] += 256
-    x[..., 1] += 256
+    gt[..., :2] *= scale
+    pred[..., :2] *= scale
 
-    return x.contiguous()   # [T,J,3]
+    # ===== 3) 平移到画布中心 =====
+    gt[..., 0] += 256
+    gt[..., 1] += 256
+    pred[..., 0] += 256
+    pred[..., 1] += 256
+
+    return gt, pred
+
 
 
 def tensor_to_pose(t_btjc, header):
@@ -194,8 +201,7 @@ if __name__ == "__main__":
     print("fut_un_178  shape =", fut_un_178.shape)
     print("pred_un_178 shape =", pred_un_178.shape)
 
-    fut_vis  = prepare_for_visualization(fut_un_178)
-    pred_vis = prepare_for_visualization(pred_un_178)
+    fut_vis, pred_vis = prepare_pair_for_visualization(fut_un_178, pred_un_178)
     print("fut_vis shape =", fut_vis.shape)
     print("pred_vis shape =", pred_vis.shape)
 
