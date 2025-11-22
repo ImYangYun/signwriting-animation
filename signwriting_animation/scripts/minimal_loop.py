@@ -35,27 +35,48 @@ def unnormalize_tensor_with_global_stats(t, mean_std):
 
 
 def prepare_for_visualization(x):
+    """
+    输入: [1,T,J,3] 或 [T,J,3]
+    输出: [T,J,3] —— 修复 GT 压缩的问题
+    逻辑：
+        1) 先分出 4 个组件 (body, face, left hand, right hand)
+        2) 仅用 body joints 计算全局 scale（因为身体跨度最大）
+        3) face, hands 跟随相同 scale，这样不会被压缩成一个点
+        4) 最后整体平移到画布中心
+    """
+
+    # --- make dense ---
     if x.dim() == 4:
-        x = x[0]    
+        x = x[0]  # [T,J,3]
 
     x = torch.nan_to_num(x, nan=0.0)
 
-    # torso joints (586→178 reduce 后的 8 个 POSE_LANDMARKS)
-    torso = x[:, :8, :2]        # shape [T, 8, 2]
+    T, J, C = x.shape
 
-    # 1) center using torso only
-    center = torso.reshape(-1,2).mean(dim=0, keepdim=True)
-    x[..., :2] -= center
+    # ====================================================
+    # 关键：拆分组件（你的 header 固定顺序 8 + 128 + 21 + 21）
+    # ====================================================
+    body   = x[:, 0:8, :]       # POSE_LANDMARKS
+    face   = x[:, 8:8+128, :]   # FACE_LANDMARKS
+    lh     = x[:, 8+128:8+128+21, :]   # LEFT_HAND_LANDMARKS
+    rh     = x[:, 8+128+21:, :]        # RIGHT_HAND_LANDMARKS
 
-    # 2) scale by torso span only
-    min_xy = torso.reshape(-1,2).min(dim=0).values
-    max_xy = torso.reshape(-1,2).max(dim=0).values
+    # ====================================================
+    # 1) 用 body joints 计算 scale（身体跨度最大）
+    # ====================================================
+    body_xy = body[..., :2].reshape(-1, 2)
+    min_xy = body_xy.min(dim=0).values
+    max_xy = body_xy.max(dim=0).values
     span = (max_xy - min_xy).max().clamp(min=1e-6)
 
     scale = 400.0 / span
     x[..., :2] *= scale
 
-    # 3) shift to plot canvas center
+
+    center = (body[..., :2].reshape(-1, 2).mean(dim=0))
+    x[..., 0] -= center[0]
+    x[..., 1] -= center[1]
+
     x[..., 0] += 256
     x[..., 1] += 256
 
