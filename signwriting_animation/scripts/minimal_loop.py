@@ -158,6 +158,21 @@ if __name__ == "__main__":
         for p in comp.points:
             print(f"{comp.name}::{p}")
 
+    print("\n=== EXTRA DEBUG: 586 HEADER DUMP (first 200 joints) ===")
+
+    joint_i = 0
+    for comp in pose_full.header.components:
+        print(f"\n--- Component: {comp.name} (num={len(comp.points)}) ---")
+        for p in comp.points:
+            print(f"{joint_i:3d}: {comp.name:25s} {p}")
+            joint_i += 1
+            if joint_i >= 200:
+                break
+        if joint_i >= 200:
+            break
+
+    print("=== END EXTRA DEBUG ===\n")
+
     # ====== REDUCED 178 HEADER DUMP ======
     print("\n=== REDUCED 178 HEADER DUMP ===")
     for comp in header_178.components:
