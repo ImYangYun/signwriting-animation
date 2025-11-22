@@ -37,32 +37,28 @@ def unnormalize_tensor_with_global_stats(t, mean_std):
 def prepare_for_visualization(x):
     """
     Input:  x = [1,T,J,3]  or [T,J,3]
-    Output: [T,J,3]  nicely centered & scaled for plotting
+    Output: [T,J,3] with stable human proportions for MediaPipe-like skeleton
     """
 
-    # --- make dense ---
     if x.dim() == 4:
         x = x[0]  # [T,J,3]
 
     x = torch.nan_to_num(x, nan=0.0)
 
-    # 1) subtract global center (XY only)
-    center = x[..., :2].reshape(-1,2).mean(dim=0,keepdim=True)
-    x[..., :2] -= center
 
-    # 2) scale so max span = 400 px
-    xy = x[...,:2].reshape(-1,2)
-    min_xy, max_xy = xy.min(dim=0).values, xy.max(dim=0).values
-    span = (max_xy - min_xy).max().clamp(min=1e-6)
+    center_xy = x[:, 0, :2].mean(0)  # NOSE 平均位置
+    x[..., :2] -= center_xy
 
-    scale = 400.0 / span
-    x[...,:2] *= scale
+    left_ref = x[:, 2, :2]
+    right_ref = x[:, 5, :2]
+    shoulder_width = torch.norm((left_ref - right_ref).mean(0)).clamp(min=1e-6)
 
-    # 3) shift to canvas center
-    x[...,0] += 256
-    x[...,1] += 256
+    scale = 180.0 / shoulder_width
+    x[..., :2] *= scale
+    x[..., 0] += 256
+    x[..., 1] += 256
 
-    return x.contiguous()   # shape = [T,J,3]
+    return x.contiguous()   # [T,J,3]
 
 
 def tensor_to_pose(t_btjc, header):
