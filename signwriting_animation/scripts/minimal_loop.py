@@ -34,36 +34,35 @@ def unnormalize_tensor_with_global_stats(t, mean_std):
     return t * std + mean
 
 
-def temporal_smooth(x, k=5):
-    import torch.nn.functional as F
-    if x.dim() == 4:
-        x = x[0]
-    T, J, C = x.shape
-    x2 = x.permute(2, 1, 0).reshape(1, C*J, T)
-    x2 = F.avg_pool1d(x2, kernel_size=k, stride=1, padding=k//2)
-    return x2.reshape(C, J, T).permute(2, 1, 0).contiguous()
+def prepare_for_visualization(x):
+    """
+    Input:  x = [1,T,J,3]  or [T,J,3]
+    Output: [T,J,3]  nicely centered & scaled for plotting
+    """
 
-
-def recenter_for_view(x):
+    # --- make dense ---
     if x.dim() == 4:
-        x = x[0]
+        x = x[0]  # [T,J,3]
+
     x = torch.nan_to_num(x, nan=0.0)
-    T, J, C = x.shape
 
-    torso = x[:, :33, :2]
-    center = torso.reshape(-1, 2).median(dim=0).values
+    # 1) subtract global center (XY only)
+    center = x[..., :2].reshape(-1,2).mean(dim=0,keepdim=True)
     x[..., :2] -= center
 
-    flat = x[..., :2].reshape(-1, 2)
-    q02 = torch.quantile(flat, 0.02, dim=0)
-    q98 = torch.quantile(flat, 0.98, dim=0)
-    span = (q98 - q02).clamp(min=1.0)
+    # 2) scale so max span = 400 px
+    xy = x[...,:2].reshape(-1,2)
+    min_xy, max_xy = xy.min(dim=0).values, xy.max(dim=0).values
+    span = (max_xy - min_xy).max().clamp(min=1e-6)
 
-    ox = 512 - span[0] / 2
-    oy = 384 - span[1] / 2
-    x[..., 0] += ox
-    x[..., 1] += oy
-    return x
+    scale = 400.0 / span
+    x[...,:2] *= scale
+
+    # 3) shift to canvas center
+    x[...,0] += 256
+    x[...,1] += 256
+
+    return x.contiguous()   # shape = [T,J,3]
 
 
 def tensor_to_pose(t_btjc, header):
@@ -186,14 +185,9 @@ if __name__ == "__main__":
     print("fut_un_178  shape =", fut_un_178.shape)
     print("pred_un_178 shape =", pred_un_178.shape)
 
-    fut_un_178  = torch.clamp(fut_un_178,  -3,  3)
-    pred_un_178 = torch.clamp(pred_un_178, -3,  3)
-
-    fut_un_178  = temporal_smooth(fut_un_178)
-    pred_un_178 = temporal_smooth(pred_un_178)
-
-    fut_vis  = recenter_for_view(fut_un_178)
-    pred_vis = recenter_for_view(pred_un_178)
+    fut_vis  = prepare_for_visualization(fut_un_178)
+    pred_vis = prepare_for_visualization(pred_un_178)
+    print("fut_vis shape =", fut_vis.shape)
 
     # ====================================================================
     # SAVE pose files
