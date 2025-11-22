@@ -171,6 +171,21 @@ if __name__ == "__main__":
         collate_fn=zero_pad_collator,
     )
 
+    print("\n================ ENTERING DEBUG MODE ================\n")
+
+    batch = next(iter(loader))
+    print("batch keys:", batch.keys())
+
+    cond = batch["conditions"]
+
+    past_raw = sanitize_btjc(cond["input_pose"][:1])
+    fut_raw  = sanitize_btjc(batch["data"][:1])
+
+    print("past_raw shape =", past_raw.shape)
+    print("fut_raw shape  =", fut_raw.shape)
+
+    raise SystemExit("STOP BEFORE TRAINING")
+
     batch0 = next(iter(loader))
     B, T, P, J, C = batch0["data"].shape
     print(f"[INFO] 586-joint shape → B={B}, T={T}, J={J}, C={C}")
