@@ -239,7 +239,7 @@ if __name__ == "__main__":
         log_every_n_steps=1,
     )
 
-    trainer.fit(model, loader, loader)
+    #trainer.fit(model, loader, loader)
     print("======== TRAIN DONE ========")
 
 
@@ -259,7 +259,7 @@ if __name__ == "__main__":
         future_len=fut_raw.size(1),
         chunk=1
     )
-
+    print("RAW pred before unnormalize:", pred_586.min().item(), pred_586.max().item())
 
 
     # ---------------------------------------------------------------
