@@ -123,7 +123,7 @@ if __name__ == "__main__":
     # -------------------------------
     # DataLoader
     # -------------------------------
-    def make_loader(split):
+    def make_loader(split, subset_size=16):     # 默认做一个16样本tiny dataset
         ds = DynamicPosePredictionDataset(
             data_dir=data_dir,
             csv_path=csv_path,
@@ -133,18 +133,24 @@ if __name__ == "__main__":
             split=split,
             reduce_holistic=True,
         )
+
+        # ---- NEW: tiny subset ----
+        if subset_size is not None:
+            idx = list(range(min(subset_size, len(ds))))
+            ds = torch.utils.data.Subset(ds, idx)
+
         return DataLoader(
             ds,
             batch_size=BATCH_SIZE,
             shuffle=(split=="train"),
-            num_workers=0,         # 💙 必须 0，否则 masked tensor pin_memory 崩溃
+            num_workers=0,
             collate_fn=zero_pad_collator,
             pin_memory=False,
             persistent_workers=False,
         )
 
-    train_loader = make_loader("train")
-    val_loader   = make_loader("dev")
+    train_loader = make_loader("train", subset_size=16)
+    val_loader   = make_loader("dev",   subset_size=16)
 
     print("[INFO] Train samples:", len(train_loader.dataset))
     print("[INFO] Val samples:", len(val_loader.dataset))
