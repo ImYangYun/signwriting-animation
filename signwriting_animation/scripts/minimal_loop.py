@@ -117,7 +117,7 @@ if __name__ == "__main__":
     out_dir = "logs/minimal_178_final"
     os.makedirs(out_dir, exist_ok=True)
 
-    BATCH_SIZE = 8
+    BATCH_SIZE = 4
     MAX_EPOCHS = 50
 
     # -------------------------------
@@ -164,7 +164,7 @@ if __name__ == "__main__":
         num_dims=3,
         lr=1e-4,
         stats_path=mean_std_178,
-        diffusion_steps=1000,
+        diffusion_steps=200,
         pred_target="x0",
         guidance_scale=0.0,
     )
