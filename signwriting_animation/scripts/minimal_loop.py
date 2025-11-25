@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Stable Minimal Loop for 178-joint CAMDM
----------------------------------------
-Features:
-- tiny subset (16 samples)
-- diffusion_steps=200 → fast
-- training + validation (Lightning)
-- autoregressive sampling
-- stable unnormalize
-- stable visualization (center + scale)
-- saves GT & Pred pose files
+Final stable 178-joint minimal loop:
+- 训练 (CAMDM diffusion)
+- 验证
+- 未来序列采样 (autoregressive 预测)
+- 反归一化 + 平滑
+- 可视化重心一致化
+- 保存 GT / Pred 的 .pose 文件
 """
 
 import os
@@ -29,31 +26,28 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
 
 
-# ============================================================
-# Helpers
-# ============================================================
+# ---------------------------------------------------------
+# Helper
+# ---------------------------------------------------------
 
-def to_plain(x):
+def _plain(x):
     if hasattr(x, "tensor"): x = x.tensor
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     return x.detach().cpu().float().contiguous()
 
-
-def smooth(x, k=5):
-    """Temporal smoothing for predicted pose"""
+def temporal_smooth(x, k=5):
     import torch.nn.functional as F
-    x = x[0]
+    if x.dim() == 4:
+        x = x[0]
     T,J,C = x.shape
-    x = x.permute(2,1,0).reshape(1,C*J,T)
+    x = x.permute(2,1,0).reshape(1, C*J, T)
     x = F.avg_pool1d(x, k, stride=1, padding=k//2)
-    x = x.reshape(C,J,T).permute(2,1,0)
+    x = x.reshape(C, J, T).permute(2,1,0).contiguous()
     return x.unsqueeze(0)
 
-
 def recenter_pair(gt, pr):
-    """Use GT torso median as reference → scale → recenter"""
-    gt = gt[0]
-    pr = pr[0]
+    if gt.dim()==4: gt = gt[0]
+    if pr.dim()==4: pr = pr[0]
 
     gt = torch.nan_to_num(gt)
     pr = torch.nan_to_num(pr)
@@ -71,48 +65,44 @@ def recenter_pair(gt, pr):
     q98 = torch.quantile(pts, 0.98, dim=0)
     span = (q98 - q02).clamp(min=50.0)
 
-    scale = min(450.0/span.max(), 5.0)
+    scale = min(450.0 / span.max(), 5.0)
     gt[..., :2] *= scale
     pr[..., :2] *= scale
 
-    gt[..., 0] += 256
-    gt[..., 1] += 256
-    pr[..., 0] += 256
-    pr[..., 1] += 256
+    gt[...,0] += 256; gt[...,1] += 256
+    pr[...,0] += 256; pr[...,1] += 256
 
     return gt.unsqueeze(0), pr.unsqueeze(0)
 
-
-def tensor_to_pose(x, header):
-    """[1,T,J,C] → Pose()"""
-    x = x[0]
-    arr = np.ascontiguousarray(x[:,None,:,:], np.float32)
-    conf = np.ones((arr.shape[0],1,arr.shape[2],1), np.float32)
+def tensor_to_pose(x_btjc, header):
+    if x_btjc.dim()==4:
+        x_btjc = x_btjc[0]
+    arr = np.ascontiguousarray(x_btjc[:,None,:,:], dtype=np.float32)
+    conf = np.ones((arr.shape[0],1,arr.shape[2],1), dtype=np.float32)
     return Pose(header=header, body=NumPyPoseBody(fps=25, data=arr, confidence=conf))
 
 
-# ============================================================
+# ---------------------------------------------------------
 # MAIN
-# ============================================================
+# ---------------------------------------------------------
 if __name__ == "__main__":
     pl.seed_everything(42)
+    torch.use_deterministic_algorithms(False)
 
     data_dir = "/data/yayun/pose_data"
     csv_path = "/data/yayun/signwriting-animation/data_fixed.csv"
-    stats_178 = f"{data_dir}/mean_std_178.pt"
+    mean_std_178 = os.path.join(data_dir, "mean_std_178.pt")
 
     out_dir = "logs/minimal_178_final"
     os.makedirs(out_dir, exist_ok=True)
 
     BATCH_SIZE = 4
-    SUBSET = 16   # fast debug
-    EPOCHS = 20   # enough for movement test
+    MAX_EPOCHS = 20   # tiny dataset for speed
 
-
-    # ========================================================
-    # Dataset (178 joints)
-    # ========================================================
-    def make_loader(split):
+    # -------------------------------
+    # Dataset: tiny subset
+    # -------------------------------
+    def make_loader(split, subset=16):
         ds = DynamicPosePredictionDataset(
             data_dir=data_dir,
             csv_path=csv_path,
@@ -123,16 +113,17 @@ if __name__ == "__main__":
             reduce_holistic=True,
         )
 
-        # tiny dataset
-        ds = torch.utils.data.Subset(ds, list(range(min(SUBSET, len(ds)))))
+        if subset is not None:
+            idx = list(range(min(len(ds), subset)))
+            ds = torch.utils.data.Subset(ds, idx)
 
         return DataLoader(
             ds,
             batch_size=BATCH_SIZE,
             shuffle=(split=="train"),
             num_workers=0,
-            collate_fn=zero_pad_collator,
             pin_memory=False,
+            collate_fn=zero_pad_collator,
         )
 
     train_loader = make_loader("train")
@@ -142,103 +133,88 @@ if __name__ == "__main__":
     print("[INFO] Val samples:", len(val_loader.dataset))
 
 
-    # ========================================================
-    # Model (CAMDM)
-    # ========================================================
+    # -------------------------------
+    # Model
+    # -------------------------------
     model = LitMinimal(
         num_keypoints=178,
         num_dims=3,
         lr=1e-4,
-        stats_path=stats_178,
-        diffusion_steps=200,      # <<< SPEED-UP
+        stats_path=mean_std_178,
+        diffusion_steps=200,      # fast
         pred_target="x0",
         guidance_scale=0.0,
     )
 
-
-    # ========================================================
-    # Trainer
-    # ========================================================
     trainer = pl.Trainer(
         default_root_dir=out_dir,
         accelerator="gpu",
         devices=1,
-        max_epochs=EPOCHS,
-        log_every_n_steps=10,
-        num_sanity_val_steps=0,   # IMPORTANT: avoids infinite sanity loop
+        max_epochs=MAX_EPOCHS,
+        log_every_n_steps=5,
+        accumulate_grad_batches=1,
+        enable_checkpointing=True,
     )
 
-
-    # ========================================================
-    # TRAIN
-    # ========================================================
-    print("===== TRAINING =====")
+    print("\n===== TRAINING =====")
     trainer.fit(model, train_loader, val_loader)
-    print("===== TRAIN DONE =====\n")
+    print("===== TRAIN DONE =====")
 
 
-    # ========================================================
-    # SAMPLE FUTURE
-    # ========================================================
+    # -------------------------------
+    # Sampling
+    # -------------------------------
+    print("\n===== SAMPLING =====")
+
     batch = next(iter(val_loader))
     cond = batch["conditions"]
 
-    past = sanitize_btjc(cond["input_pose"][:1]).to(model.device)
-    fut  = sanitize_btjc(batch["data"][:1]).to(model.device)
-    img  = cond["sign_image"][:1].to(model.device)
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(model.device)
+    fut_raw  = sanitize_btjc(batch["data"][:1]).to(model.device)
+    sign_img = cond["sign_image"][:1].to(model.device)
 
-    T = fut.size(1)
+    # length
+    if "target_mask" in cond:
+        mask = cond["target_mask"][:1]
+        if mask.dim()==4:
+            mask = (mask.sum((2,3))>0).float()
+        true_len = int(mask.sum().item())
+    else:
+        true_len = fut_raw.size(1)
 
     pred_norm = model.sample_autoregressive_diffusion(
-        past_btjc=past,
-        sign_img=img,
-        future_len=T,
+        past_btjc=past_raw,
+        sign_img=sign_img,
+        future_len=true_len,
         chunk=1
     )
 
+    # unnormalize
+    fut_un  = _plain(model.unnormalize(fut_raw))
+    pred_un = _plain(model.unnormalize(pred_norm))
 
-    # ========================================================
-    # Unnormalize
-    # ========================================================
-    fut_un  = to_plain(model.unnormalize(fut))
-    pred_un = to_plain(model.unnormalize(pred_norm))
-
-    pred_un = torch.clamp(pred_un, -2000, 2000)
-
-    fut_s  = fut_un.unsqueeze(0)
-    pred_s = smooth(pred_un)
+    # smooth & recenter
+    pred_s  = temporal_smooth(pred_un)
+    fut_s   = fut_un.unsqueeze(0)
 
     fut_vis, pred_vis = recenter_pair(fut_s, pred_s)
 
+    pose_path = batch["pose_path"][0]   # ✔ DynamicPosePredictionDataset 提供
+    with open(os.path.join(data_dir, pose_path), "rb") as f:
+        pose0 = Pose.read(f)
 
-    # ========================================================
-    # Header
-    # ========================================================
-    sample_path = batch["records"][0]["pose"]
-    with open(os.path.join(data_dir, sample_path), "rb") as f:
-        raw_pose = Pose.read(f)
-    header = reduce_holistic(raw_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
+    header = reduce_holistic(pose0.remove_components(["POSE_WORLD_LANDMARKS"])).header
 
 
-    # ========================================================
-    # SAVE
-    # ========================================================
-    out_gt   = f"{out_dir}/gt_178.pose"
-    out_pred = f"{out_dir}/pred_178.pose"
+    # -----------------------------------
+    # Save pose files
+    # -----------------------------------
+    out_gt   = os.path.join(out_dir, "gt_178.pose")
+    out_pred = os.path.join(out_dir, "pred_178.pose")
 
     tensor_to_pose(fut_vis, header).write(open(out_gt, "wb"))
     tensor_to_pose(pred_vis, header).write(open(out_pred, "wb"))
 
-    print("[SAVE]  GT  →", out_gt)
-    print("[SAVE] PRED →", out_pred)
-
-
-    # ========================================================
-    # Debug info
-    # ========================================================
-    gt_m = float((fut_un[:,1:]-fut_un[:,:-1]).abs().mean())
-    pr_m = float((pred_un[:,1:]-pred_un[:,:-1]).abs().mean())
-
-    print(f"[DEBUG] GT motion:   {gt_m:.4f}")
-    print(f"[DEBUG] Pred motion: {pr_m:.4f}")
-    print("\n===== DONE =====")
+    print("[SAVE] GT:", out_gt)
+    print("[SAVE] Pred:", out_pred)
+    print("===== DONE =====")
