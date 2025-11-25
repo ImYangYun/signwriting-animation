@@ -199,7 +199,7 @@ if __name__ == "__main__":
 
     fut_vis, pred_vis = recenter_pair(fut_s, pred_s)
 
-    pose_path = batch["pose_path"][0]   # ✔ DynamicPosePredictionDataset 提供
+    pose_path = batch["pose_path"][0]
     with open(os.path.join(data_dir, pose_path), "rb") as f:
         pose0 = Pose.read(f)
 
