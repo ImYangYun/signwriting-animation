@@ -230,73 +230,88 @@ class LitMinimal(pl.LightningModule):
         sign_img,
         future_len: int = 30,
         chunk: int = 1,
-        ddim_steps: int = 20, 
+        guidance_scale: float = None,
     ):
         """
-        Much faster sampling using DDIM:
-        - No full diffusion chain
-        - Runs 10–20x faster than p_sample_loop
+        Fast autoregressive version:
+        - Only uses CAMDM interface()
+        - No BJCT kwargs bugs
+        - BTJC <-> BJCT strictly controlled
+        - Runs 10~20x faster than standard diffusion loop
         """
         self.eval()
         device = self.device
 
-        # Normalize past
-        past_norm = self.normalize(past_btjc.to(device))
-        sign = sign_img.to(device)
+        if guidance_scale is None:
+            guidance_scale = self.guidance_scale
+
+        # ---------------------------------------
+        # Normalize inputs
+        # ---------------------------------------
+        past_norm = self.normalize(past_btjc.to(device))      # [B,Tp,J,C]
+        sign      = sign_img.to(device)
+
         B, Tp, J, C = past_norm.shape
 
+        # ---------------------------------------
+        # Wrap CAMDM model to the expected interface
+        # ---------------------------------------
         class _Wrapper(nn.Module):
-            def __init__(self, model):
+            def __init__(self, mdl):
                 super().__init__()
-                self.model = model
-            
+                self.m = mdl
+
             def forward(self, x, t, **kwargs):
-                y = kwargs.get("y", None)
-                return self.model.interface(x, t, y)
+                cond = kwargs.get("y", None)
+                assert cond is not None
+                # x: [B, J, C, T]
+                # t: timestep
+                # cond: {input_pose(BJCT), sign_image}
+                return self.m.interface(x, t, cond)
 
         wrapped = _Wrapper(self.model).to(device)
 
+        # ---------------------------------------
+        # Autoregressive generation
+        # ---------------------------------------
         frames = []
         remain = int(future_len)
-        cur_hist = past_norm.clone()
-
-        # ⭐ only 20 DDIM steps instead of 200 DDPM steps
-        ddim_eta = 0.0
-        timesteps = torch.linspace(
-            self.diffusion.num_timesteps - 1, 0, ddim_steps, device=device
-        ).long()
+        cur_hist = past_norm.clone()      # [B,Tp,J,C]
 
         while remain > 0:
             n = min(chunk, remain)
-            shape_bjct = (B, J, C, n)
+            future_shape_bjct = (B, J, C, n)   # BJCT
 
             cond = {
                 "sign_image": sign,
-                "input_pose": self.btjc_to_bjct(cur_hist)
+                "input_pose": self.btjc_to_bjct(cur_hist),   # BTJC → BJCT
             }
 
-            # ⭐ DDIM sampling instead of DDPM
-            x_bjct = self.diffusion.ddim_sample_loop(
+            # --- fast one-step prediction (CAMDM built-in) ---
+            x_bjct = self.diffusion.p_sample_loop(
                 model=wrapped,
-                shape=shape_bjct,
-                timesteps=timesteps,
+                shape=future_shape_bjct,
                 model_kwargs={"y": cond},
-                eta=ddim_eta
+                clip_denoised=False,
+                progress=False,
             )
 
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)
+            # BJCT → BTJC
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)          # [B,n,J,C]
+
             frames.append(x_btjc_norm)
 
+            # update history window
             cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
             if cur_hist.size(1) > Tp:
-                cur_hist = cur_hist[:, -Tp:]
+                cur_hist = cur_hist[:, -Tp:, :]
 
             remain -= n
 
-        pred_norm = torch.cat(frames, dim=1)
+        # stack frames
+        pred_norm = torch.cat(frames, dim=1)   # [B,Tf,J,C]
+
         return self.unnormalize(pred_norm)
-
-
 
 
     def configure_optimizers(self):
