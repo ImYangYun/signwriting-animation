@@ -233,11 +233,9 @@ class LitMinimal(pl.LightningModule):
         guidance_scale: float = None,
     ):
         """
-        Fast autoregressive version:
-        - Only uses CAMDM interface()
-        - No BJCT kwargs bugs
-        - BTJC <-> BJCT strictly controlled
-        - Runs 10~20x faster than standard diffusion loop
+        Fast autoregressive sampler (normalized space):
+        - past_btjc: [B, Tp, J, C]  (raw coords)
+        - 返回: pred_norm [B, Tf, J, C] (normalized，与训练同一空间)
         """
         self.eval()
         device = self.device
@@ -245,17 +243,12 @@ class LitMinimal(pl.LightningModule):
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
 
-        # ---------------------------------------
-        # Normalize inputs
-        # ---------------------------------------
-        past_norm = self.normalize(past_btjc.to(device))      # [B,Tp,J,C]
+        # -------- Normalize inputs --------
+        past_norm = self.normalize(past_btjc.to(device))   # [B, Tp, J, C]
         sign      = sign_img.to(device)
-
         B, Tp, J, C = past_norm.shape
 
-        # ---------------------------------------
-        # Wrap CAMDM model to the expected interface
-        # ---------------------------------------
+        # -------- Wrapper: 适配 CAMDM 接口 --------
         class _Wrapper(nn.Module):
             def __init__(self, mdl):
                 super().__init__()
@@ -263,56 +256,49 @@ class LitMinimal(pl.LightningModule):
 
             def forward(self, x, t, **kwargs):
                 cond = kwargs.get("y", None)
-                assert cond is not None
-                # x: [B, J, C, T]
-                # t: timestep
-                # cond: {input_pose(BJCT), sign_image}
+                assert cond is not None, "cond 'y' is required"
+                # 直接走 CAMDM 的 interface(x, t, y)
                 return self.m.interface(x, t, cond)
 
         wrapped = _Wrapper(self.model).to(device)
 
-        # ---------------------------------------
-        # Autoregressive generation
-        # ---------------------------------------
+        # -------- Autoregressive 逐块生成 --------
         frames = []
         remain = int(future_len)
-        cur_hist = past_norm.clone()      # [B,Tp,J,C]
+        cur_hist = past_norm.clone()      # [B, Tp, J, C]
 
         while remain > 0:
             n = min(chunk, remain)
-            future_shape_bjct = (B, J, C, n)   # BJCT
+            shape_bjct = (B, J, C, n)     # BJCT
 
             cond = {
                 "sign_image": sign,
                 "input_pose": self.btjc_to_bjct(cur_hist),   # BTJC → BJCT
             }
 
-            # --- fast one-step prediction (CAMDM built-in) ---
+            # 单次 diffusion 采样整块 n 帧（normalized BJCT）
             x_bjct = self.diffusion.p_sample_loop(
                 model=wrapped,
-                shape=future_shape_bjct,
+                shape=shape_bjct,
                 model_kwargs={"y": cond},
                 clip_denoised=False,
                 progress=False,
             )
 
             # BJCT → BTJC
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)          # [B,n,J,C]
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)          # [B, n, J, C]
 
             frames.append(x_btjc_norm)
 
-            # update history window
+            # 更新历史窗口
             cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
             if cur_hist.size(1) > Tp:
                 cur_hist = cur_hist[:, -Tp:, :]
 
             remain -= n
 
-        # stack frames
-        pred_norm = torch.cat(frames, dim=1)   # [B,Tf,J,C]
-
-        return self.unnormalize(pred_norm)
-
+        pred_norm = torch.cat(frames, dim=1)
+        return pred_norm
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
