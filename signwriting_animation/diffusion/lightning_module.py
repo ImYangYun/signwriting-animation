@@ -232,51 +232,43 @@ class LitMinimal(pl.LightningModule):
         chunk: int = 1,
         guidance_scale: float = None,
     ):
-        """
-        Fast autoregressive sampler (normalized space):
-        - past_btjc: [B, Tp, J, C]  (raw coords)
-        - 返回: pred_norm [B, Tf, J, C] (normalized，与训练同一空间)
-        """
         self.eval()
         device = self.device
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
 
-        # -------- Normalize inputs --------
-        past_norm = self.normalize(past_btjc.to(device))   # [B, Tp, J, C]
-        sign      = sign_img.to(device)
-        B, Tp, J, C = past_norm.shape
+        # ------------ Normalize -------------
+        past_norm = self.normalize(past_btjc.to(device))
+        sign = sign_img.to(device)
 
-        # -------- Wrapper: 适配 CAMDM 接口 --------
+        B, Tp, J, C = past_norm.shape
+        frames = []
+        remain = int(future_len)
+        cur_hist = past_norm.clone()
+
+        # ------------ Wrapper for interface() -------------
         class _Wrapper(nn.Module):
             def __init__(self, mdl):
                 super().__init__()
                 self.m = mdl
 
             def forward(self, x, t, **kwargs):
-                cond = kwargs.get("y", None)
-                assert cond is not None, "cond 'y' is required"
-                # 直接走 CAMDM 的 interface(x, t, y)
+                cond = kwargs["y"]
                 return self.m.interface(x, t, cond)
 
         wrapped = _Wrapper(self.model).to(device)
 
-        # -------- Autoregressive 逐块生成 --------
-        frames = []
-        remain = int(future_len)
-        cur_hist = past_norm.clone()      # [B, Tp, J, C]
-
+        # ------------ Loop -------------
         while remain > 0:
             n = min(chunk, remain)
-            shape_bjct = (B, J, C, n)     # BJCT
+            shape_bjct = (B, J, C, n)
 
             cond = {
+                "past_motion_emb": self.btjc_to_bjct(cur_hist),  # <-- 修正点
                 "sign_image": sign,
-                "input_pose": self.btjc_to_bjct(cur_hist),   # BTJC → BJCT
             }
 
-            # 单次 diffusion 采样整块 n 帧（normalized BJCT）
             x_bjct = self.diffusion.p_sample_loop(
                 model=wrapped,
                 shape=shape_bjct,
@@ -285,13 +277,12 @@ class LitMinimal(pl.LightningModule):
                 progress=False,
             )
 
-            # BJCT → BTJC
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)          # [B, n, J, C]
+            x_btjc = self.bjct_to_btjc(x_bjct)
 
-            frames.append(x_btjc_norm)
+            frames.append(x_btjc)
 
-            # 更新历史窗口
-            cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
+            # update window
+            cur_hist = torch.cat([cur_hist, x_btjc], dim=1)
             if cur_hist.size(1) > Tp:
                 cur_hist = cur_hist[:, -Tp:, :]
 
@@ -299,6 +290,7 @@ class LitMinimal(pl.LightningModule):
 
         pred_norm = torch.cat(frames, dim=1)
         return pred_norm
+
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
