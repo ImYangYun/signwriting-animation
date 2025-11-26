@@ -182,11 +182,10 @@ if __name__ == "__main__":
     else:
         true_len = fut_raw.size(1)
 
-    pred_norm = model.sample_autoregressive_diffusion(
+    pred_norm = model.sample_autoregressive_fast(
         past_btjc=past_raw,
         sign_img=sign_img,
-        future_len=true_len,
-        chunk=1
+        future_len=true_len
     )
 
     # unnormalize
