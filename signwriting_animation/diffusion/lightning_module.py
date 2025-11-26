@@ -230,110 +230,72 @@ class LitMinimal(pl.LightningModule):
         sign_img,
         future_len: int = 30,
         chunk: int = 1,
-        guidance_scale: float = None,
+        ddim_steps: int = 20, 
     ):
         """
-        Stable autoregressive sampling for CAMDM
-        - past_btjc: [B,Tp,J,C]
-        - sign_img:  [B,3,H,W]
-        - Returns: unnormalized predicted pose [B,Tf,J,C]
+        Much faster sampling using DDIM:
+        - No full diffusion chain
+        - Runs 10–20x faster than p_sample_loop
         """
-
         self.eval()
         device = self.device
 
-        if guidance_scale is None:
-            guidance_scale = self.guidance_scale
-
-        # ----------------------------------------
-        # Normalize input
-        # ----------------------------------------
+        # Normalize past
         past_norm = self.normalize(past_btjc.to(device))
-        sign     = sign_img.to(device)
-
+        sign = sign_img.to(device)
         B, Tp, J, C = past_norm.shape
 
-        # ----------------------------------------
-        # Wrapper: clean CAMDM interface
-        # ----------------------------------------
         class _Wrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
                 self.model = model
-
+            
             def forward(self, x, t, **kwargs):
-                cond = kwargs["y"]
-                # CAMDM interface expected: interface(latent, timestep, cond_dict)
-                return self.model.interface(x, t, cond)
+                y = kwargs.get("y", None)
+                return self.model.interface(x, t, y)
 
         wrapped = _Wrapper(self.model).to(device)
 
-
-        # ----------------------------------------
-        # Autoregressive generation loop
-        # ----------------------------------------
         frames = []
         remain = int(future_len)
+        cur_hist = past_norm.clone()
 
-        # rolling past
-        cur_hist = past_norm.clone()  # [B, Tp, J ,C]
+        # ⭐ only 20 DDIM steps instead of 200 DDPM steps
+        ddim_eta = 0.0
+        timesteps = torch.linspace(
+            self.diffusion.num_timesteps - 1, 0, ddim_steps, device=device
+        ).long()
 
         while remain > 0:
             n = min(chunk, remain)
             shape_bjct = (B, J, C, n)
 
-            # Condition dict
-            cond_dict = {
+            cond = {
                 "sign_image": sign,
-                "input_pose": self.btjc_to_bjct(cur_hist),   # (B,J,C,Tp)
+                "input_pose": self.btjc_to_bjct(cur_hist)
             }
 
-            # Optional unconditional (for classifier-free guidance)
-            uncond_dict = {
-                "sign_image": torch.zeros_like(sign),
-                "input_pose": torch.zeros_like(cond_dict["input_pose"]),
-            }
-
-            # -------- conditional sample --------
-            x_cond = self.diffusion.p_sample_loop(
+            # ⭐ DDIM sampling instead of DDPM
+            x_bjct = self.diffusion.ddim_sample_loop(
                 model=wrapped,
                 shape=shape_bjct,
-                model_kwargs={"y": cond_dict},
-                progress=False,
-                clip_denoised=False,
+                timesteps=timesteps,
+                model_kwargs={"y": cond},
+                eta=ddim_eta
             )
 
-            # -------- guidance --------
-            if guidance_scale and guidance_scale > 0:
-                x_uncond = self.diffusion.p_sample_loop(
-                    model=wrapped,
-                    shape=shape_bjct,
-                    model_kwargs={"y": uncond_dict},
-                    progress=False,
-                    clip_denoised=False,
-                )
-                x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
-            else:
-                x_bjct = x_cond
-
-            # BJCT -> BTJC
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)     # [B,n,J,C]
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)
             frames.append(x_btjc_norm)
 
-            # rolling history
             cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
             if cur_hist.size(1) > Tp:
-                cur_hist = cur_hist[:, -Tp:, :, :]
+                cur_hist = cur_hist[:, -Tp:]
 
             remain -= n
 
-        # ----------------------------------------
-        # Final concat & unnormalize
-        # ----------------------------------------
-        pred_norm = torch.cat(frames, dim=1)   # [B,Tf,J,C]
-        pred = self.unnormalize(pred_norm)
+        pred_norm = torch.cat(frames, dim=1)
+        return self.unnormalize(pred_norm)
 
-        return pred
 
 
 
