@@ -225,55 +225,116 @@ class LitMinimal(pl.LightningModule):
 
     @torch.no_grad()
     def sample_autoregressive_fast(
-        self, past_btjc, sign_img, future_len=30
+        self,
+        past_btjc,
+        sign_img,
+        future_len: int = 30,
+        chunk: int = 1,
+        guidance_scale: float = None,
     ):
         """
-        Fast autoregressive sampling:
-        - No p_sample_loop
-        - Direct x0 prediction each step
-        - 100x faster than diffusion sampling
+        Stable autoregressive sampling for CAMDM
+        - past_btjc: [B,Tp,J,C]
+        - sign_img:  [B,3,H,W]
+        - Returns: unnormalized predicted pose [B,Tf,J,C]
         """
 
         self.eval()
         device = self.device
 
-        # normalize history
-        hist = self.normalize(past_btjc.to(device))   # [B,Tp,J,C]
-        sign = sign_img.to(device)
+        if guidance_scale is None:
+            guidance_scale = self.guidance_scale
 
-        B, Tp, J, C = hist.shape
-        outputs = []
+        # ----------------------------------------
+        # Normalize input
+        # ----------------------------------------
+        past_norm = self.normalize(past_btjc.to(device))
+        sign     = sign_img.to(device)
 
-        for _ in range(future_len):
-            # convert to BJCT for CAMDM forward
-            hist_bjct = self.btjc_to_bjct(hist)               # [B,J,C,Tp]
+        B, Tp, J, C = past_norm.shape
 
-            # t=0 让模型直接预测 x0
-            t_long = torch.zeros(B, dtype=torch.long, device=device)
+        # ----------------------------------------
+        # Wrapper: clean CAMDM interface
+        # ----------------------------------------
+        class _Wrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
 
-            # forward
-            pred_bjct = self.model.forward(
-                x_bjct=torch.zeros_like(hist_bjct[..., :1]),   # dummy input
-                t=t_long,
-                past_bjct=hist_bjct,
-                sign_img=sign,
+            def forward(self, x, t, **kwargs):
+                cond = kwargs["y"]
+                # CAMDM interface expected: interface(latent, timestep, cond_dict)
+                return self.model.interface(x, t, cond)
+
+        wrapped = _Wrapper(self.model).to(device)
+
+
+        # ----------------------------------------
+        # Autoregressive generation loop
+        # ----------------------------------------
+        frames = []
+        remain = int(future_len)
+
+        # rolling past
+        cur_hist = past_norm.clone()  # [B, Tp, J ,C]
+
+        while remain > 0:
+            n = min(chunk, remain)
+            shape_bjct = (B, J, C, n)
+
+            # Condition dict
+            cond_dict = {
+                "sign_image": sign,
+                "input_pose": self.btjc_to_bjct(cur_hist),   # (B,J,C,Tp)
+            }
+
+            # Optional unconditional (for classifier-free guidance)
+            uncond_dict = {
+                "sign_image": torch.zeros_like(sign),
+                "input_pose": torch.zeros_like(cond_dict["input_pose"]),
+            }
+
+            # -------- conditional sample --------
+            x_cond = self.diffusion.p_sample_loop(
+                model=wrapped,
+                shape=shape_bjct,
+                model_kwargs={"y": cond_dict},
+                progress=False,
+                clip_denoised=False,
             )
 
-            # bjct -> btjc
-            pred_btjc_norm = self.bjct_to_btjc(pred_bjct)  # [B,1,J,C]
+            # -------- guidance --------
+            if guidance_scale and guidance_scale > 0:
+                x_uncond = self.diffusion.p_sample_loop(
+                    model=wrapped,
+                    shape=shape_bjct,
+                    model_kwargs={"y": uncond_dict},
+                    progress=False,
+                    clip_denoised=False,
+                )
+                x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
+            else:
+                x_bjct = x_cond
 
-            # append
-            outputs.append(pred_btjc_norm)
+            # BJCT -> BTJC
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)     # [B,n,J,C]
+            frames.append(x_btjc_norm)
 
-            # update history window
-            hist = torch.cat([hist, pred_btjc_norm], dim=1)
-            if hist.size(1) > Tp:
-                hist = hist[:, -Tp:, : , :]
+            # rolling history
+            cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
+            if cur_hist.size(1) > Tp:
+                cur_hist = cur_hist[:, -Tp:, :, :]
 
-        # concat future frames
-        pred_norm = torch.cat(outputs, dim=1)    # [B, future_len, J, C]
+            remain -= n
 
-        return pred_norm
+        # ----------------------------------------
+        # Final concat & unnormalize
+        # ----------------------------------------
+        pred_norm = torch.cat(frames, dim=1)   # [B,Tf,J,C]
+        pred = self.unnormalize(pred_norm)
+
+        return pred
+
 
 
     def configure_optimizers(self):

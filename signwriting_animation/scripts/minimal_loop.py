@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Final stable 178-joint minimal loop:
-- 训练 (CAMDM diffusion)
-- 验证
-- 未来序列采样 (autoregressive 预测)
-- 反归一化 + 平滑
-- 可视化重心一致化
-- 保存 GT / Pred 的 .pose 文件
-"""
-
 import os
 import torch
 import numpy as np
@@ -58,8 +48,10 @@ def recenter_pair(gt, pr):
     gt[..., :2] -= center
     pr[..., :2] -= center
 
-    pts = torch.cat([gt[..., :2].reshape(-1,2),
-                     pr[..., :2].reshape(-1,2)], dim=0)
+    pts = torch.cat([
+        gt[..., :2].reshape(-1,2),
+        pr[..., :2].reshape(-1,2)
+    ], dim=0)
 
     q02 = torch.quantile(pts, 0.02, dim=0)
     q98 = torch.quantile(pts, 0.98, dim=0)
@@ -74,12 +66,95 @@ def recenter_pair(gt, pr):
 
     return gt.unsqueeze(0), pr.unsqueeze(0)
 
+
 def tensor_to_pose(x_btjc, header):
     if x_btjc.dim()==4:
         x_btjc = x_btjc[0]
     arr = np.ascontiguousarray(x_btjc[:,None,:,:], dtype=np.float32)
     conf = np.ones((arr.shape[0],1,arr.shape[2],1), dtype=np.float32)
-    return Pose(header=header, body=NumPyPoseBody(fps=25, data=arr, confidence=conf))
+    return Pose(header=header,
+                body=NumPyPoseBody(fps=25, data=arr, confidence=conf))
+
+
+# ---------------------------------------------------------
+# PATCH: final fast autoregressive sampling
+# ---------------------------------------------------------
+@torch.no_grad()
+def sample_autoregressive_fast(self, past_btjc, sign_img,
+                               future_len: int = 30, chunk: int = 1,
+                               guidance_scale: float = None):
+
+    self.eval()
+    device = self.device
+
+    if guidance_scale is None:
+        guidance_scale = self.guidance_scale
+
+    # Normalize past
+    past_norm = self.normalize(past_btjc.to(device))
+    sign = sign_img.to(device)
+    B, Tp, J, C = past_norm.shape
+
+    # Wrapper for CAMDM
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+        def forward(self, x, t, **kwargs):
+            y = kwargs["y"]
+            return self.model.interface(x, t, y)
+
+    wrapped = _Wrapper(self.model).to(device)
+
+    frames = []
+    remain = int(future_len)
+    cur_hist = past_norm.clone()     # [B,Tp,J,C]
+
+    while remain > 0:
+        n = min(chunk, remain)
+        shape_bjct = (B, J, C, n)
+
+        cond_dict = {
+            "sign_image": sign,
+            "input_pose": self.btjc_to_bjct(cur_hist),
+        }
+        uncond_dict = {
+            "sign_image": torch.zeros_like(sign),
+            "input_pose": torch.zeros_like(cond_dict["input_pose"]),
+        }
+
+        # conditional
+        x_cond = self.diffusion.p_sample_loop(
+            model=wrapped, shape=shape_bjct,
+            model_kwargs={"y": cond_dict},
+            clip_denoised=False, progress=False,
+        )
+
+        # unconditional guidance
+        if guidance_scale and guidance_scale > 0:
+            x_uncond = self.diffusion.p_sample_loop(
+                model=wrapped, shape=shape_bjct,
+                model_kwargs={"y": uncond_dict},
+                clip_denoised=False, progress=False,
+            )
+            x_bjct = x_uncond + guidance_scale * (x_cond - x_uncond)
+        else:
+            x_bjct = x_cond
+
+        x_btjc_norm = self.bjct_to_btjc(x_bjct)
+        frames.append(x_btjc_norm)
+
+        cur_hist = torch.cat([cur_hist, x_btjc_norm], dim=1)
+        if cur_hist.size(1) > Tp:
+            cur_hist = cur_hist[:, -Tp:, :]
+
+        remain -= n
+
+    pred_norm = torch.cat(frames, dim=1)
+    return pred_norm   # 注意：返回 normalized（让外面去 unnormalize）
+
+# attach patch to model class
+LitMinimal.sample_autoregressive_fast = sample_autoregressive_fast
 
 
 # ---------------------------------------------------------
@@ -97,12 +172,12 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
 
     BATCH_SIZE = 4
-    MAX_EPOCHS = 20   # tiny dataset for speed
+    MAX_EPOCHS = 20
 
     # -------------------------------
-    # Dataset: tiny subset
+    # Dataset tiny subset
     # -------------------------------
-    def make_loader(split, subset=16):
+    def make_loader(split):
         ds = DynamicPosePredictionDataset(
             data_dir=data_dir,
             csv_path=csv_path,
@@ -113,17 +188,17 @@ if __name__ == "__main__":
             reduce_holistic=True,
         )
 
-        if subset is not None:
-            idx = list(range(min(len(ds), subset)))
-            ds = torch.utils.data.Subset(ds, idx)
+        # tiny dataset
+        idx = list(range(min(16, len(ds))))
+        ds = torch.utils.data.Subset(ds, idx)
 
         return DataLoader(
             ds,
             batch_size=BATCH_SIZE,
             shuffle=(split=="train"),
             num_workers=0,
-            pin_memory=False,
             collate_fn=zero_pad_collator,
+            pin_memory=False,
         )
 
     train_loader = make_loader("train")
@@ -141,7 +216,7 @@ if __name__ == "__main__":
         num_dims=3,
         lr=1e-4,
         stats_path=mean_std_178,
-        diffusion_steps=200,      # fast
+        diffusion_steps=200,
         pred_target="x0",
         guidance_scale=0.0,
     )
@@ -152,8 +227,6 @@ if __name__ == "__main__":
         devices=1,
         max_epochs=MAX_EPOCHS,
         log_every_n_steps=5,
-        accumulate_grad_batches=1,
-        enable_checkpointing=True,
     )
 
     print("\n===== TRAINING =====")
@@ -173,7 +246,7 @@ if __name__ == "__main__":
     fut_raw  = sanitize_btjc(batch["data"][:1]).to(model.device)
     sign_img = cond["sign_image"][:1].to(model.device)
 
-    # length
+    # determine future length
     if "target_mask" in cond:
         mask = cond["target_mask"][:1]
         if mask.dim()==4:
@@ -182,32 +255,33 @@ if __name__ == "__main__":
     else:
         true_len = fut_raw.size(1)
 
+    # --- GENERATE ---
     pred_norm = model.sample_autoregressive_fast(
         past_btjc=past_raw,
         sign_img=sign_img,
-        future_len=true_len
+        future_len=true_len,
+        chunk=1
     )
 
     # unnormalize
     fut_un  = _plain(model.unnormalize(fut_raw))
     pred_un = _plain(model.unnormalize(pred_norm))
 
-    # smooth & recenter
+    # smooth + recenter
     pred_s  = temporal_smooth(pred_un)
     fut_s   = fut_un.unsqueeze(0)
 
     fut_vis, pred_vis = recenter_pair(fut_s, pred_s)
 
-    pose_path = batch["pose_path"][0]
+    # load header
+    pose_path = batch["records"][0]["pose"]
     with open(os.path.join(data_dir, pose_path), "rb") as f:
         pose0 = Pose.read(f)
+    header = reduce_holistic(
+        pose0.remove_components(["POSE_WORLD_LANDMARKS"])
+    ).header
 
-    header = reduce_holistic(pose0.remove_components(["POSE_WORLD_LANDMARKS"])).header
-
-
-    # -----------------------------------
-    # Save pose files
-    # -----------------------------------
+    # save
     out_gt   = os.path.join(out_dir, "gt_178.pose")
     out_pred = os.path.join(out_dir, "pred_178.pose")
 
