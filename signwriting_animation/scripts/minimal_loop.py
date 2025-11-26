@@ -184,11 +184,11 @@ def recenter_pair(gt: torch.Tensor, pr: torch.Tensor):
     return gt.unsqueeze(0), pr.unsqueeze(0)
 
 
-def tensor_to_pose(x_btjc: torch.Tensor, header: Pose.header.__class__):
-    if x_btjc.dim() == 4:
+def tensor_to_pose(x_btjc, header):
+    if x_btjc.dim()==4:
         x_btjc = x_btjc[0]
-    arr = np.ascontiguousarray(x_btjc[:, None, :, :], dtype=np.float32)
-    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+    arr = np.ascontiguousarray(x_btjc[:,None,:,:], dtype=np.float32)
+    conf = np.ones((arr.shape[0],1,arr.shape[2],1), dtype=np.float32)
     return Pose(header=header, body=NumPyPoseBody(fps=25, data=arr, confidence=conf))
 
 
