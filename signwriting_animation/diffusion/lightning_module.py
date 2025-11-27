@@ -265,9 +265,9 @@ class LitMinimal(pl.LightningModule):
             shape_bjct = (B, J, C, n)
 
             cond = {
-                "past_motion_emb": self.btjc_to_bjct(cur_hist),  # <-- 修正点
-                "sign_image": sign,
-            }
+            "input_pose": self.btjc_to_bjct(cur_hist),
+            "sign_image": sign,
+        }
 
             x_bjct = self.diffusion.p_sample_loop(
                 model=wrapped,
