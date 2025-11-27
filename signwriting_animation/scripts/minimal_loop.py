@@ -39,11 +39,17 @@ def temporal_smooth(x, k=3):
     return x
 
 
-def recenter_for_view(x):
-    # x: [T,J,C]
+def recenter_for_view(x, header):
+    if x.dim() == 4:
+        x = x[0]
+
     x = torch.nan_to_num(x, nan=0.0)
-    torso = x[:, :33, :2] if x.size(1) >= 33 else x[..., :2]
-    ctr = torso.reshape(-1,2).mean(0)
+
+    torso_end = len(header.components[0].points)   # typically 8
+    torso_xy = x[:, :torso_end, :2]
+
+    ctr = torso_xy.reshape(-1,2).mean(dim=0)
+
     x[..., :2] -= ctr
     return x
 
@@ -132,29 +138,28 @@ if __name__ == "__main__":
         sign = cond["sign_image"][:1].float().to(model.device)
         gt   = sanitize_btjc(batch["data"][:1]).to(model.device)
 
-        # ---------------- Generate Future (Sampling) ----------------
         fut_len = gt.size(1)
         print(f"[SAMPLE] sampling future length = {fut_len}")
 
+        # ---- sampling normalized ----
         pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
             future_len=fut_len,
-            chunk=1,                   # slow but stable
-        )                              # [B,T,J,C] normalized
+            chunk=1,
+        )
 
-        # unnormalize
+        # ---- unnormalize ----
+        gt_un   = model.unnormalize(model.normalize(gt))
         pred_un = model.unnormalize(pred_norm)
-        gt_un   = model.unnormalize(model.normalize(gt))   # identity but keeps consistency
 
-        # smooth + center
-        pred_un = temporal_smooth(pred_un)
-        gt_un   = temporal_smooth(gt_un)
+        # ---- smooth ----
+        gt_sm   = temporal_smooth(gt_un)
+        pred_sm = temporal_smooth(pred_un)
 
-        pred_un = recenter_for_view(pred_un)
-        gt_un   = recenter_for_view(gt_un)
-
-    # ---------------- Build header (178 skeleton) ----------------
+    # ============================================================
+    # 🔥 Build header FIRST — must happen BEFORE recenter + debug
+    # ============================================================
     pose_path = base_ds.records[0]["pose"]
     ref_path = pose_path if os.path.isabs(pose_path) else os.path.join(data_dir, pose_path)
 
@@ -169,9 +174,36 @@ if __name__ == "__main__":
     print("[HEADER] components:", [c.name for c in header.components])
     print("[HEADER] limbs per component:", [len(c.limbs) for c in header.components])
 
+
+    # ============================================================
+    # 🔥 NOW debug (header exists)
+    # ============================================================
+    print("\n================ GT DEBUG ================")
+    print("[1] GT raw shape:", gt.shape)
+    print("[2] GT unnormalized shape:", gt_un.shape)
+    print("[3] GT smooth shape:", gt_sm.shape)
+    print("[4] GT smooth stats:",
+        gt_sm.min().item(), gt_sm.max().item(),
+        gt_sm.mean().item(), gt_sm.std().item())
+
+    torso_end = len(header.components[0].points)
+    print("[5] torso_end =", torso_end)
+
+    torso_xy = gt_sm[:, :torso_end, :2]
+    print("[6] torso_xy shape:", torso_xy.shape)
+    print("[7] torso_xy min/max:",
+        torso_xy.min().item(), torso_xy.max().item())
+
+    # ============================================================
+    # 🔥 recenter AFTER header and debug
+    # ============================================================
+    gt_rc   = recenter_for_view(gt_sm, header)
+    pred_rc = recenter_for_view(pred_sm, header)
+
+
     # ---------------- Save pose files ----------------
-    gt_pose   = tensor_to_pose(gt_un.cpu(),   header)
-    pred_pose = tensor_to_pose(pred_un.cpu(), header)
+    gt_pose   = tensor_to_pose(gt_rc.cpu(),   header)
+    pred_pose = tensor_to_pose(pred_rc.cpu(), header)
 
     out_gt   = f"{out_dir}/gt_178.pose"
     out_pred = f"{out_dir}/pred_178.pose"
@@ -188,7 +220,6 @@ if __name__ == "__main__":
     print(f"[SAVE] wrote: {out_gt}")
     print(f"[SAVE] wrote: {out_pred}")
 
-    # ---------------- Final check ----------------
     try:
         p = Pose.read(open(out_pred, "rb"))
         print("[CHECK] pred pose OK, limbs:", [len(c.limbs) for c in p.header.components])
