@@ -49,12 +49,11 @@ def recenter_for_view(x):
 
 
 def tensor_to_pose(t_btjc, header):
-    if t_btjc.dim() == 4:
-        t = t_btjc[0]
-    else:
-        t = t_btjc
+    t = t_btjc.detach().cpu()
+    if t.dim() == 4:
+        t = t[0]  # [T,J,C]
 
-    arr = np.ascontiguousarray(t[:,None,:,:], dtype=np.float32)
+    arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
@@ -171,8 +170,8 @@ if __name__ == "__main__":
     print("[HEADER] limbs per component:", [len(c.limbs) for c in header.components])
 
     # ---------------- Save pose files ----------------
-    gt_pose   = tensor_to_pose(gt_un,   header)
-    pred_pose = tensor_to_pose(pred_un, header)
+    gt_pose   = tensor_to_pose(gt_un.cpu(),   header)
+    pred_pose = tensor_to_pose(pred_un.cpu(), header)
 
     out_gt   = f"{out_dir}/gt_178.pose"
     out_pred = f"{out_dir}/pred_178.pose"
