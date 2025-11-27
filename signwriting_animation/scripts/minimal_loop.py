@@ -39,18 +39,22 @@ def temporal_smooth(x, k=3):
     return x
 
 
-def recenter_for_view(x, header):
+def recenter_with_fixed_scale(x, scale=200):
     if x.dim() == 4:
-        x = x[0]
+        x = x[0]  # [T,J,C]
 
     x = torch.nan_to_num(x, nan=0.0)
 
-    torso_end = len(header.components[0].points)   # typically 8
-    torso_xy = x[:, :torso_end, :2]
+    center = x[..., :2].mean(dim=(0,1))  # shape: (2,)
+    x[..., :2] -= center
 
-    ctr = torso_xy.reshape(-1,2).mean(dim=0)
+    max_val = x[..., :2].abs().max().item()
+    
+    if max_val < 1e-6:
+        max_val = 1.0
 
-    x[..., :2] -= ctr
+    x[..., :2] = x[..., :2] / max_val * scale
+    
     return x
 
 
@@ -200,8 +204,8 @@ if __name__ == "__main__":
     # ============================================================
     # 🔥 recenter AFTER header and debug
     # ============================================================
-    gt_rc   = recenter_for_view(gt_sm, header)
-    pred_rc = recenter_for_view(pred_sm, header)
+    gt_rc   = recenter_with_fixed_scale(gt_sm, scale=200)
+    pred_rc = recenter_with_fixed_scale(pred_sm, scale=200)
 
 
     # ---------------- Save pose files ----------------
