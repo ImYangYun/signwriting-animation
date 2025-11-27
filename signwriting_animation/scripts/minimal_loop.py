@@ -135,6 +135,8 @@ if __name__ == "__main__":
 
         # Prepare inputs
         past = sanitize_btjc(cond["input_pose"][:1]).to(model.device)
+        past = model.normalize(past)
+
         sign = cond["sign_image"][:1].float().to(model.device)
         gt   = sanitize_btjc(batch["data"][:1]).to(model.device)
 
@@ -148,9 +150,10 @@ if __name__ == "__main__":
             future_len=fut_len,
             chunk=1,
         )
+        print("pred_norm min/max:", pred_norm.min().item(), pred_norm.max().item())
 
         # ---- unnormalize ----
-        gt_un   = model.unnormalize(model.normalize(gt))
+        gt_un   = gt
         pred_un = model.unnormalize(pred_norm)
 
         # ---- smooth ----
