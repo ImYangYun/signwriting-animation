@@ -34,17 +34,41 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_fixed_scale(x, scale=250):
-    """使图像居中、人形大小一致、y 翻转"""
-    if x.dim() == 4: x = x[0]
+def recenter_for_view(x, header, scale=250):
+    """
+    For reduce_holistic 178-joint skeleton:
+    - use first 33 points as torso proxy (MP pose subset)
+    - recenter by torso center
+    - scale by torso range (stable)
+    - flip Y for viewer
+    """
+    if x.dim() == 4:
+        x = x[0]      # [T,J,C]
+
     x = torch.nan_to_num(x, nan=0.0)
-    center = x[..., :2].mean(dim=(0,1))
-    x[..., :2] -= center
-    max_abs = x[..., :2].abs().max().item()
-    if max_abs < 1e-6: max_abs = 1.0
-    x[..., :2] = x[..., :2] / max_abs * scale
+
+    # ---- torso slice (same idea as your old working version) ----
+    torso_end = min(33, x.size(1))      # first 33 joints are stable torso+upper body
+    torso_xy = x[:, :torso_end, :2]     # [T,33,2]
+
+    # ---- recenter by torso center ----
+    ctr = torso_xy.reshape(-1, 2).mean(dim=0)   # [2]
+    x[..., :2] -= ctr
+
+    # ---- scale by torso range (not by noisy hands/face) ----
+    flat = torso_xy.reshape(-1, 2)
+    span = (flat.max(dim=0).values - flat.min(dim=0).values).max().item()
+    if span < 1e-6:
+        span = 1.0
+
+    scale_factor = scale / span
+    x[..., :2] *= scale_factor
+
+    # ---- flip Y axis for viewer ----
     x[..., 1] = -x[..., 1]
-    return x
+
+    return x.contiguous()
+
 
 
 def tensor_to_pose(t, header):
@@ -110,6 +134,16 @@ if __name__ == "__main__":
     print("[TRAIN] Overfit 4 samples…")
     trainer.fit(model, loader, loader)
 
+    # Header from reference pose
+    ref_path = base_ds.records[0]["pose"]
+    ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
+
+    with open(ref_path, "rb") as f:
+        ref_pose = Pose.read(f)
+
+    header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
+    print("[HEADER] components:", [c.name for c in header.components])
+
     # ============================================================
     # Inference
     # ============================================================
@@ -143,20 +177,8 @@ if __name__ == "__main__":
         gt_s   = temporal_smooth(gt_un)
 
         # ---------- Recenter ----------
-        pred_r = recenter_fixed_scale(pred_s)
-        gt_r   = recenter_fixed_scale(gt_s)
-
-    # ============================================================
-    # Header from reference pose
-    # ============================================================
-    ref_path = base_ds.records[0]["pose"]
-    ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
-
-    with open(ref_path, "rb") as f:
-        ref_pose = Pose.read(f)
-
-    header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
-    print("[HEADER] components:", [c.name for c in header.components])
+        pred_r = recenter_for_view(pred_s, header)
+        gt_r   = recenter_for_view(gt_s, header)
 
     # ============================================================
     # Save pose files

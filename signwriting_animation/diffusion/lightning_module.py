@@ -55,7 +55,7 @@ class LitMinimal(pl.LightningModule):
                  num_dims=3,
                  lr=1e-4,
                  stats_path="/data/yayun/pose_data/mean_std_178.pt",
-                 diffusion_steps: int = 1000,
+                 diffusion_steps: int = 200,
                  beta_start: float = 1e-4,
                  beta_end: float = 2e-2,
                  pred_target: str = "x0",
