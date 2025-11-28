@@ -34,28 +34,30 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view(x, header, scale=250, canvas_offset=512):
+def recenter_for_view(x, header, scale=250.0, canvas_offset=512.0):
+    # x: [T,J,C] or [1,T,J,C]
     if x.dim() == 4:
-        x = x[0]   # [T,J,C]
+        x = x[0]
+
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
     torso_end = min(33, x.size(1))
-    torso_xy = x[:, :torso_end, :2]
-    center = torso_xy.mean(dim=(0,1))  # (2,)
-    x[..., :2] -= center               # shift to center
+    torso_xy = x[:, :torso_end, :2]  # [T,33,2]
+
+    center = torso_xy.mean(dim=(0, 1))   # (2,)
+    x[..., :2] -= center
 
     max_abs = x[..., :2].abs().max().item()
-    if max_abs < 1e-6: 
+    if max_abs < 1e-6:
         max_abs = 1.0
     x[..., :2] = x[..., :2] / max_abs * scale
 
-    x[..., 1] = -x[..., 1]
-
+    # ---- 3) 顺时针 90° 旋转 ----
     old_x = x[..., 0].clone()
     old_y = x[..., 1].clone()
-    x[..., 0] = old_y
-    x[..., 1] = -old_x
+    x[..., 0] = old_y         # x' =  y
+    x[..., 1] = -old_x        # y' = -x
 
     x[..., 0] += canvas_offset
     x[..., 1] += canvas_offset
