@@ -34,41 +34,33 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view(x, header, scale=250):
-    """
-    For reduce_holistic 178-joint skeleton:
-    - use first 33 points as torso proxy (MP pose subset)
-    - recenter by torso center
-    - scale by torso range (stable)
-    - flip Y for viewer
-    """
+def recenter_for_view(x, header, scale=250, canvas_offset=512):
     if x.dim() == 4:
-        x = x[0]      # [T,J,C]
-
+        x = x[0]   # [T,J,C]
+    x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    # ---- torso slice (same idea as your old working version) ----
-    torso_end = min(33, x.size(1))      # first 33 joints are stable torso+upper body
-    torso_xy = x[:, :torso_end, :2]     # [T,33,2]
+    torso_end = min(33, x.size(1))
+    torso_xy = x[:, :torso_end, :2]
+    center = torso_xy.mean(dim=(0,1))  # (2,)
+    x[..., :2] -= center               # shift to center
 
-    # ---- recenter by torso center ----
-    ctr = torso_xy.reshape(-1, 2).mean(dim=0)   # [2]
-    x[..., :2] -= ctr
+    max_abs = x[..., :2].abs().max().item()
+    if max_abs < 1e-6: 
+        max_abs = 1.0
+    x[..., :2] = x[..., :2] / max_abs * scale
 
-    # ---- scale by torso range (not by noisy hands/face) ----
-    flat = torso_xy.reshape(-1, 2)
-    span = (flat.max(dim=0).values - flat.min(dim=0).values).max().item()
-    if span < 1e-6:
-        span = 1.0
-
-    scale_factor = scale / span
-    x[..., :2] *= scale_factor
-
-    # ---- flip Y axis for viewer ----
     x[..., 1] = -x[..., 1]
 
-    return x.contiguous()
+    old_x = x[..., 0].clone()
+    old_y = x[..., 1].clone()
+    x[..., 0] = old_y
+    x[..., 1] = -old_x
 
+    x[..., 0] += canvas_offset
+    x[..., 1] += canvas_offset
+
+    return x.contiguous()
 
 
 def tensor_to_pose(t, header):
