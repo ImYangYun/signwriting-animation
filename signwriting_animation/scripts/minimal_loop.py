@@ -41,17 +41,43 @@ def recenter_for_view(x, header, scale=250.0, offset=(512.0, 384.0)):
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    torso_end = min(33, x.size(1))
-    torso_xy = x[:, :torso_end, :2]      # [T, 33, 2]
+    nose = x[:, 0]               # (T,3)
+    left_shoulder = x[:, 5]
+    right_shoulder = x[:, 6]
+    mid_hip = x[:, 7]
 
-    center = torso_xy.mean(dim=(0, 1))   # (2,)
+    forward = (mid_hip - nose).mean(0)
+    forward = forward / (forward.norm() + 1e-6)
+
+    up = (left_shoulder - right_shoulder).mean(0)
+    up = up / (up.norm() + 1e-6)
+
+    right = torch.cross(up, forward)
+    right = right / (right.norm() + 1e-6)
+
+    up = torch.cross(forward, right)
+    up = up / (up.norm() + 1e-6)
+
+    R = torch.stack([right, up, forward], dim=1)  # [3,3]
+
+    T, J, C = x.shape
+    x = x.reshape(-1,3) @ R.T
+    x = x.reshape(T,J,C)
+
+    # ==============================
+    # (2) 居中 torso
+    # ==============================
+    torso_end = len(header.components[0].points)   # 178 reduce 后的 pose 部件点数（8）
+    torso_xy = x[:, :torso_end, :2]
+    center = torso_xy.mean(dim=(0,1))
     x[..., :2] -= center
 
-    min_xy = torso_xy.view(-1, 2).min(dim=0).values
-    max_xy = torso_xy.view(-1, 2).max(dim=0).values
+    min_xy = torso_xy.reshape(-1,2).min(dim=0).values
+    max_xy = torso_xy.reshape(-1,2).max(dim=0).values
     span = (max_xy - min_xy).max().item()
     if span < 1e-6:
         span = 1.0
+
     s = scale / span
     x[..., :2] *= s
 
@@ -59,6 +85,7 @@ def recenter_for_view(x, header, scale=250.0, offset=(512.0, 384.0)):
     x[..., 1] += offset[1]
 
     return x.contiguous()
+
 
 
 def tensor_to_pose(t, header):
