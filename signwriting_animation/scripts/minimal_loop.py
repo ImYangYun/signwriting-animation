@@ -34,7 +34,7 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view_178(x, header, scale=250.0, offset=(512.0, 384.0)):
+def recenter_for_view(x, header, scale=250.0, offset=(512.0, 384.0)):
     if x.dim() == 4:
         x = x[0]  # [T,J,C]
 
