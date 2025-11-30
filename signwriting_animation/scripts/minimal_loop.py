@@ -88,10 +88,19 @@ def save_raw_pose(x, header, path):
 
 
 
-def tensor_to_pose(t, header):
-    t = _to_plain(t)
-    arr = np.ascontiguousarray(t[:, None, :, :], dtype=np.float32)
-    conf = np.ones((arr.shape[0],1,arr.shape[2],1), dtype=np.float32)
+def tensor_to_pose(t_btjc, header):
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    elif t_btjc.dim() == 3:
+        t = t_btjc
+    else:
+        raise ValueError(f"unexpected shape {t_btjc.shape}")
+
+    print("[tensor_to_pose] final shape:", t.shape)
+
+    arr = t[:, None, :, :].cpu().numpy().astype(np.float32)
+    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
     return Pose(header=header, body=body)
 
@@ -200,9 +209,12 @@ if __name__ == "__main__":
 
     # ============================================================
     # Save pose files
-    # ============================================================
     pose_gt = tensor_to_pose(gt_s, header)
     pose_pr = tensor_to_pose(pred_s, header)
+    print(gt_s.shape)
+    print(pred_s.shape)
+    print("[tensor_to_pose input]", gt_s.shape)
+
 
     out_gt = os.path.join(out_dir, "gt_178.pose")
     out_pr = os.path.join(out_dir, "pred_178.pose")
