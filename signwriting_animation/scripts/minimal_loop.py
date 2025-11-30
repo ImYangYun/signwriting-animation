@@ -34,36 +34,31 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view(x, header, scale=250.0, offset=(512.0, 384.0)):
+def recenter_for_view(x, header, scale=350.0, canvas=(1024, 1024)):
 
     if x.dim() == 4:
-        x = x[0]              # [T,J,C]
+        x = x[0]  # [T,J,C]
 
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    face_start = len(header.components[0].points)          # 8
-    face_end   = face_start + len(header.components[1].points)  # 8+128
-    face_y = x[:, face_start:face_end, 1]
+    all_xy = x[..., :2].view(-1, 2)
+    min_xy = all_xy.min(dim=0).values
+    max_xy = all_xy.max(dim=0).values
 
-    if face_y.mean() > 0:
-        x[...,1] = -x[...,1]
+    center = (min_xy + max_xy) / 2.0
 
-    all_xy = x[..., :2]
-    center = all_xy.mean(dim=(0,1))
     x[..., :2] -= center
 
-    min_xy = all_xy.view(-1,2).min(dim=0).values
-    max_xy = all_xy.view(-1,2).max(dim=0).values
     span = (max_xy - min_xy).max().item()
+    if span < 1e-6: span = 1.0
 
-    if span < 1e-6:
-        span = 1.0
     s = scale / span
     x[..., :2] *= s
 
-    x[..., 0] += offset[0]
-    x[..., 1] += offset[1]
+    cx, cy = canvas[0] / 2, canvas[1] / 2
+    x[..., 0] += cx
+    x[..., 1] += cy
 
     return x.contiguous()
 
