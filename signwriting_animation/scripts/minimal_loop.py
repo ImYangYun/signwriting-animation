@@ -71,6 +71,22 @@ def recenter_for_view(x, header, scale=350.0, canvas=(1024, 1024)):
     return x.contiguous()
 
 
+def save_raw_pose(x, header, path):
+    if x.dim() == 4:
+        x = x[0]
+    from pose_format.numpy.pose_body import NumPyPoseBody
+    from pose_format import Pose
+    arr = x.detach().cpu().numpy()
+    arr = arr[:, None, :, :]  # (T,1,J,C)
+
+    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
+    body = NumPyPoseBody(fps=25, data=arr.astype(np.float32), confidence=conf)
+    pose = Pose(header=header, body=body)
+
+    with open(path, "wb") as f:
+        pose.write(f)
+
+
 
 def tensor_to_pose(t, header):
     t = _to_plain(t)
@@ -175,15 +191,18 @@ if __name__ == "__main__":
         pred_s = temporal_smooth(pred)
         gt_s   = temporal_smooth(gt_un)
 
+        save_raw_pose(gt_s, header, "logs/minimal_178/gt_raw.pose")
+        save_raw_pose(pred_s, header, "logs/minimal_178/pred_raw.pose")
+
         # ---------- Recenter ----------
-        pred_r = recenter_for_view(pred_s, header)
-        gt_r   = recenter_for_view(gt_s, header)
+        #pred_r = recenter_for_view(pred_s, header)
+        #gt_r   = recenter_for_view(gt_s, header)
 
     # ============================================================
     # Save pose files
     # ============================================================
-    pose_gt = tensor_to_pose(gt_r, header)
-    pose_pr = tensor_to_pose(pred_r, header)
+    pose_gt = tensor_to_pose(gt_s, header)
+    pose_pr = tensor_to_pose(pred_s, header)
 
     out_gt = os.path.join(out_dir, "gt_178.pose")
     out_pr = os.path.join(out_dir, "pred_178.pose")
