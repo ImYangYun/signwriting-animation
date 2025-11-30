@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import torch
+import math
 import numpy as np
 import lightning as pl
 from torch.utils.data import DataLoader
@@ -34,39 +35,50 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view(x, header, scale=350.0, canvas=(1024, 1024)):
+def fix_pose_for_view(x, scale=250.0):
     if x.dim() == 4:
-        x = x[0]             # [T,J,C]
+        x = x[0]  # [T,J,C]
 
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    pose_joints  = len(header.components[0].points)       # 8
-    face_joints  = len(header.components[1].points)       # 128
-    face_start   = pose_joints                            # 8
-    face_end     = pose_joints + face_joints              # 136
+    T, J, C = x.shape
 
-    fx = x[:, face_start:face_end, 0]
-    fy = x[:, face_start:face_end, 1]
+    x[..., :2] *= scale
 
-    x[:, face_start:face_end, 0] =  fy
-    x[:, face_start:face_end, 1] = -fx
-    all_xy = x[..., :2].view(-1, 2)
-    min_xy = all_xy.min(dim=0).values
-    max_xy = all_xy.max(dim=0).values
-
-    center = (min_xy + max_xy) / 2.0
+    torso_end = min(33, J)
+    torso_xy = x[:, :torso_end, :2]          # [T,33,2]
+    center = torso_xy.mean(dim=(0,1))        # (2,)
     x[..., :2] -= center
 
-    span = (max_xy - min_xy).max().item()
-    if span < 1e-6:
-        span = 1.0
-    s = scale / span
-    x[..., :2] *= s
 
-    cx, cy = canvas[0] / 2, canvas[1] / 2
-    x[..., 0] += cx
-    x[..., 1] += cy
+    left_shoulder  = x[:, 11, :2].mean(0)   # (2,)
+    right_shoulder = x[:, 12, :2].mean(0)   # (2,)
+
+    dx = right_shoulder[0] - left_shoulder[0]
+    dy = right_shoulder[1] - left_shoulder[1]
+
+    angle = math.degrees(math.atan2(dy, dx))
+
+    if angle > 45 and angle < 135:
+        rot = -90
+    elif angle < -45 and angle > -135:
+        rot = 90
+    elif abs(angle) > 135:
+        rot = 180
+    else:
+        rot = 0
+
+    if rot != 0:
+        rad = rot * math.pi / 180.0
+        R = torch.tensor([
+            [math.cos(rad), -math.sin(rad)],
+            [math.sin(rad),  math.cos(rad)],
+        ], dtype=x.dtype, device=x.device)
+        x[..., :2] = torch.matmul(x[..., :2], R.T)
+
+    x[..., 0] += 512    # 画布 x 偏移
+    x[..., 1] += 384    # 画布 y 偏移
 
     return x.contiguous()
 
@@ -203,18 +215,18 @@ if __name__ == "__main__":
         save_raw_pose(gt_s, header, "logs/minimal_178/gt_raw.pose")
         save_raw_pose(pred_s, header, "logs/minimal_178/pred_raw.pose")
 
-        # ---------- Recenter ----------
-        #pred_r = recenter_for_view(pred_s, header)
-        #gt_r   = recenter_for_view(gt_s, header)
+        pred_f = fix_pose_for_view(pred_s)
+        gt_f   = fix_pose_for_view(gt_s)
 
-    # ============================================================
+        print("gt_f shape:", gt_f.shape)
+        print("pred_f shape:", pred_f.shape)
+
+        print("gt_f min/max:", gt_f.min().item(), gt_f.max().item())
+        print("pred_f min/max:", pred_f.min().item(), pred_f.max().item())
+
     # Save pose files
-    pose_gt = tensor_to_pose(gt_s, header)
-    pose_pr = tensor_to_pose(pred_s, header)
-    print(gt_s.shape)
-    print(pred_s.shape)
-    print("[tensor_to_pose input]", gt_s.shape)
-
+    pose_gt = tensor_to_pose(gt_f, header)
+    pose_pr = tensor_to_pose(pred_f, header)
 
     out_gt = os.path.join(out_dir, "gt_178.pose")
     out_pr = os.path.join(out_dir, "pred_178.pose")
