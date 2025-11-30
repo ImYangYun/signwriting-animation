@@ -205,12 +205,9 @@ if __name__ == "__main__":
             chunk=1,
         )
 
-        pred = model.unnormalize(pred_norm)
-        gt_un = model.unnormalize(gt)
-
         # ---------- Smooth ----------
-        pred_s = temporal_smooth(pred)
-        gt_s   = temporal_smooth(gt_un)
+        pred_s = temporal_smooth(pred_norm)
+        gt_s   = temporal_smooth(gt)
 
         save_raw_pose(gt_s, header, "logs/minimal_178/gt_raw.pose")
         save_raw_pose(pred_s, header, "logs/minimal_178/pred_raw.pose")
@@ -223,6 +220,9 @@ if __name__ == "__main__":
 
         print("gt_f min/max:", gt_f.min().item(), gt_f.max().item())
         print("pred_f min/max:", pred_f.min().item(), pred_f.max().item())
+
+        pred_f = model.unnormalize(pred_f)
+        gt_f   = model.unnormalize(gt_f)
 
     # Save pose files
     pose_gt = tensor_to_pose(gt_f, header)
