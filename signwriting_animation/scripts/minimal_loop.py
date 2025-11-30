@@ -180,15 +180,16 @@ if __name__ == "__main__":
     header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
     print("[HEADER] components:", [c.name for c in header.components])
 
-    # ============================================================
     # Inference
-    device = trainer.strategy.root_device
-    model = model.to(device)
     model.eval()
+    device = trainer.strategy.root_device
+
+    model.mean_pose = model.mean_pose.to(device)
+    model.std_pose  = model.std_pose.to(device)
 
     with torch.no_grad():
         batch = next(iter(loader))
-        cond = batch["conditions"]
+        cond  = batch["conditions"]
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
@@ -197,7 +198,6 @@ if __name__ == "__main__":
         future_len = gt.size(1)
         print("[SAMPLE] future_len =", future_len)
 
-        # ---------- Sampling ----------
         pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -205,26 +205,24 @@ if __name__ == "__main__":
             chunk=1,
         )
 
-        # ---------- Smooth ----------
+        # --- Smooth normalized pose ---
         pred_s = temporal_smooth(pred_norm)
         gt_s   = temporal_smooth(gt)
 
-        save_raw_pose(gt_s, header, "logs/minimal_178/gt_raw.pose")
+        save_raw_pose(gt_s,   header, "logs/minimal_178/gt_raw.pose")
         save_raw_pose(pred_s, header, "logs/minimal_178/pred_raw.pose")
 
+        # --- Fix for view (still normalized) ---
         pred_f = fix_pose_for_view(pred_s)
         gt_f   = fix_pose_for_view(gt_s)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
-
-        print("gt_f min/max:", gt_f.min().item(), gt_f.max().item())
+        print("gt_f min/max:",   gt_f.min().item(),   gt_f.max().item())
         print("pred_f min/max:", pred_f.min().item(), pred_f.max().item())
 
-        pred_f = model.unnormalize(pred_f)
-        gt_f   = model.unnormalize(gt_f)
+    # --- DO NOT unnormalize here !!! ---
 
-    # Save pose files
     pose_gt = tensor_to_pose(gt_f, header)
     pose_pr = tensor_to_pose(pred_f, header)
 
@@ -232,9 +230,12 @@ if __name__ == "__main__":
     out_pr = os.path.join(out_dir, "pred_178.pose")
 
     for p in [out_gt, out_pr]:
-        if os.path.exists(p): os.remove(p)
+        if os.path.exists(p):
+            os.remove(p)
 
-    with open(out_gt, "wb") as f: pose_gt.write(f)
-    with open(out_pr, "wb") as f: pose_pr.write(f)
+    with open(out_gt, "wb") as f:
+        pose_gt.write(f)
+    with open(out_pr, "wb") as f:
+        pose_pr.write(f)
 
     print("[SAVE] GT & Pred pose saved ✔")
