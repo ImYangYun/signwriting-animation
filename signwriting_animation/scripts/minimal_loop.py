@@ -35,24 +35,32 @@ def temporal_smooth(x, k=5):
 
 
 def recenter_for_view(x, header, scale=350.0, canvas=(1024, 1024)):
-
     if x.dim() == 4:
-        x = x[0]  # [T,J,C]
+        x = x[0]             # [T,J,C]
 
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
+    pose_joints  = len(header.components[0].points)       # 8
+    face_joints  = len(header.components[1].points)       # 128
+    face_start   = pose_joints                            # 8
+    face_end     = pose_joints + face_joints              # 136
+
+    fx = x[:, face_start:face_end, 0]
+    fy = x[:, face_start:face_end, 1]
+
+    x[:, face_start:face_end, 0] =  fy
+    x[:, face_start:face_end, 1] = -fx
     all_xy = x[..., :2].view(-1, 2)
     min_xy = all_xy.min(dim=0).values
     max_xy = all_xy.max(dim=0).values
 
     center = (min_xy + max_xy) / 2.0
-
     x[..., :2] -= center
 
     span = (max_xy - min_xy).max().item()
-    if span < 1e-6: span = 1.0
-
+    if span < 1e-6:
+        span = 1.0
     s = scale / span
     x[..., :2] *= s
 
@@ -72,9 +80,7 @@ def tensor_to_pose(t, header):
     return Pose(header=header, body=body)
 
 
-# ============================================================
 # Main
-# ============================================================
 if __name__ == "__main__":
     pl.seed_everything(42)
 
