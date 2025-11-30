@@ -182,12 +182,9 @@ if __name__ == "__main__":
 
     # ============================================================
     # Inference
-    # ============================================================
-    model.eval()
     device = trainer.strategy.root_device
-
-    model.mean_pose = model.mean_pose.to(device)
-    model.std_pose  = model.std_pose.to(device)
+    model = model.to(device)
+    model.eval()
 
     with torch.no_grad():
         batch = next(iter(loader))
