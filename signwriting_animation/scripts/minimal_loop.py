@@ -194,7 +194,7 @@ if __name__ == "__main__":
         )
 
         pred = model.unnormalize(pred_norm)
-        gt_un = gt  # already unnormalized from dataloader
+        gt_un = model.unnormalize(gt)
 
         # ---------- Smooth ----------
         pred_s = temporal_smooth(pred)
