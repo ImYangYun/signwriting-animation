@@ -186,6 +186,9 @@ if __name__ == "__main__":
     model.eval()
     device = trainer.strategy.root_device
 
+    model.mean_pose = model.mean_pose.to(device)
+    model.std_pose  = model.std_pose.to(device)
+
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
