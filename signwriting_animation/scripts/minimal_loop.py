@@ -34,12 +34,7 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def recenter_for_view_178(x, header, scale=250.0, offset=(512.0, 384.0)):
-    """
-    对178 (reduce_holistic) 的可视化修正：
-    - 不做方向旋转（因为178没有身体点）
-    - 只做：上下翻转修正 + 居中 + 等比缩放 + 平移到画布中心
-    """
+def recenter_for_view(x, header, scale=250.0, offset=(512.0, 384.0)):
 
     if x.dim() == 4:
         x = x[0]              # [T,J,C]
@@ -47,21 +42,17 @@ def recenter_for_view_178(x, header, scale=250.0, offset=(512.0, 384.0)):
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    # =====(1) 使用 face 区域决定上下方向======
     face_start = len(header.components[0].points)          # 8
     face_end   = face_start + len(header.components[1].points)  # 8+128
     face_y = x[:, face_start:face_end, 1]
 
-    # 如果脸整体比手/pose还“向下”，就上下翻转
     if face_y.mean() > 0:
         x[...,1] = -x[...,1]
 
-    # =====(2) 中心化 torso+face（稳定）======
     all_xy = x[..., :2]
     center = all_xy.mean(dim=(0,1))
     x[..., :2] -= center
 
-    # =====(3) 按 bbox 做等比缩放（保证整体大小一致）=====
     min_xy = all_xy.view(-1,2).min(dim=0).values
     max_xy = all_xy.view(-1,2).max(dim=0).values
     span = (max_xy - min_xy).max().item()
