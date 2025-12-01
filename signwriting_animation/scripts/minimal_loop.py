@@ -34,39 +34,19 @@ def temporal_smooth(x, k=5):
     x = x.reshape(C, J, T).permute(2,1,0)
     return x.contiguous()
 
-def view_pose(x, scale=500.0):
-    if x.dim() == 4:
-        x = x[0]
-    y = x.clone()
-    y = torch.nan_to_num(y, nan=0.0)
+def view_pose(tensor, scale=50):
+    if tensor.dim() == 4:
+        tensor = tensor[0]    # [T,J,C]
 
-    center = y.mean(dim=1, keepdim=True)
-    y = y - center
+    center = tensor.mean(dim=1, keepdim=True)    # 以所有关节平均为中心
+    x = tensor - center
 
-    y[..., 1] = -y[..., 1]
+    x[..., 1] = -x[..., 1]    # Y 翻转以适配 poseviewer
+    x *= scale                # 简单缩放
+    x[..., 0] += 512          # 移到屏幕中心
+    x[..., 1] += 384
 
-    rad = math.radians(90)
-    R = torch.tensor([
-        [math.cos(rad), -math.sin(rad)],
-        [math.sin(rad),  math.cos(rad)],
-    ], dtype=y.dtype, device=y.device)
-    y_xy = y[..., :2]
-    y[..., :2] = torch.matmul(y_xy, R.T)
-
-    y[..., :2] *= scale
-
-    min_xy = y[..., :2].min(dim=1)[0].min(dim=0)[0]
-    max_xy = y[..., :2].max(dim=1)[0].max(dim=0)[0]
-    span = max_xy - min_xy
-    canvas_center_x = 600
-    canvas_center_y = 400
-    offset_x = canvas_center_x - span[0] / 2
-    offset_y = canvas_center_y - span[1] / 2
-
-    y[..., 0] += offset_x
-    y[..., 1] += offset_y
-
-    return y.contiguous()
+    return x
 
 
 
