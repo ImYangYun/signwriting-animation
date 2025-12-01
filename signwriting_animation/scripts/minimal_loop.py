@@ -44,33 +44,72 @@ def fix_pose_for_view(x):
 
     T, J, C = x.shape
 
-    # ---- Flip Y (sign.mt expects this) ----
+    # 1) Flip Y for sign.mt
     x[..., 1] = -x[..., 1]
 
-    # ==================================================
-    # 1) Use torso only (first 8 joints) for centering
-    # ==================================================
-    torso_joints = min(8, J)      # 178 joints: first 8 are POSE_LANDMARKS
-    torso_xy = x[:, :torso_joints, :2]  # [T,8,2]
-
-    torso_center = torso_xy.mean(dim=(0,1))
+    # ==========================================
+    # 2) Torso center (前 8 joints)
+    # ==========================================
+    torso_joints = min(8, J)
+    torso = x[:, :torso_joints, :2]
+    torso_center = torso.mean(dim=(0,1))
     x[..., :2] -= torso_center
 
-    # ==================================================
-    # 2) Fix Z explosion
-    # ==================================================
-    z = x[..., 2]
-    z_center = z.mean()
-    z = z - z_center
-    z = torch.clamp(z, -2.0, 2.0)
-    x[..., 2] = z
+    # ==========================================
+    # 3) Detect orientation & rotate to face front
+    # ==========================================
+    # In 178-joint reduced skeleton:
+    #   joint 11 = left shoulder
+    #   joint 12 = right shoulder
+    L = x[:, 11, :2].mean(0)
+    R = x[:, 12, :2].mean(0)
 
-    # ==================================================
-    # 3) Scale XY to make visualization reasonable
-    # ==================================================
-    x[..., :2] *= 400.0
+    dx = R[0] - L[0]
+    dy = R[1] - L[1]
+    angle = math.degrees(math.atan2(dy, dx))
+
+    # Current orientation → desired orientation:
+    # 正面时 dx > 0 且 dy ~ 0，angle ≈ 0°  
+    # 左侧面： angle ~ ±90°
+    # 背面： angle ≈ 180°
+
+    if angle > 45 and angle < 135:          # turned left 90°
+        rot = -90
+    elif angle < -45 and angle > -135:      # turned right 90°
+        rot = 90
+    elif abs(angle) > 135:                  # facing backward
+        rot = 180
+    else:
+        rot = 0
+
+    if rot != 0:
+        rad = rot * math.pi / 180.0
+        Rmat = torch.tensor([
+            [math.cos(rad), -math.sin(rad)],
+            [math.sin(rad),  math.cos(rad)]
+        ], dtype=x.dtype, device=x.device)
+        x[..., :2] = torch.matmul(x[..., :2], Rmat.T)
+
+    # ==========================================
+    # 4) Z axis fix
+    # ==========================================
+    z = x[..., 2]
+    z = z - z.mean()
+    x[..., 2] = torch.clamp(z, -2, 2)
+
+    # ==========================================
+    # 5) Scale XY
+    # ==========================================
+    x[..., :2] *= 350.0
+
+    # ==========================================
+    # 6) Move whole body slightly right (sign.mt center)
+    # ==========================================
+    x[..., 0] += 200   # move right
+    x[..., 1] += 150   # move down slightly (optional)
 
     return x.contiguous()
+
 
 
 def save_raw_pose(x, header, path):
