@@ -42,12 +42,24 @@ def fix_pose_for_view(x):
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
+    # ---- 1) Flip Y (MediaPipe -> sign.mt)
     x[..., 1] = -x[..., 1]
 
-    # --- 把整体缩小一点，避免被相机裁掉 ---
-    x = x * 100.0
+    # ---- 2) Compute center (using all joints + all frames)
+    center = x[..., :2].mean(dim=(0,1))  # shape (2,)
+
+    # ---- 3) Shift to center the body
+    x[..., :2] -= center
+
+    # ---- 4) Amplify XY so they fit sign.mt canvas
+    x[..., :2] *= 400.0     # try 400 first — not too small, not too crazy
+
+    # ---- 5) Move to screen center (sign.mt is roughly [-1000,1000])
+    x[..., 0] += 0      # not offset, center first
+    x[..., 1] += 0
 
     return x.contiguous()
+
 
 
 def save_raw_pose(x, header, path):
