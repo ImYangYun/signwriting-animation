@@ -34,12 +34,7 @@ def temporal_smooth(x, k=5):
     x = x.reshape(C, J, T).permute(2,1,0)
     return x.contiguous()
 
-
-def fix_pose_for_view(t_btjc, offset=(500,500)):
-    """
-    简单居中 + 翻转Y轴 + 平移
-    完全兼容178 joints，不依赖特定关节顺序
-    """
+def fix_pose_for_view(t_btjc, scale=200.0, offset=(500, 500)):
     if t_btjc.dim() == 4:
         t = t_btjc[0]   # [T,J,C]
     else:
@@ -48,14 +43,17 @@ def fix_pose_for_view(t_btjc, offset=(500,500)):
     x = t.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    # 居中 (over joints)
-    center = x.mean(dim=1, keepdim=True)  # [T,1,3]
+    # 1) 居中 (over joints)
+    center = x.mean(dim=1, keepdim=True)
     x = x - center
 
-    # 翻转 y，让 PoseViewer 正方向正确
+    # 2) 放大
+    x[..., :2] *= scale
+
+    # 3) 翻转 y
     x[..., 1] = -x[..., 1]
 
-    # 平移让骨架在画布中心
+    # 4) 平移到画布中点
     x[..., 0] += offset[0]
     x[..., 1] += offset[1]
 
