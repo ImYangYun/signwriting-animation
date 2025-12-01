@@ -104,17 +104,11 @@ class LitMinimal(pl.LightningModule):
     def bjct_to_btjc(x): return x.permute(0, 3, 1, 2).contiguous()
 
     def _forward_bjct(self, x_bjct, t_long, past_btjc, sign_img):
-        """包装一次 CAMDM 前向：x/past 都转为 BJCT 喂给 base model"""
         past_bjct = self.btjc_to_bjct(past_btjc)                # [B,J,C,Tp]
         out_bjct  = self.model.forward(x_bjct, t_long, past_bjct, sign_img)  # [B,J,C,T]
         return out_bjct
 
     def _diffuse_once(self, x0_btjc, t_long, cond):
-        """
-        单步前向：把 GT 的 x0 送入前向扩散得到 x_t，再用模型预测目标（x0 or eps）。
-        x0_btjc: [B,T,J,C] (已归一化)
-        返回: pred_bjct, target_bjct
-        """
         x0_bjct = self.btjc_to_bjct(x0_btjc)  # [B,J,C,T]
         noise   = torch.randn_like(x0_bjct)
         x_t     = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
@@ -290,6 +284,16 @@ class LitMinimal(pl.LightningModule):
 
         pred_norm = torch.cat(frames, dim=1)
         return pred_norm
+    
+    def on_train_start(self):
+        self.mean_pose = self.mean_pose.to(self.device)
+        self.std_pose  = self.std_pose.to(self.device)
+        print(f"[on_train_start] mean/std moved to {self.device}")
+
+    def on_predict_start(self):
+        self.mean_pose = self.mean_pose.to(self.device)
+        self.std_pose  = self.std_pose.to(self.device)
+        print(f"[on_predict_start] mean/std moved to {self.device}")
 
 
     def configure_optimizers(self):
