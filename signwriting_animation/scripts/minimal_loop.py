@@ -35,7 +35,7 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def simple_view_transform(t_btjc, offset=(500,500)):
+def fix_pose_for_view(t_btjc, offset=(500,500)):
     """
     简单居中 + 翻转Y轴 + 平移
     完全兼容178 joints，不依赖特定关节顺序
