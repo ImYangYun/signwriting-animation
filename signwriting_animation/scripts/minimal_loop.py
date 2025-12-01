@@ -35,50 +35,18 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def fix_pose_for_view(x, scale=250.0):
+def fix_pose_for_view(x):
     if x.dim() == 4:
         x = x[0]  # [T,J,C]
 
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    T, J, C = x.shape
-
-    x[..., :2] *= scale
-
-    torso_end = min(33, J)
-    torso_xy = x[:, :torso_end, :2]          # [T,33,2]
-    center = torso_xy.mean(dim=(0,1))        # (2,)
-    x[..., :2] -= center
-
-
-    left_shoulder  = x[:, 11, :2].mean(0)   # (2,)
-    right_shoulder = x[:, 12, :2].mean(0)   # (2,)
-
-    dx = right_shoulder[0] - left_shoulder[0]
-    dy = right_shoulder[1] - left_shoulder[1]
-
-    angle = math.degrees(math.atan2(dy, dx))
-
-    if angle > 45 and angle < 135:
-        rot = -90
-    elif angle < -45 and angle > -135:
-        rot = 90
-    elif abs(angle) > 135:
-        rot = 180
-    else:
-        rot = 0
-
-    if rot != 0:
-        rad = rot * math.pi / 180.0
-        R = torch.tensor([
-            [math.cos(rad), -math.sin(rad)],
-            [math.sin(rad),  math.cos(rad)],
-        ], dtype=x.dtype, device=x.device)
-        x[..., :2] = torch.matmul(x[..., :2], R.T)
-
-    x[..., 0] += 512    # 画布 x 偏移
-    x[..., 1] += 384    # 画布 y 偏移
+    x[..., 1] = -x[..., 1]
+    y = x[..., 1].clone()
+    z = x[..., 2].clone()
+    x[..., 1] = z
+    x[..., 2] = -y
 
     return x.contiguous()
 
