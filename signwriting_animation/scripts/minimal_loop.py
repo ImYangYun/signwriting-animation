@@ -35,98 +35,31 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def fix_pose_for_view(x):
-    if x.dim() == 4:
-        x = x[0]  # [T,J,C]
+def simple_view_transform(t_btjc, offset=(500,500)):
+    """
+    简单居中 + 翻转Y轴 + 平移
+    完全兼容178 joints，不依赖特定关节顺序
+    """
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]   # [T,J,C]
+    else:
+        t = t_btjc
 
-    x = x.clone()
+    x = t.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    T, J, C = x.shape
+    # 居中 (over joints)
+    center = x.mean(dim=1, keepdim=True)  # [T,1,3]
+    x = x - center
 
-    # 1) Flip Y for sign.mt
+    # 翻转 y，让 PoseViewer 正方向正确
     x[..., 1] = -x[..., 1]
 
-    # ==========================================
-    # 2) Torso center (前 8 joints)
-    # ==========================================
-    torso_joints = min(8, J)
-    torso = x[:, :torso_joints, :2]
-    torso_center = torso.mean(dim=(0,1))
-    x[..., :2] -= torso_center
-
-    # ==========================================
-    # 3) Detect orientation & rotate to face front
-    # ==========================================
-    # In 178-joint reduced skeleton:
-    #   joint 11 = left shoulder
-    #   joint 12 = right shoulder
-    L = x[:, 11, :2].mean(0)
-    R = x[:, 12, :2].mean(0)
-
-    dx = R[0] - L[0]
-    dy = R[1] - L[1]
-    angle = math.degrees(math.atan2(dy, dx))
-
-    # Current orientation → desired orientation:
-    # 正面时 dx > 0 且 dy ~ 0，angle ≈ 0°  
-    # 左侧面： angle ~ ±90°
-    # 背面： angle ≈ 180°
-
-    if angle > 45 and angle < 135:          # turned left 90°
-        rot = -90
-    elif angle < -45 and angle > -135:      # turned right 90°
-        rot = 90
-    elif abs(angle) > 135:                  # facing backward
-        rot = 180
-    else:
-        rot = 0
-
-    if rot != 0:
-        rad = rot * math.pi / 180.0
-        Rmat = torch.tensor([
-            [math.cos(rad), -math.sin(rad)],
-            [math.sin(rad),  math.cos(rad)]
-        ], dtype=x.dtype, device=x.device)
-        x[..., :2] = torch.matmul(x[..., :2], Rmat.T)
-
-    # ==========================================
-    # 4) Z axis fix
-    # ==========================================
-    z = x[..., 2]
-    z = z - z.mean()
-    x[..., 2] = torch.clamp(z, -2, 2)
-
-    # ==========================================
-    # 5) Scale XY
-    # ==========================================
-    x[..., :2] *= 350.0
-
-    # ==========================================
-    # 6) Move whole body slightly right (sign.mt center)
-    # ==========================================
-    x[..., 0] += 200   # move right
-    x[..., 1] += 150   # move down slightly (optional)
+    # 平移让骨架在画布中心
+    x[..., 0] += offset[0]
+    x[..., 1] += offset[1]
 
     return x.contiguous()
-
-
-
-def save_raw_pose(x, header, path):
-    if x.dim() == 4:
-        x = x[0]
-    from pose_format.numpy.pose_body import NumPyPoseBody
-    from pose_format import Pose
-    arr = x.detach().cpu().numpy()
-    arr = arr[:, None, :, :]  # (T,1,J,C)
-
-    conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
-    body = NumPyPoseBody(fps=25, data=arr.astype(np.float32), confidence=conf)
-    pose = Pose(header=header, body=body)
-
-    with open(path, "wb") as f:
-        pose.write(f)
-
 
 
 def tensor_to_pose(t_btjc, header):
