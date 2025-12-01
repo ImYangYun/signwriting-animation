@@ -34,30 +34,22 @@ def temporal_smooth(x, k=5):
     x = x.reshape(C, J, T).permute(2,1,0)
     return x.contiguous()
 
-def fix_pose_for_view(t_btjc, scale=200.0, offset=(500, 500)):
-    if t_btjc.dim() == 4:
-        t = t_btjc[0]   # [T,J,C]
-    else:
-        t = t_btjc
+def view_pose(x, scale=200.0, offset=(512, 384)):
+    if x.dim() == 4:
+        x = x[0]
 
-    x = t.clone()
-    x = torch.nan_to_num(x, nan=0.0)
+    y = x.clone()
+    y = torch.nan_to_num(y, nan=0.0)
 
-    # 1) 居中 (over joints)
-    center = x.mean(dim=1, keepdim=True)
-    x = x - center
+    center = y.mean(dim=1, keepdim=True)
+    y = y - center
 
-    # 2) 放大
-    x[..., :2] *= scale
+    y[..., :2] *= scale
+    y[..., 1] = -y[..., 1]
+    y[..., 0] += offset[0]
+    y[..., 1] += offset[1]
 
-    # 3) 翻转 y
-    x[..., 1] = -x[..., 1]
-
-    # 4) 平移到画布中点
-    x[..., 0] += offset[0]
-    x[..., 1] += offset[1]
-
-    return x.contiguous()
+    return y.contiguous()
 
 
 def tensor_to_pose(t_btjc, header):
@@ -184,8 +176,8 @@ if __name__ == "__main__":
         pred_s = temporal_smooth(pred)
         gt_s   = temporal_smooth(gt)
 
-        pred_f = fix_pose_for_view(pred_s)
-        gt_f   = fix_pose_for_view(gt_s)
+        pred_f = view_pose(pred_s)
+        gt_f   = view_pose(gt_s)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
