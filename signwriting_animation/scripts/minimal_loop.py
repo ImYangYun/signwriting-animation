@@ -217,8 +217,8 @@ if __name__ == "__main__":
 
     # also check reduced header joint counts
     print("[DEBUG] reduced header joint counts:",
-        [c.points for c in header.components],
-        "sum =", sum(c.points for c in header.components))
+        [len(c.points) for c in header.components],
+        "sum =", sum(len(c.points) for c in header.components))
     print("=====================================\n")
 
     # Inference
