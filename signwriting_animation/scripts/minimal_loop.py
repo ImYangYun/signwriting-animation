@@ -43,10 +43,9 @@ def fix_pose_for_view(x):
     x = torch.nan_to_num(x, nan=0.0)
 
     x[..., 1] = -x[..., 1]
-    y = x[..., 1].clone()
-    z = x[..., 2].clone()
-    x[..., 1] = z
-    x[..., 2] = -y
+
+    # --- 把整体缩小一点，避免被相机裁掉 ---
+    x = x * 100.0
 
     return x.contiguous()
 
