@@ -42,24 +42,35 @@ def fix_pose_for_view(x):
     x = x.clone()
     x = torch.nan_to_num(x, nan=0.0)
 
-    # ---- 1) Flip Y (MediaPipe -> sign.mt)
+    T, J, C = x.shape
+
+    # ---- Flip Y (sign.mt expects this) ----
     x[..., 1] = -x[..., 1]
 
-    # ---- 2) Compute center (using all joints + all frames)
-    center = x[..., :2].mean(dim=(0,1))  # shape (2,)
+    # ==================================================
+    # 1) Use torso only (first 8 joints) for centering
+    # ==================================================
+    torso_joints = min(8, J)      # 178 joints: first 8 are POSE_LANDMARKS
+    torso_xy = x[:, :torso_joints, :2]  # [T,8,2]
 
-    # ---- 3) Shift to center the body
-    x[..., :2] -= center
+    torso_center = torso_xy.mean(dim=(0,1))
+    x[..., :2] -= torso_center
 
-    # ---- 4) Amplify XY so they fit sign.mt canvas
-    x[..., :2] *= 400.0     # try 400 first — not too small, not too crazy
+    # ==================================================
+    # 2) Fix Z explosion
+    # ==================================================
+    z = x[..., 2]
+    z_center = z.mean()
+    z = z - z_center
+    z = torch.clamp(z, -2.0, 2.0)
+    x[..., 2] = z
 
-    # ---- 5) Move to screen center (sign.mt is roughly [-1000,1000])
-    x[..., 0] += 0      # not offset, center first
-    x[..., 1] += 0
+    # ==================================================
+    # 3) Scale XY to make visualization reasonable
+    # ==================================================
+    x[..., :2] *= 400.0
 
     return x.contiguous()
-
 
 
 def save_raw_pose(x, header, path):
