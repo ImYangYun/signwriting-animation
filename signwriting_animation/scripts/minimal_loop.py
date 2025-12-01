@@ -16,9 +16,7 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
 
 
-# ============================================================
 # Utility
-# ============================================================
 def _to_plain(x):
     if hasattr(x, "tensor"): x = x.tensor
     if hasattr(x, "zero_filled"): x = x.zero_filled()
@@ -34,16 +32,16 @@ def temporal_smooth(x, k=5):
     x = x.reshape(C, J, T).permute(2,1,0)
     return x.contiguous()
 
-def view_pose(tensor, scale=50):
+def view_pose(tensor, scale=300):
     if tensor.dim() == 4:
         tensor = tensor[0]    # [T,J,C]
 
-    center = tensor.mean(dim=1, keepdim=True)    # 以所有关节平均为中心
+    center = tensor.mean(dim=1, keepdim=True)
     x = tensor - center
 
-    x[..., 1] = -x[..., 1]    # Y 翻转以适配 poseviewer
-    x *= scale                # 简单缩放
-    x[..., 0] += 512          # 移到屏幕中心
+    x[..., 1] = -x[..., 1]
+    x *= scale
+    x[..., 0] += 512
     x[..., 1] += 384
 
     return x
