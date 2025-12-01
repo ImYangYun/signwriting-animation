@@ -184,9 +184,9 @@ if __name__ == "__main__":
     model.eval()
     device = trainer.strategy.root_device
 
-    pl_model = trainer.strategy.model
-    pl_model.mean_pose = pl_model.mean_pose.to(device)
-    pl_model.std_pose  = pl_model.std_pose.to(device)
+    model = model.to(device)
+    model.mean_pose = model.mean_pose.to(device)
+    model.std_pose  = model.std_pose.to(device)
 
     with torch.no_grad():
         batch = next(iter(loader))
@@ -200,15 +200,15 @@ if __name__ == "__main__":
         print("[SAMPLE] future_len =", future_len)
 
         # ---- 1) Sample normalized prediction ----
-        pred_norm = pl_model.sample_autoregressive_fast(
+        pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
             future_len=future_len,
             chunk=1,
         )
 
-        pred_real = pl_model.unnormalize(pred_norm)
-        gt_real   = pl_model.unnormalize(gt)
+        pred_real = model.unnormalize(pred_norm)
+        gt_real   = model.unnormalize(gt)
 
         pred_s = temporal_smooth(pred_real)
         gt_s   = temporal_smooth(gt_real)
