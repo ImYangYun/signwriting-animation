@@ -33,38 +33,18 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def visualize_pose(x, scale=300, offset=(500, 500), rotate=True):
-    """
-    Fixes orientation, centers, scales, flips Y for poseviewer.
-    x: [T, J, 3] tensor
-    """
+def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    if tensor.dim() == 5 and tensor.shape[2] == 1:
+        tensor = tensor.squeeze(2)
 
-    if hasattr(x, "tensor"):
-        x = x.tensor
-    if hasattr(x, "zero_filled"):
-        x = x.zero_filled()
-
-    if x.dim() == 5 and x.shape[2] == 1:
-        x = x.squeeze(2)
-    if x.dim() == 4:
-        x = x.mean(dim=0)
-
-    # rotate around z-axis
-    if rotate:
-        # rotation 90 degrees back to front
-        R = torch.tensor([
-            [0, -1, 0],
-            [1,  0, 0],
-            [0,  0, 1]
-        ], dtype=x.dtype, device=x.device)   # 90° rotation
-        x = torch.matmul(x, R)   # [T,J,3] * [3,3]
-
-    center = x.mean(dim=(0,1), keepdim=True)
+    x = tensor.clone().float()
+    center = x.mean(dim=1, keepdim=True)
     x = x - center
 
     x[..., 1] = -x[..., 1]
-
-    x = x * scale
+    x[..., :2] *= scale
     x[..., 0] += offset[0]
     x[..., 1] += offset[1]
 
@@ -195,8 +175,8 @@ if __name__ == "__main__":
         pred_s = temporal_smooth(pred)
         gt_s   = temporal_smooth(gt)
 
-        pred_f = visualize_pose(pred_s, scale=300, offset=(500,500))
-        gt_f   = visualize_pose(gt_s,  scale=300, offset=(500,500))
+        pred_f = visualize_pose(pred_s, scale=250, offset=(500,500))
+        gt_f   = visualize_pose(gt_s,  scale=250, offset=(500,500))
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
