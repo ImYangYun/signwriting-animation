@@ -199,21 +199,20 @@ if __name__ == "__main__":
         future_len = gt.size(1)
         print("[SAMPLE] future_len =", future_len)
 
-        pred_norm = model.sample_autoregressive_fast(
+        # ---- 1) Sample normalized prediction ----
+        pred_norm = pl_model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
             future_len=future_len,
             chunk=1,
         )
 
-        # --- Smooth normalized pose ---
-        pred_s = temporal_smooth(pred_norm)
-        gt_s   = temporal_smooth(gt)
+        pred_real = pl_model.unnormalize(pred_norm)
+        gt_real   = pl_model.unnormalize(gt)
 
-        save_raw_pose(gt_s,   header, "logs/minimal_178/gt_raw.pose")
-        save_raw_pose(pred_s, header, "logs/minimal_178/pred_raw.pose")
+        pred_s = temporal_smooth(pred_real)
+        gt_s   = temporal_smooth(gt_real)
 
-        # --- Fix for view (still normalized) ---
         pred_f = fix_pose_for_view(pred_s)
         gt_f   = fix_pose_for_view(gt_s)
 
@@ -221,8 +220,6 @@ if __name__ == "__main__":
         print("pred_f shape:", pred_f.shape)
         print("gt_f min/max:",   gt_f.min().item(),   gt_f.max().item())
         print("pred_f min/max:", pred_f.min().item(), pred_f.max().item())
-
-    # --- DO NOT unnormalize here !!! ---
 
     pose_gt = tensor_to_pose(gt_f, header)
     pose_pr = tensor_to_pose(pred_f, header)
