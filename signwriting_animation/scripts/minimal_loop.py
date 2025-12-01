@@ -209,6 +209,18 @@ if __name__ == "__main__":
     header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
     print("[HEADER] components:", [c.name for c in header.components])
 
+    # DEBUG: check mean/std order
+    # ==========================
+    stats = torch.load(stats_path)
+    print("\n[DEBUG] mean shape:", stats["mean"].shape)
+    print("[DEBUG] std shape :", stats["std"].shape)
+
+    # also check reduced header joint counts
+    print("[DEBUG] reduced header joint counts:",
+        [c.points for c in header.components],
+        "sum =", sum(c.points for c in header.components))
+    print("=====================================\n")
+
     # Inference
     model.eval()
     device = trainer.strategy.root_device
