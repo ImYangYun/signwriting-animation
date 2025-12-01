@@ -207,11 +207,10 @@ if __name__ == "__main__":
             chunk=1,
         )
 
-        pred_real = model.unnormalize(pred_norm)
-        gt_real   = model.unnormalize(gt)
+        pred = model.unnormalize(pred_norm)
 
-        pred_s = temporal_smooth(pred_real)
-        gt_s   = temporal_smooth(gt_real)
+        pred_s = temporal_smooth(pred)
+        gt_s   = temporal_smooth(gt)
 
         pred_f = fix_pose_for_view(pred_s)
         gt_f   = fix_pose_for_view(gt_s)
