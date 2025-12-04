@@ -59,9 +59,9 @@ def _btjc_to_tjc_list(x_btjc, mask_bt):
     mask_bt = (mask_bt > 0.5).float()
 
     seqs = []
-    for b in range(B):
+    for b in range(batch_size):
         t = int(mask_bt[b].sum().item())
-        t = max(0, min(t, T))
+        t = max(0, min(t, seq_len))
         seqs.append(x_btjc[b, :t].contiguous())
     return seqs
 
@@ -96,6 +96,7 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 
 #  --------------------- LitMinimal Model ---------------------
+# pylint: disable=too-many-instance-attributes,too-many-arguments,too-many-positional-arguments,too-many-locals
 
 class LitMinimal(pl.LightningModule):
     """
