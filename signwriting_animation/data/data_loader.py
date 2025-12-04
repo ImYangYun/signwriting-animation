@@ -1,10 +1,10 @@
 import os
+import math
 import random
 from typing import Literal, Optional
-
+import copy
 import pandas as pd
 import torch
-import copy
 from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
@@ -32,7 +32,6 @@ def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
 def _coalesce_maybe_nan(x) -> Optional[int]:
     """Return None if value is NaN/None/empty; else return the value."""
     try:
-        import math
         if x is None:
             return None
         # pandas may pass float('nan')
@@ -74,13 +73,14 @@ class DynamicPosePredictionDataset(Dataset):
         self.with_metadata = with_metadata
         self.reduce_holistic = reduce_holistic
 
+        self.mean_std = None
+
         df_records = pd.read_csv(csv_path)
         df_records = df_records[df_records["split"] == split].reset_index(drop=True)
         self.records = df_records.to_dict(orient="records")
 
         self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
 
-        # try import reduce_holistic lazily
         self._reduce_holistic_fn = None
         if self.reduce_holistic:
             try:
@@ -101,7 +101,7 @@ class DynamicPosePredictionDataset(Dataset):
 
         start = _coalesce_maybe_nan(rec.get("start"))
         end   = _coalesce_maybe_nan(rec.get("end"))
-        
+
         if not os.path.exists(pose_path):
             raise FileNotFoundError(f"[ERR] Pose file not found: {pose_path}")
 
@@ -119,7 +119,7 @@ class DynamicPosePredictionDataset(Dataset):
                 raw = self._reduce_holistic_fn(raw)
             except Exception:
                 pass
-        
+
         if hasattr(self, "mean_std") and self.mean_std is not None:
             pose = normalize_pose_with_global_stats(raw, self.mean_std)
         else:
