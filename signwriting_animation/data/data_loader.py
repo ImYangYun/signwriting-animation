@@ -81,9 +81,6 @@ class DynamicPosePredictionDataset(Dataset):
 
         self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
 
-        self._reduce_holistic_fn = None
-        if self.reduce_holistic:
-            raw = reduce_holistic(raw)
 
     def __len__(self):
         return len(self.records)
