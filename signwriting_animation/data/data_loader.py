@@ -83,11 +83,7 @@ class DynamicPosePredictionDataset(Dataset):
 
         self._reduce_holistic_fn = None
         if self.reduce_holistic:
-            try:
-                from pose_format.utils.generic import reduce_holistic as _rh
-                self._reduce_holistic_fn = _rh
-            except Exception:
-                self._reduce_holistic_fn = None
+            raw = reduce_holistic(raw)
 
     def __len__(self):
         return len(self.records)
