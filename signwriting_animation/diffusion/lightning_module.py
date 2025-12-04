@@ -1,3 +1,4 @@
+# pylint: disable=invalid-name,arguments-differ,too-many-locals,too-many-instance-attributes,too-many-arguments,too-many-positional-arguments
 import torch
 from torch import nn
 import numpy as np
@@ -95,7 +96,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 
 #  --------------------- LitMinimal Model ---------------------
-# pylint: disable=too-many-instance-attributes,too-many-arguments,too-many-positional-arguments,too-many-locals
 
 class LitMinimal(pl.LightningModule):
     """
@@ -325,7 +325,7 @@ class LitMinimal(pl.LightningModule):
             def __init__(self, mdl):
                 super().__init__()
                 self.m = mdl
-            def forward(self, x, t, **kw): 
+            def forward(self, x, t, **kw):
                 return self.m.interface(x, t, kw["y"])
 
         wrapped = _Wrapper(self.model)
