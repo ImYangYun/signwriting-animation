@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 import torch
-import math
 import numpy as np
 import lightning as pl
 from torch.utils.data import DataLoader
@@ -13,19 +12,25 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc
+from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
 
 
-# Utility
+
 def _to_plain(x):
-    if hasattr(x, "tensor"): x = x.tensor
-    if hasattr(x, "zero_filled"): x = x.zero_filled()
+    """Convert pose-format tensors to contiguous float32 CPU tensor."""
+    if hasattr(x, "tensor"):
+        x = x.tensor
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
     return x.detach().cpu().contiguous().float()
 
 
 def temporal_smooth(x, k=5):
+    """Simple temporal smoothing for visualization."""
     import torch.nn.functional as F
-    if x.dim() == 4: x = x[0]
+    if x.dim() == 4:
+        x = x[0]
+
     T, J, C = x.shape
     x = x.permute(2,1,0).reshape(1, C*J, T)
     x = F.avg_pool1d(x, kernel_size=k, stride=1, padding=k//2)
@@ -34,30 +39,29 @@ def temporal_smooth(x, k=5):
 
 
 def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
+    """Convert 3D pose → 2D viewer coordinates."""
     if tensor.dim() == 4:
         tensor = tensor[0]
-    if tensor.dim() == 5 and tensor.shape[2] == 1:
-        tensor = tensor.squeeze(2)
 
     x = tensor.clone().float()
     center = x.mean(dim=1, keepdim=True)
     x = x - center
 
-    x[..., 1] = -x[..., 1]
+    x[..., 1] = -x[..., 1]  # flip Y
     x[..., :2] *= scale
     x[..., 0] += offset[0]
     x[..., 1] += offset[1]
-
     return x.contiguous()
 
 
 def tensor_to_pose(t_btjc, header):
+    """Convert tensor → Pose-format object."""
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     elif t_btjc.dim() == 3:
         t = t_btjc
     else:
-        raise ValueError(f"unexpected shape {t_btjc.shape}")
+        raise ValueError
 
     print("[tensor_to_pose] final shape:", t.shape)
 
@@ -68,7 +72,6 @@ def tensor_to_pose(t_btjc, header):
     return Pose(header=header, body=body)
 
 
-# Main
 if __name__ == "__main__":
     pl.seed_everything(42)
 
@@ -79,7 +82,7 @@ if __name__ == "__main__":
 
     stats_path = f"{data_dir}/mean_std_178.pt"
 
-    # ---------------- Dataset ----------------
+    # Dataset + reduction (178 joints)
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -91,16 +94,20 @@ if __name__ == "__main__":
     )
     base_ds.mean_std = torch.load(stats_path)
 
-    small_ds = torch.utils.data.Subset(base_ds, [0,1,2,3])
-    loader = DataLoader(small_ds, batch_size=4, shuffle=True,
-                        collate_fn=zero_pad_collator)
+    small_ds = torch.utils.data.Subset(base_ds, [0, 1, 2, 3])
+    loader = DataLoader(
+        small_ds,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=zero_pad_collator,
+    )
 
     batch0 = next(iter(loader))
     num_joints = batch0["data"].shape[-2]
     num_dims   = batch0["data"].shape[-1]
     print(f"[INFO] joints={num_joints}, dims={num_dims}")
 
-    # ---------------- Model ----------------
+    # Model
     model = LitMinimal(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -121,32 +128,22 @@ if __name__ == "__main__":
     print("[TRAIN] Overfit 4 samples…")
     trainer.fit(model, loader, loader)
 
-    # Header from reference pose
+    # Load original header (reduced)
     ref_path = base_ds.records[0]["pose"]
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
-
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
     header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
+
     print("[HEADER] components:", [c.name for c in header.components])
 
-    # DEBUG: check mean/std order
-    # ==========================
-    stats = torch.load(stats_path)
-    print("\n[DEBUG] mean shape:", stats["mean"].shape)
-    print("[DEBUG] std shape :", stats["std"].shape)
-
-    # also check reduced header joint counts
-    print("[DEBUG] reduced header joint counts:",
-        [len(c.points) for c in header.components],
-        "sum =", sum(len(c.points) for c in header.components))
-    print("=====================================\n")
-
+    # ============================================================
     # Inference
+    # ============================================================
+
     model.eval()
     device = trainer.strategy.root_device
-
     model = model.to(device)
     model.mean_pose = model.mean_pose.to(device)
     model.std_pose  = model.std_pose.to(device)
@@ -162,7 +159,7 @@ if __name__ == "__main__":
         future_len = gt.size(1)
         print("[SAMPLE] future_len =", future_len)
 
-        # ---- 1) Sample normalized prediction ----
+        # 1. Generate normalized prediction
         pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -170,18 +167,30 @@ if __name__ == "__main__":
             chunk=1,
         )
 
+        # 2. unnormalize to BTJC
         pred = model.unnormalize(pred_norm)
 
-        pred_s = temporal_smooth(pred)
-        gt_s   = temporal_smooth(gt)
+        # 3. Smoothing (optional)
+        #pred_s = temporal_smooth(pred)
+        #gt_s   = temporal_smooth(gt)
 
-        pred_f = visualize_pose(pred_s, scale=250, offset=(500,500))
-        gt_f   = visualize_pose(gt_s,  scale=250, offset=(500,500))
+        # 4. Visualization transform
+        #pred_f = visualize_pose(pred_s, scale=250, offset=(500, 500))
+        #gt_f   = visualize_pose(gt_s,  scale=250, offset=(500, 500))
+        pred_f = pred
+        gt_f   = gt
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
-        print("gt_f min/max:",   gt_f.min().item(),   gt_f.max().item())
-        print("pred_f min/max:", pred_f.min().item(), pred_f.max().item())
+
+        # --- DTW evaluation ---
+        mask_bt = torch.ones(1, future_len, device=device)
+        dtw_val = masked_dtw(pred, gt, mask_bt)
+        print(f"[DTW] masked_dtw (unnormalized) = {dtw_val:.4f}")
+
+    # ============================================================
+    # Save .pose for viewer
+    # ============================================================
 
     pose_gt = tensor_to_pose(gt_f, header)
     pose_pr = tensor_to_pose(pred_f, header)
