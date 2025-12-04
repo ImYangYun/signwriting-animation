@@ -62,7 +62,7 @@ class DynamicPosePredictionDataset(Dataset):
         with_metadata: bool = True,
         clip_model_name: str = "openai/clip-vit-base-patch32",
         split: Literal["train", "dev", "test"] = "train",
-        reduce_holistic: bool = True,
+        use_reduce_holistic: bool = True,
     ):
         super().__init__()
         assert split in ["train", "dev", "test"]
@@ -71,7 +71,7 @@ class DynamicPosePredictionDataset(Dataset):
         self.num_past_frames = num_past_frames
         self.num_future_frames = num_future_frames
         self.with_metadata = with_metadata
-        self.reduce_holistic = reduce_holistic
+        self.use_reduce_holistic = use_reduce_holistic
 
         self.mean_std = None
 
@@ -107,7 +107,7 @@ class DynamicPosePredictionDataset(Dataset):
                   f"file={os.path.basename(pose_path)}")
             return self.__getitem__((idx + 1) % len(self.records))
 
-        if self.reduce_holistic:
+        if self.use_reduce_holistic:
             raw = reduce_holistic(raw)
 
         if hasattr(self, "mean_std") and self.mean_std is not None:
@@ -189,7 +189,7 @@ def main():
         num_future_frames=30,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,
+        use_reduce_holistic=True,
     )
     stats = torch.load("/data/yayun/pose_data/mean_std_586.pt")
     dataset.mean_std = stats
