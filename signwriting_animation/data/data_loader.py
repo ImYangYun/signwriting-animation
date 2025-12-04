@@ -31,14 +31,10 @@ def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
 
 def _coalesce_maybe_nan(x) -> Optional[int]:
     """Return None if value is NaN/None/empty; else return the value."""
-    try:
-        if x is None:
-            return None
-        # pandas may pass float('nan')
-        if isinstance(x, float) and math.isnan(x):
-            return None
-    except Exception:
-        pass
+    if x is None:
+        return None
+    if isinstance(x, float) and math.isnan(x):
+        return None
     return x
 
 
