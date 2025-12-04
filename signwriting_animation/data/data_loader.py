@@ -107,11 +107,8 @@ class DynamicPosePredictionDataset(Dataset):
                   f"file={os.path.basename(pose_path)}")
             return self.__getitem__((idx + 1) % len(self.records))
 
-        if self._reduce_holistic_fn is not None:
-            try:
-                raw = self._reduce_holistic_fn(raw)
-            except Exception:
-                pass
+        if self.reduce_holistic:
+            raw = reduce_holistic(raw)
 
         if hasattr(self, "mean_std") and self.mean_std is not None:
             pose = normalize_pose_with_global_stats(raw, self.mean_std)
