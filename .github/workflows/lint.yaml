@@ -3,7 +3,7 @@ name: Lint
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, real-data-test ]
   pull_request:
     branches: [ master, main ]
 
