@@ -52,7 +52,6 @@ def masked_mse(pred_btjc, tgt_btjc, mask_bt):
 def _btjc_to_tjc_list(x_btjc, mask_bt):
     """
     Convert batched sequence [B,T,J,C] into list of valid-length [T,J,C].
-    The most reliable version from your working PR.
     """
     x_btjc = sanitize_btjc(x_btjc)
     batch_size, seq_len, _, _ = x_btjc.shape
@@ -128,6 +127,10 @@ class LitMinimal(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.verbose = False
+
+        self.mean_pose = None
+        self.std_pose = None
+        self._std_calibrated = False
 
         # ---------------- Load global mean/std ----------------
         stats = torch.load(stats_path, map_location="cpu")
@@ -322,7 +325,6 @@ class LitMinimal(pl.LightningModule):
             def __init__(self, mdl):
                 super().__init__()
                 self.m = mdl
-
             def forward(self, x, t, **kw): 
                 return self.m.interface(x, t, kw["y"])
 
