@@ -133,19 +133,17 @@ class LitMinimal(pl.LightningModule):
         self._std_calibrated = False
 
         # ---------------- Load global mean/std ----------------
-        # ---------------- Load global mean/std ----------------
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std  = stats["std"].float().view(1, 1, -1, 3)
 
-        # These buffers must NOT be registered twice if Lightning rebuilds the model
-        if "mean_pose" not in self._buffers:
-            self.register_buffer("mean_pose", mean)
+        if not hasattr(self, "mean_pose") or "mean_pose" not in self._buffers:
+            self.register_buffer("mean_pose", mean.clone())
         else:
             self.mean_pose = self._buffers["mean_pose"]
 
-        if "std_pose" not in self._buffers:
-            self.register_buffer("std_pose", std)
+        if not hasattr(self, "std_pose") or "std_pose" not in self._buffers:
+            self.register_buffer("std_pose", std.clone())
         else:
             self.std_pose = self._buffers["std_pose"]
 
