@@ -137,15 +137,22 @@ class LitMinimal(pl.LightningModule):
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std  = stats["std"].float().view(1, 1, -1, 3)
 
-        if not hasattr(self, "mean_pose") or "mean_pose" not in self._buffers:
-            self.register_buffer("mean_pose", mean.clone())
-        else:
-            self.mean_pose = self._buffers["mean_pose"]
+        # mean_pose
+        if hasattr(self, "mean_pose"):
+            delattr(self, "mean_pose")
+        if "mean_pose" in self._buffers:
+            del self._buffers["mean_pose"]
 
-        if not hasattr(self, "std_pose") or "std_pose" not in self._buffers:
-            self.register_buffer("std_pose", std.clone())
-        else:
-            self.std_pose = self._buffers["std_pose"]
+        self.register_buffer("mean_pose", mean.clone())
+
+        # std_pose
+        if hasattr(self, "std_pose"):
+            delattr(self, "std_pose")
+        if "std_pose" in self._buffers:
+            del self._buffers["std_pose"]
+
+        self.register_buffer("std_pose", std.clone())
+
 
         # ---------------- Load SignWriting → Pose model ----------------
         self.model = SignWritingToPoseDiffusion(
