@@ -160,7 +160,10 @@ if __name__ == "__main__":
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
-    header = reduce_holistic(ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])).header
+    ref_p = ref_pose.clone()
+    ref_p = reduce_holistic(ref_p)
+    ref_p = ref_p.remove_components(["POSE_WORLD_LANDMARKS"])
+    header = ref_p.header
 
     print("[HEADER] components:", [c.name for c in header.components])
 
