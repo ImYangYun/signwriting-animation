@@ -14,6 +14,10 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
 
+# ----------- DEBUG: confirm which lightning_module is actually used -----------
+import signwriting_animation.diffusion.lightning_module as LM
+print(">>> USING LIGHTNING MODULE FROM:", LM.__file__)
+# -------------------------------------------------------------------------------
 
 
 def _to_plain(x):
