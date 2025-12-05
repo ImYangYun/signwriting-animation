@@ -159,8 +159,9 @@ if __name__ == "__main__":
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
+    # Correct reduce pipeline (IMPORTANT)
+    ref_p = Pose(header=ref_pose.header, body=ref_pose.body)  # clone safely
 
-    ref_p = ref_pose.clone()
     ref_p = reduce_holistic(ref_p)
     ref_p = ref_p.remove_components(["POSE_WORLD_LANDMARKS"])
     header = ref_p.header
