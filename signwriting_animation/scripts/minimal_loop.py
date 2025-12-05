@@ -225,6 +225,11 @@ if __name__ == "__main__":
         batch = next(iter(loader))
         cond  = batch["conditions"]
 
+        raw_gt = batch["data"][0, 0]   # shape [178, 3]
+        print("\n====== RAW GT FIRST FRAME (first 10 joints) ======")
+        print(raw_gt[:10])
+        print("=================================================\n")
+
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
         gt   = sanitize_btjc(batch["data"][:1]).to(device)
