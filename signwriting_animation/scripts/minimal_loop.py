@@ -57,27 +57,37 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     x[..., 1] += offset[1]
     return x.contiguous()
 
-def safe_for_view(x_btjc, scale=300.0, offset=(512.0, 384.0)):
+def safe_view_centered(x_btjc, scale=300.0, offset=(512.0, 384.0)):
     """
-    Only for visualization:
-    - clone original tensor
-    - uniform scaling
-    - translate to canvas center
-    - do NOT alter original GT or prediction used for evaluation
+    Visualization-only transform.
+    ✔ 不改变模型输入、训练、预测
+    ✔ 不做任何 axis flip
+    ✔ 不做任何坐标畸变
+    ✔ 只在画之前做：居中 + uniform scale + 平移
     """
+
+    # x_btjc: [B,T,J,C] or [T,J,C]
     if x_btjc.dim() == 4:
-        x = x_btjc[0].clone()    # [T,J,C]
+        x = x_btjc[0].clone()           # [T,J,C]
     else:
         x = x_btjc.clone()
 
-    # scale for canvas visibility
-    x[..., :2] = x[..., :2] * scale
+    # ---- ① 计算全局中心（非常重要）----
+    center = x.mean(dim=(0,1), keepdim=True)   # [1,1,C]
 
-    # translate to center of canvas
+    # ---- ② 把姿态整体移动到原点附近 ----
+    x = x - center
+
+    # ---- ③ uniform scale ----
+    x[..., :2] *= scale
+
+    # ---- ④ 平移到 canvas 中心 ----
     x[..., 0] += offset[0]
     x[..., 1] += offset[1]
 
-    return x.unsqueeze(0)         # return [1,T,J,C]
+    # Return back to [1,T,J,C]
+    return x.unsqueeze(0)
+
 
 def visualize_pose_with_projection(t_btjc, scale=300, offset=(512, 384)):
     """
@@ -264,8 +274,8 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        pred_f = visualize_pose_with_projection(pred)
-        gt_f   = visualize_pose_with_projection(gt)
+        pred_f = safe_view_centered(pred)
+        gt_f   = safe_view_centered(gt)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
