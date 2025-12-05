@@ -90,7 +90,6 @@ if __name__ == "__main__":
         num_future_frames=20,
         with_metadata=True,
         split="train",
-        reduce_holistic=True,
     )
     base_ds.mean_std = torch.load(stats_path)
 
