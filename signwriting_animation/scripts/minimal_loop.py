@@ -205,11 +205,8 @@ if __name__ == "__main__":
         #gt_s   = temporal_smooth(gt)
 
         # 4. Visualization transform
-        #pred_f = visualize_pose(pred_s, scale=250, offset=(500, 500))
-        #gt_f   = visualize_pose(gt_s,  scale=250, offset=(500, 500))
-        # Use safe visualization (no centering, no axis flip, no distortions)
-        pred_f = safe_for_view(pred)
-        gt_f   = safe_for_view(gt)
+        pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
+        gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
