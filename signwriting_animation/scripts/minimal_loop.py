@@ -225,10 +225,18 @@ if __name__ == "__main__":
         batch = next(iter(loader))
         cond  = batch["conditions"]
 
-        raw_gt = batch["data"][0, 0]   # shape [178, 3]
-        print("\n====== RAW GT FIRST FRAME (first 10 joints) ======")
-        print(raw_gt[:10])
-        print("=================================================\n")
+        raw_gt = batch["data"][0, 0]
+        print("\n====== RAW GT FIRST FRAME (MaskedTensor) ======")
+        print(type(raw_gt))
+
+        if hasattr(raw_gt, "zero_filled"):
+            dense = raw_gt.zero_filled()
+            print("dense[:10] =", dense[:10])
+            print("dense min/max =", dense.min(), dense.max())
+            print("dense shape =", dense.shape)
+        else:
+            print("raw_gt[:10] =", raw_gt[:10])
+
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
