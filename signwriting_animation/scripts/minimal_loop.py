@@ -57,6 +57,29 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     x[..., 1] += offset[1]
     return x.contiguous()
 
+def safe_for_view(x_btjc, scale=300.0, offset=(512.0, 384.0)):
+    """
+    Only for visualization:
+    - clone original tensor
+    - uniform scaling
+    - translate to canvas center
+    - do NOT alter original GT or prediction used for evaluation
+    """
+    if x_btjc.dim() == 4:
+        x = x_btjc[0].clone()    # [T,J,C]
+    else:
+        x = x_btjc.clone()
+
+    # scale for canvas visibility
+    x[..., :2] = x[..., :2] * scale
+
+    # translate to center of canvas
+    x[..., 0] += offset[0]
+    x[..., 1] += offset[1]
+
+    return x.unsqueeze(0)         # return [1,T,J,C]
+
+
 
 def tensor_to_pose(t_btjc, header):
     """Convert tensor → Pose-format object."""
@@ -180,8 +203,9 @@ if __name__ == "__main__":
         # 4. Visualization transform
         #pred_f = visualize_pose(pred_s, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt_s,  scale=250, offset=(500, 500))
-        pred_f = pred
-        gt_f   = gt
+        # Use safe visualization (no centering, no axis flip, no distortions)
+        pred_f = safe_for_view(pred)
+        gt_f   = safe_for_view(gt)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
