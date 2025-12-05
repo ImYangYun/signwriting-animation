@@ -75,7 +75,7 @@ def tensor_to_pose(t_btjc, header):
 if __name__ == "__main__":
     pl.seed_everything(42)
 
-    data_dir = "home/yayun/data/pose_data"
+    data_dir = "home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     out_dir = "logs/minimal_178"
     os.makedirs(out_dir, exist_ok=True)
