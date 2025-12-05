@@ -79,6 +79,49 @@ def safe_for_view(x_btjc, scale=300.0, offset=(512.0, 384.0)):
 
     return x.unsqueeze(0)         # return [1,T,J,C]
 
+def visualize_pose_with_projection(t_btjc, scale=300, offset=(512, 384)):
+    """
+    Project 3D MediaPipe coordinates into a stable 2D layout for visualization.
+    Avoids lying-down effect by using weak perspective projection.
+    """
+    if t_btjc.dim() == 4:
+        x = t_btjc[0].clone()   # [T,J,C]
+    else:
+        x = t_btjc.clone()
+
+    T, J, C = x.shape
+
+    # -------------- Weak Perspective Projection --------------
+    # shrink Z so far joints appear smaller forward/backward differences
+    z = x[..., 2].clone()
+
+    # optional: invert Z so forward becomes up
+    z = -z
+
+    # normalize Z influence
+    z = (z - z.mean()) / (z.std() + 1e-6)
+
+    # apply projection: X' = X + k * Z
+    k = 0.2
+    x2d_x = x[..., 0] + k * z
+    x2d_y = x[..., 1] + k * z
+
+    # -------------- Center body --------------
+    cx = x2d_x.mean()
+    cy = x2d_y.mean()
+
+    x2d_x = x2d_x - cx
+    x2d_y = x2d_y - cy
+
+    # -------------- Flip Y to match screen coords --------------
+    x2d_y = -x2d_y
+
+    # -------------- Scale and offset --------------
+    x2d_x = x2d_x * scale + offset[0]
+    x2d_y = x2d_y * scale + offset[1]
+
+    out = torch.stack([x2d_x, x2d_y, torch.zeros_like(x2d_x)], dim=-1)
+    return out.unsqueeze(0)  # [1,T,J,3]
 
 
 def tensor_to_pose(t_btjc, header):
@@ -205,8 +248,11 @@ if __name__ == "__main__":
         #gt_s   = temporal_smooth(gt)
 
         # 4. Visualization transform
-        pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
-        gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
+        #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
+        #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
+
+        pred_f = visualize_pose_with_projection(pred)
+        gt_f   = visualize_pose_with_projection(gt)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
