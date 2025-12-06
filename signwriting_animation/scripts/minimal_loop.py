@@ -80,44 +80,32 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
 
 
 def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
-    """
-    Convert BTJC pose into a coordinate system suitable for PoseViewer.
-
-    Fixes:
-    - person is centered
-    - vertical upright orientation
-    - correct facing direction
-    """
-
-    # ---- remove batch dim ----
     if btjc.dim() == 4:
-        x = btjc[0].clone()   # [T, J, C]
+        x = btjc[0].clone()
     else:
         x = btjc.clone()
 
-    # ========= 1. rotate around Z axis by +90 degrees =========
-    # Convert lying-down person → upright person
-    theta = np.pi / 2  # +90 degrees
+    # ---- 1. rotate +90 deg around Z ----
     R = torch.tensor([
         [0, -1, 0],
         [1,  0, 0],
         [0,  0, 1],
     ], dtype=x.dtype, device=x.device)
-
-    # apply rotation: [T,J,C] → [T,J,C]
     x = torch.matmul(x, R)
 
-    # ========= 2. center per frame =========
-    center = x.mean(dim=1, keepdim=True)
-    x = x - center
+    # ---- 2. remove Z component (fix flattening) ----
+    x[..., 2] = 0
 
-    # ========= 3. flip Y axis (viewer expects down-positive) =========
+    # ---- 3. center ----
+    x = x - x.mean(dim=1, keepdim=True)
+
+    # ---- 4. flip Y ----
     x[..., 1] = -x[..., 1]
 
-    # ========= 4. scale =========
+    # ---- 5. scale ----
     x[..., :2] *= scale
 
-    # ========= 5. shift to screen center =========
+    # ---- 6. shift to center ----
     x[..., 0] += w / 2
     x[..., 1] += h / 2
 
