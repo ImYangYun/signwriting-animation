@@ -42,72 +42,65 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def rotate_to_upright(x):
-    """
-    Rotate Mediapipe coordinates to an upright human orientation.
-    x: [1,T,J,3] or [T,J,3]
-    """
-
-    if x.dim() == 4:
-        x = x[0]   # remove batch
-
-    # rotation matrix: old(Z)->new(Y), old(Y)->new(-Z)
-    R = torch.tensor([
-        [1,  0,   0],   # X stays X
-        [0,  0,   1],   # new Y = old Z
-        [0, -1,   0],   # new Z = -old Y
-    ], dtype=torch.float32, device=x.device)
-
-    # apply rotation: [T,J,3] × [3,3] → [T,J,3]
-    x_rot = torch.einsum("tjc,dc->tjd", x, R)
-    return x_rot.unsqueeze(0)   # back to BTJC
-
-
-def visualize_pose_for_viewer(btjc, scale=1.0):
-    """
-    Convert pixel-space BTJC (T,J,3) → centered upright viewer coordinates.
-    This version is guaranteed to display correct human shape
-    for your 178-joint SignWriting dataset.
-    """
-
+def debug_and_visualize(btjc, name="pose"):
+    """诊断 + 可视化一体函数"""
     if btjc.dim() == 4:
-        x = btjc[0].clone()       # [T,J,C]
+        x = btjc[0].clone()
     else:
         x = btjc.clone()
-
+    
     T, J, C = x.shape
-
-    # -----------------------------------------
-    # 1. choose torso center (static) 
-    #    - use hips + shoulders
-    # -----------------------------------------
-    torso_ids = [11, 12, 23, 24]  # COCO-like torso (adapt as needed)
-    torso = x[:, torso_ids].mean(dim=1, keepdim=True)   # [T,1,3]
-    center = torso[0]   # only first frame
+    print(f"\n====== {name} 诊断 ======")
+    print(f"Shape: {x.shape}")
+    print(f"X range: [{x[...,0].min():.4f}, {x[...,0].max():.4f}]")
+    print(f"Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
+    print(f"Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
+    
+    # 检查是否所有点都在同一位置（导致只显示一个点）
+    x_std = x[0, :, 0].std()
+    y_std = x[0, :, 1].std()
+    print(f"First frame std: X={x_std:.6f}, Y={y_std:.6f}")
+    
+    if x_std < 0.01 and y_std < 0.01:
+        print("⚠️  警告：所有关键点几乎在同一位置！")
+    
+    # ===== 新的可视化策略 =====
+    # 1. 使用第一帧的所有点计算边界
+    x0 = x[0]  # [J, 3]
+    
+    # 2. 找到有效点（假设全0或NaN是无效的）
+    valid_mask = (x0.abs().sum(dim=-1) > 1e-6)
+    if valid_mask.sum() == 0:
+        print("⚠️  错误：没有有效的关键点！")
+        return x.unsqueeze(0)
+    
+    x_valid = x0[valid_mask]
+    print(f"有效关键点数: {valid_mask.sum()}/{J}")
+    
+    # 3. 中心化：使用有效点的中位数（比均值更稳健）
+    center = x_valid.median(dim=0)[0]  # [3]
     x = x - center
-
-    # -----------------------------------------
-    # 2. flip Y axis (viewer coordinate system)
-    # -----------------------------------------
-    x[...,1] = -x[...,1]
-
-    # -----------------------------------------
-    # 3. scale adaptively
-    # -----------------------------------------
-    xmax = x[0,:,0].abs().max()
-    ymax = x[0,:,1].abs().max()
-    base = max(xmax, ymax)
-    if base < 1: base = 1
-    x[..., :2] /= base
-    x[..., :2] *= 300     # fit into viewer
-
-    # -----------------------------------------
-    # 4. shift to screen center
-    # -----------------------------------------
-    x[...,0] += 512
-    x[...,1] += 384   
-    print("[VIS] using NEW viewer function")
-    return x.unsqueeze(0) 
+    
+    # 4. 翻转Y（如果需要）
+    x[..., 1] = -x[..., 1]
+    
+    # 5. 自适应缩放：基于有效点的90百分位距离
+    dist = torch.norm(x[0, valid_mask, :2], dim=-1)
+    scale_ref = torch.quantile(dist, 0.9)
+    if scale_ref < 1e-3:
+        scale_ref = 1.0
+    
+    scale_factor = 250 / scale_ref  # 让90%的点在250像素内
+    x[..., :2] *= scale_factor
+    
+    # 6. 平移到屏幕中心
+    x[..., 0] += 512
+    x[..., 1] += 384
+    
+    print(f"变换后 X range: [{x[...,0].min():.1f}, {x[...,0].max():.1f}]")
+    print(f"变换后 Y range: [{x[...,1].min():.1f}, {x[...,1].max():.1f}]")
+    
+    return x.unsqueeze(0)
 
 
 def tensor_to_pose(t_btjc, header):
@@ -263,8 +256,9 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        gt_f   = visualize_pose_for_viewer(gt)
-        pred_f = visualize_pose_for_viewer(pred)
+        # 替换你的可视化部分
+        gt_f   = debug_and_visualize(gt, "GT")
+        pred_f = debug_and_visualize(pred, "PRED")
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
