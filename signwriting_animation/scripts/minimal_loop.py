@@ -71,7 +71,6 @@ def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
 
     T, J, C = x.shape
 
-    # ====== 1. Rotate 90 deg around Z ======
     R = torch.tensor([
         [0, -1, 0],
         [1,  0, 0],
@@ -79,24 +78,20 @@ def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
     ], dtype=x.dtype, device=x.device)
     x = torch.matmul(x, R)
 
-    # ====== 2. Remove Z dimension (viewer doesn't use it) ======
     x[..., 2] = 0
 
-    # ====== 3. Use FIRST FRAME center only ======
-    first_center = x[0].mean(dim=0, keepdim=True)   # shape [1,3]
-    x = x - first_center   # apply same center to all frames
+    first_center = x[0].mean(dim=0, keepdim=True)   # [1,3]
+    x = x - first_center
 
-    # ====== 4. Flip Y axis ======
     x[..., 1] = -x[..., 1]
 
-    # ====== 5. Scale ======
     x[..., :2] *= scale
 
-    # ====== 6. Move to viewer center ======
     x[..., 0] += w / 2
     x[..., 1] += h / 2
-
-    return x.unsqueeze(0)
+    
+    print("[VIS] using NEW viewer function")
+    return x.unsqueeze(0) 
 
 
 def tensor_to_pose(t_btjc, header):
