@@ -42,6 +42,27 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
+def rotate_to_upright(x):
+    """
+    Rotate Mediapipe coordinates to an upright human orientation.
+    x: [1,T,J,3] or [T,J,3]
+    """
+
+    if x.dim() == 4:
+        x = x[0]   # remove batch
+
+    # rotation matrix: old(Z)->new(Y), old(Y)->new(-Z)
+    R = torch.tensor([
+        [1,  0,   0],   # X stays X
+        [0,  0,   1],   # new Y = old Z
+        [0, -1,   0],   # new Z = -old Y
+    ], dtype=torch.float32, device=x.device)
+
+    # apply rotation: [T,J,3] × [3,3] → [T,J,3]
+    x_rot = torch.einsum("tjc,dc->tjd", x, R)
+    return x_rot.unsqueeze(0)   # back to BTJC
+
+
 def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     """Convert 3D pose → 2D viewer coordinates."""
     if tensor.dim() == 4:
@@ -246,8 +267,11 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        pred_f = visualize_pose_for_viewer(pred)
-        gt_f   = visualize_pose_for_viewer(gt)
+        gt_u   = rotate_to_upright(gt)
+        pred_u = rotate_to_upright(pred)
+
+        gt_f   = visualize_pose_for_viewer(gt_u)
+        pred_f = visualize_pose_for_viewer(pred_u)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
