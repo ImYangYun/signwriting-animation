@@ -112,6 +112,11 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178.pt"
+    stats = torch.load(stats_path)
+    print("mean shape:", stats["mean"].shape)
+    print("std shape:", stats["std"].shape)
+    print("std min/max:", stats["std"].min(), stats["std"].max())
+
 
     # Dataset + reduction (178 joints)
     base_ds = DynamicPosePredictionDataset(
