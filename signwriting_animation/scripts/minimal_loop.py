@@ -142,7 +142,7 @@ if __name__ == "__main__":
 
     print("====== RAW DATA STATS ======")
     print("raw.min =", raw.min().item(), " raw.max =", raw.max().item())
-    print("raw[0, :10] =", raw[0, :10])   # 打印前 10 个关节
+    print("raw[0, :10] =", raw[0, :10])
     print("RAW shape:", raw.shape)
 
     num_joints = batch0["data"].shape[-2]
@@ -175,14 +175,13 @@ if __name__ == "__main__":
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
-    # Correct reduce pipeline (IMPORTANT)
-    ref_p = Pose(header=ref_pose.header, body=ref_pose.body)  # clone safely
 
-    ref_p = reduce_holistic(ref_p)
-    ref_p = ref_p.remove_components(["POSE_WORLD_LANDMARKS"])
-    header = ref_p.header
+    p = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+    p = reduce_holistic(p)
+    header = p.header
 
-    print("[HEADER] components:", [c.name for c in header.components])
+    print("[CHECK HEADER] components:", [c.name for c in header.components])
+    print("[CHECK HEADER] total joints:", header.total_points())
 
     # ============================================================
     # Inference
