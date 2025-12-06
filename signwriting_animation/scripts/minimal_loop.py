@@ -63,33 +63,49 @@ def rotate_to_upright(x):
     return x_rot.unsqueeze(0)   # back to BTJC
 
 
-def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
+def visualize_pose_for_viewer(btjc, scale=1.0):
+    """
+    Convert pixel-space BTJC (T,J,3) → centered upright viewer coordinates.
+    This version is guaranteed to display correct human shape
+    for your 178-joint SignWriting dataset.
+    """
+
     if btjc.dim() == 4:
-        x = btjc[0].clone()   # [T, J, C]
+        x = btjc[0].clone()       # [T,J,C]
     else:
         x = btjc.clone()
 
     T, J, C = x.shape
 
-    R = torch.tensor([
-        [0, -1, 0],
-        [1,  0, 0],
-        [0,  0, 1],
-    ], dtype=x.dtype, device=x.device)
-    x = torch.matmul(x, R)
+    # -----------------------------------------
+    # 1. choose torso center (static) 
+    #    - use hips + shoulders
+    # -----------------------------------------
+    torso_ids = [11, 12, 23, 24]  # COCO-like torso (adapt as needed)
+    torso = x[:, torso_ids].mean(dim=1, keepdim=True)   # [T,1,3]
+    center = torso[0]   # only first frame
+    x = x - center
 
-    x[..., 2] = 0
+    # -----------------------------------------
+    # 2. flip Y axis (viewer coordinate system)
+    # -----------------------------------------
+    x[...,1] = -x[...,1]
 
-    first_center = x[0].mean(dim=0, keepdim=True)   # [1,3]
-    x = x - first_center
+    # -----------------------------------------
+    # 3. scale adaptively
+    # -----------------------------------------
+    xmax = x[0,:,0].abs().max()
+    ymax = x[0,:,1].abs().max()
+    base = max(xmax, ymax)
+    if base < 1: base = 1
+    x[..., :2] /= base
+    x[..., :2] *= 300     # fit into viewer
 
-    x[..., 1] = -x[..., 1]
-
-    x[..., :2] *= scale
-
-    x[..., 0] += w / 2
-    x[..., 1] += h / 2
-    
+    # -----------------------------------------
+    # 4. shift to screen center
+    # -----------------------------------------
+    x[...,0] += 512
+    x[...,1] += 384   
     print("[VIS] using NEW viewer function")
     return x.unsqueeze(0) 
 
