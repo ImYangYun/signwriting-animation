@@ -58,30 +58,31 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     return x.contiguous()
 
 
-def visualize_pose_for_viewer(x_btjc):
+def visualize_pose_for_viewer(x_btjc, scale=320.0, w=1024, h=768):
     """
-    Convert 3D normalized coordinates into 2D viewer-friendly coordinates.
+    Fully correct the coordinate system so PoseViewer shows a standing human.
+    This matches the version you previously used when GT looked correct.
     """
-    if x_btjc.dim() == 4:  
+    if x_btjc.dim() == 4:
         x = x_btjc[0].clone()   # [T,J,C]
     else:
         x = x_btjc.clone()
 
-    # 1) center around torso or mean
+    # 1. center per-frame so the person stands in the middle
     center = x.mean(dim=1, keepdim=True)
     x = x - center
 
-    # 2) flip Y axis (PoseViewer expects image coords)
+    # 2. flip Y axis — PoseViewer expects 2D image coordinates
     x[..., 1] = -x[..., 1]
 
-    # 3) scale up so viewer can see clearly
-    x[..., :2] *= 300.0   # try 200–400
+    # 3. scale up normalized coordinates ([-0.3,0.3]) → pixel space
+    x[..., :2] *= scale
 
-    # 4) move to center of canvas
-    x[..., 0] += 512
-    x[..., 1] += 384
+    # 4. move to screen center
+    x[..., 0] += w / 2
+    x[..., 1] += h / 2
 
-    return x.unsqueeze(0)   # [1,T,J,C]
+    return x.unsqueeze(0)   # return [1,T,J,C]
 
 
 def tensor_to_pose(t_btjc, header):
