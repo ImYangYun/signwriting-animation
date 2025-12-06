@@ -63,29 +63,15 @@ def rotate_to_upright(x):
     return x_rot.unsqueeze(0)   # back to BTJC
 
 
-def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
-    """Convert 3D pose → 2D viewer coordinates."""
-    if tensor.dim() == 4:
-        tensor = tensor[0]
-
-    x = tensor.clone().float()
-    center = x.mean(dim=1, keepdim=True)
-    x = x - center
-
-    x[..., 1] = -x[..., 1]  # flip Y
-    x[..., :2] *= scale
-    x[..., 0] += offset[0]
-    x[..., 1] += offset[1]
-    return x.contiguous()
-
-
 def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
     if btjc.dim() == 4:
-        x = btjc[0].clone()
+        x = btjc[0].clone()   # [T, J, C]
     else:
         x = btjc.clone()
 
-    # ---- 1. rotate +90 deg around Z ----
+    T, J, C = x.shape
+
+    # ====== 1. Rotate 90 deg around Z ======
     R = torch.tensor([
         [0, -1, 0],
         [1,  0, 0],
@@ -93,19 +79,20 @@ def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
     ], dtype=x.dtype, device=x.device)
     x = torch.matmul(x, R)
 
-    # ---- 2. remove Z component (fix flattening) ----
+    # ====== 2. Remove Z dimension (viewer doesn't use it) ======
     x[..., 2] = 0
 
-    # ---- 3. center ----
-    x = x - x.mean(dim=1, keepdim=True)
+    # ====== 3. Use FIRST FRAME center only ======
+    first_center = x[0].mean(dim=0, keepdim=True)   # shape [1,3]
+    x = x - first_center   # apply same center to all frames
 
-    # ---- 4. flip Y ----
+    # ====== 4. Flip Y axis ======
     x[..., 1] = -x[..., 1]
 
-    # ---- 5. scale ----
+    # ====== 5. Scale ======
     x[..., :2] *= scale
 
-    # ---- 6. shift to center ----
+    # ====== 6. Move to viewer center ======
     x[..., 0] += w / 2
     x[..., 1] += h / 2
 
