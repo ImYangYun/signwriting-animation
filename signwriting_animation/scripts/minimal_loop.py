@@ -133,6 +133,13 @@ if __name__ == "__main__":
     )
 
     batch0 = next(iter(loader))
+    raw = sanitize_btjc(batch0["data"][0:1]).clone().cpu()
+
+    print("====== RAW DATA STATS ======")
+    print("raw.min =", raw.min().item(), " raw.max =", raw.max().item())
+    print("raw[0, :10] =", raw[0, :10])   # 打印前 10 个关节
+    print("RAW shape:", raw.shape)
+
     num_joints = batch0["data"].shape[-2]
     num_dims   = batch0["data"].shape[-1]
     print(f"[INFO] joints={num_joints}, dims={num_dims}")
