@@ -58,31 +58,38 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     return x.contiguous()
 
 
-def visualize_pose_for_viewer(x_btjc, scale=320.0, w=1024, h=768):
+def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
     """
-    Convert BTJC pose tensor into PoseViewer’s expected 2D coordinate system.
-    This is the version you previously used when GT looked correct.
+    Convert 3D BTJC → PoseViewer coordinate space.
+    Ensures:
+      - person centered
+      - vertical upright
+      - no flipping
     """
-    if x_btjc.dim() == 4:
-        x = x_btjc[0].clone()   # [T,J,C]
-    else:
-        x = x_btjc.clone()
 
-    # 1. center body per frame
-    center = x.mean(dim=1, keepdim=True)
+    # Remove batch dimension
+    if btjc.dim() == 4:
+        x = btjc[0].clone()       # [T, J, C]
+    else:
+        x = btjc.clone()
+
+    T, J, C = x.shape
+
+    # -------- 1. center each frame so person is in the middle --------
+    center = x.mean(dim=1, keepdim=True)   # [T,1,3]
     x = x - center
 
-    # 2. flip Y axis — viewer coordinate system
+    # -------- 2. flip Y axis (PoseViewer expects image coords) -------
     x[..., 1] = -x[..., 1]
 
-    # 3. scale to pixel space
+    # -------- 3. scale up for visibility -----------------------------
     x[..., :2] *= scale
 
-    # 4. shift to center of canvas
+    # -------- 4. shift person to center of screen --------------------
     x[..., 0] += w / 2
     x[..., 1] += h / 2
 
-    return x.unsqueeze(0)   # [1,T,J,C]
+    return x.unsqueeze(0)   # back to [1, T, J, C]
 
 
 
