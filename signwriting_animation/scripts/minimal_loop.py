@@ -79,55 +79,49 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     return x.contiguous()
 
 
-def visualize_pose_for_viewer(btjc, w=1024, h=768):
+def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
     """
-    Convert BTJC → PoseViewer coordinates.
-    Specifically adapted for *upper-body-only skeletons* (178 joints).
-    
+    Convert BTJC pose into a coordinate system suitable for PoseViewer.
+
     Fixes:
-      ✓ wrong centering (use shoulders instead of mean)
-      ✓ auto-scaling to prevent thin/tall stretching
-      ✓ correct Y flip for viewer
+    - person is centered
+    - vertical upright orientation
+    - correct facing direction
     """
 
-    # Remove batch dimension
+    # ---- remove batch dim ----
     if btjc.dim() == 4:
-        x = btjc[0].clone()     # [T, J, C]
+        x = btjc[0].clone()   # [T, J, C]
     else:
         x = btjc.clone()
 
-    T, J, C = x.shape
+    # ========= 1. rotate around Z axis by +90 degrees =========
+    # Convert lying-down person → upright person
+    theta = np.pi / 2  # +90 degrees
+    R = torch.tensor([
+        [0, -1, 0],
+        [1,  0, 0],
+        [0,  0, 1],
+    ], dtype=x.dtype, device=x.device)
 
-    # ---- 1. Anchor using shoulders (index 11 & 12 are standard Mediapipe) ----
-    # If your dataset uses different indices, tell me & I’ll adapt.
-    left_shoulder  = x[:, 11]     # [T, 3]
-    right_shoulder = x[:, 12]
-    center = (left_shoulder + right_shoulder) / 2.0   # [T, 3]
-    center = center[:, None, :]                        # [T,1,3]
+    # apply rotation: [T,J,C] → [T,J,C]
+    x = torch.matmul(x, R)
 
+    # ========= 2. center per frame =========
+    center = x.mean(dim=1, keepdim=True)
     x = x - center
 
-    # ---- 2. Flip Y axis for viewer ----
+    # ========= 3. flip Y axis (viewer expects down-positive) =========
     x[..., 1] = -x[..., 1]
 
-    # ---- 3. Auto-scale based on Y range (upper body is tall vertically) ----
-    y_min = x[..., 1].min()
-    y_max = x[..., 1].max()
-    y_range = (y_max - y_min).item()
-
-    # Avoid div-by-zero
-    if y_range < 1e-6:
-        scale = 300.0
-    else:
-        scale = 350.0 / y_range   # normalize height to ~350px
-
+    # ========= 4. scale =========
     x[..., :2] *= scale
 
-    # ---- 4. Center to screen ----
+    # ========= 5. shift to screen center =========
     x[..., 0] += w / 2
     x[..., 1] += h / 2
 
-    return x.unsqueeze(0)   # [1, T, J, C]
+    return x.unsqueeze(0)
 
 
 def tensor_to_pose(t_btjc, header):
