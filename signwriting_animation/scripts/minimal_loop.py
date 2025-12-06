@@ -79,39 +79,55 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     return x.contiguous()
 
 
-def visualize_pose_for_viewer(btjc, scale=200.0, w=1024, h=768):
+def visualize_pose_for_viewer(btjc, w=1024, h=768):
     """
-    Convert 3D BTJC → PoseViewer coordinate space.
-    Ensures:
-      - person centered
-      - vertical upright
-      - no flipping
+    Convert BTJC → PoseViewer coordinates.
+    Specifically adapted for *upper-body-only skeletons* (178 joints).
+    
+    Fixes:
+      ✓ wrong centering (use shoulders instead of mean)
+      ✓ auto-scaling to prevent thin/tall stretching
+      ✓ correct Y flip for viewer
     """
 
     # Remove batch dimension
     if btjc.dim() == 4:
-        x = btjc[0].clone()       # [T, J, C]
+        x = btjc[0].clone()     # [T, J, C]
     else:
         x = btjc.clone()
 
     T, J, C = x.shape
 
-    # -------- 1. center each frame so person is in the middle --------
-    center = x.mean(dim=1, keepdim=True)   # [T,1,3]
+    # ---- 1. Anchor using shoulders (index 11 & 12 are standard Mediapipe) ----
+    # If your dataset uses different indices, tell me & I’ll adapt.
+    left_shoulder  = x[:, 11]     # [T, 3]
+    right_shoulder = x[:, 12]
+    center = (left_shoulder + right_shoulder) / 2.0   # [T, 3]
+    center = center[:, None, :]                        # [T,1,3]
+
     x = x - center
 
-    # -------- 2. flip Y axis (PoseViewer expects image coords) -------
+    # ---- 2. Flip Y axis for viewer ----
     x[..., 1] = -x[..., 1]
 
-    # -------- 3. scale up for visibility -----------------------------
+    # ---- 3. Auto-scale based on Y range (upper body is tall vertically) ----
+    y_min = x[..., 1].min()
+    y_max = x[..., 1].max()
+    y_range = (y_max - y_min).item()
+
+    # Avoid div-by-zero
+    if y_range < 1e-6:
+        scale = 300.0
+    else:
+        scale = 350.0 / y_range   # normalize height to ~350px
+
     x[..., :2] *= scale
 
-    # -------- 4. shift person to center of screen --------------------
+    # ---- 4. Center to screen ----
     x[..., 0] += w / 2
     x[..., 1] += h / 2
 
-    return x.unsqueeze(0)   # back to [1, T, J, C]
-
+    return x.unsqueeze(0)   # [1, T, J, C]
 
 
 def tensor_to_pose(t_btjc, header):
@@ -267,11 +283,8 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        gt_u   = rotate_to_upright(gt)
-        pred_u = rotate_to_upright(pred)
-
-        gt_f   = visualize_pose_for_viewer(gt_u)
-        pred_f = visualize_pose_for_viewer(pred_u)
+        gt_f   = visualize_pose_for_viewer(gt)
+        pred_f = visualize_pose_for_viewer(pred)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
