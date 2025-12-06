@@ -57,81 +57,31 @@ def visualize_pose(tensor, scale=250.0, offset=(512, 384)):
     x[..., 1] += offset[1]
     return x.contiguous()
 
-def safe_view_centered(x_btjc, scale=300.0, offset=(512.0, 384.0)):
-    """
-    Visualization-only transform.
-    ✔ 不改变模型输入、训练、预测
-    ✔ 不做任何 axis flip
-    ✔ 不做任何坐标畸变
-    ✔ 只在画之前做：居中 + uniform scale + 平移
-    """
 
-    # x_btjc: [B,T,J,C] or [T,J,C]
-    if x_btjc.dim() == 4:
-        x = x_btjc[0].clone()           # [T,J,C]
+def visualize_pose_for_viewer(x_btjc):
+    """
+    Convert 3D normalized coordinates into 2D viewer-friendly coordinates.
+    """
+    if x_btjc.dim() == 4:  
+        x = x_btjc[0].clone()   # [T,J,C]
     else:
         x = x_btjc.clone()
 
-    # ---- ① 计算全局中心（非常重要）----
-    center = x.mean(dim=(0,1), keepdim=True)   # [1,1,C]
-
-    # ---- ② 把姿态整体移动到原点附近 ----
+    # 1) center around torso or mean
+    center = x.mean(dim=1, keepdim=True)
     x = x - center
 
-    # ---- ③ uniform scale ----
-    x[..., :2] *= scale
+    # 2) flip Y axis (PoseViewer expects image coords)
+    x[..., 1] = -x[..., 1]
 
-    # ---- ④ 平移到 canvas 中心 ----
-    x[..., 0] += offset[0]
-    x[..., 1] += offset[1]
+    # 3) scale up so viewer can see clearly
+    x[..., :2] *= 300.0   # try 200–400
 
-    # Return back to [1,T,J,C]
-    return x.unsqueeze(0)
+    # 4) move to center of canvas
+    x[..., 0] += 512
+    x[..., 1] += 384
 
-
-def visualize_pose_with_projection(t_btjc, scale=300, offset=(512, 384)):
-    """
-    Project 3D MediaPipe coordinates into a stable 2D layout for visualization.
-    Avoids lying-down effect by using weak perspective projection.
-    """
-    if t_btjc.dim() == 4:
-        x = t_btjc[0].clone()   # [T,J,C]
-    else:
-        x = t_btjc.clone()
-
-    T, J, C = x.shape
-
-    # -------------- Weak Perspective Projection --------------
-    # shrink Z so far joints appear smaller forward/backward differences
-    z = x[..., 2].clone()
-
-    # optional: invert Z so forward becomes up
-    z = -z
-
-    # normalize Z influence
-    z = (z - z.mean()) / (z.std() + 1e-6)
-
-    # apply projection: X' = X + k * Z
-    k = 0.2
-    x2d_x = x[..., 0] + k * z
-    x2d_y = x[..., 1] + k * z
-
-    # -------------- Center body --------------
-    cx = x2d_x.mean()
-    cy = x2d_y.mean()
-
-    x2d_x = x2d_x - cx
-    x2d_y = x2d_y - cy
-
-    # -------------- Flip Y to match screen coords --------------
-    x2d_y = -x2d_y
-
-    # -------------- Scale and offset --------------
-    x2d_x = x2d_x * scale + offset[0]
-    x2d_y = x2d_y * scale + offset[1]
-
-    out = torch.stack([x2d_x, x2d_y, torch.zeros_like(x2d_x)], dim=-1)
-    return out.unsqueeze(0)  # [1,T,J,3]
+    return x.unsqueeze(0)   # [1,T,J,C]
 
 
 def tensor_to_pose(t_btjc, header):
@@ -274,8 +224,8 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        pred_f = safe_view_centered(pred)
-        gt_f   = safe_view_centered(gt)
+        pred_f = visualize_pose_for_viewer(pred)
+        gt_f   = visualize_pose_for_viewer(gt)
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
