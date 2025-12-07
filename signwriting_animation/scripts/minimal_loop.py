@@ -543,6 +543,18 @@ if __name__ == "__main__":
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
+    original_reduced = reduce_holistic(ref_pose)
+    original_reduced = original_reduced.remove_components(["POSE_WORLD_LANDMARKS"])
+
+    # 保存这个原始 pose
+    out_original = os.path.join(out_dir, "original_ref.pose")
+    if os.path.exists(out_original):
+        os.remove(out_original)
+    with open(out_original, "wb") as f:
+        original_reduced.write(f)
+
+    print("[TEST] 保存了原始参考 pose 到 original_ref.pose")
+    print("      请先在 viewer 中打开这个文件，确认它显示是否正常")
     # ---- correct sequence ----
     ref_p = reduce_holistic(ref_pose)
     ref_p = ref_p.remove_components(["POSE_WORLD_LANDMARKS"])
