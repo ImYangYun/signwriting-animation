@@ -45,14 +45,14 @@ def temporal_smooth(x, k=5):
 
 import torch
 
-def visualize_yz_plane(btjc, name="pose"):
+def visualize_xy_plane_fixed(btjc, name="pose"):
     """
-    使用 YZ 平面进行可视化（适用于你的数据）
+    使用 XY 平面，但修正 Z 轴的异常缩放
     
-    坐标映射：
-    - 原始 Y → 显示 X (水平方向)
-    - 原始 Z → 显示 Y (垂直方向)
-    - 原始 X → 深度 (忽略)
+    根据诊断结果：
+    - 肩宽主要在 XY 平面（0.08 单位）
+    - 但脖子的 Z 分量异常大（1.7 单位）
+    - 需要将 Z 轴缩小约 10 倍来匹配 XY 平面的尺度
     """
     if btjc.dim() == 4:
         x = btjc[0].clone()  # [T, J, 3]
@@ -60,32 +60,62 @@ def visualize_yz_plane(btjc, name="pose"):
         x = btjc.clone()
     
     T, J, C = x.shape
-    print(f"\n====== {name} 可视化 (YZ平面) ======")
+    print(f"\n====== {name} 可视化 (XY平面, Z轴修正) ======")
     print(f"原始 shape: {x.shape}")
+    print(f"原始 X range: [{x[...,0].min():.4f}, {x[...,0].max():.4f}]")
     print(f"原始 Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
     print(f"原始 Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
     
-    # 1. 提取 YZ 平面
-    yz = x[..., 1:3].clone()  # [T, J, 2] - 取 Y 和 Z
+    # ===============================================
+    # 关键修复：将 Z 轴缩放到与 XY 相同的尺度
+    # ===============================================
+    # 根据诊断：肩宽在 XY 平面约 0.08，在 Z 轴约 0.15
+    # 但脖子在 Z 轴是 1.7，在 XY 平面是 0.28
+    # Z 轴被拉伸了约 6 倍
+    
+    # 计算 XY 和 Z 的尺度比例
+    xy_std = x[0, :, :2].std()
+    z_std = x[0, :, 2].std()
+    
+    if z_std > 1e-6:
+        z_scale_factor = xy_std / z_std
+    else:
+        z_scale_factor = 1.0
+    
+    print(f"XY std: {xy_std:.4f}, Z std: {z_std:.4f}")
+    print(f"Z轴缩放因子: {z_scale_factor:.4f}")
+    
+    # 应用 Z 轴缩放
+    x_corrected = x.clone()
+    x_corrected[..., 2] = x_corrected[..., 2] * z_scale_factor
+    
+    print(f"修正后 Z range: [{x_corrected[...,2].min():.4f}, {x_corrected[...,2].max():.4f}]")
+    
+    # ===============================================
+    # 现在使用修正后的数据进行 XY 平面可视化
+    # ===============================================
+    
+    # 1. 提取 XY 平面
+    xy = x_corrected[..., :2].clone()  # [T, J, 2]
     
     # 2. 找到有效点
-    valid_mask = (yz[0].abs().sum(dim=-1) > 1e-6)
+    valid_mask = (xy[0].abs().sum(dim=-1) > 1e-6)
     print(f"有效关键点: {valid_mask.sum()}/{J}")
     
     if valid_mask.sum() == 0:
         print("⚠️ 没有有效点")
         result = torch.zeros_like(x)
-        result[..., :2] = yz
+        result[..., :2] = xy
         return result.unsqueeze(0)
     
-    # 3. 中心化（使用有效点的均值）
-    yz_valid = yz[0, valid_mask]
-    center = yz_valid.mean(dim=0)  # [2]
-    yz = yz - center
-    print(f"中心点 (YZ): [{center[0]:.4f}, {center[1]:.4f}]")
+    # 3. 中心化
+    xy_valid = xy[0, valid_mask]
+    center = xy_valid.mean(dim=0)  # [2]
+    xy = xy - center
+    print(f"中心点 (XY): [{center[0]:.4f}, {center[1]:.4f}]")
     
     # 4. 计算缩放因子
-    dist = torch.norm(yz[0, valid_mask], dim=-1)
+    dist = torch.norm(xy[0, valid_mask], dim=-1)
     k = max(1, int(len(dist) * 0.95))
     scale_ref = torch.topk(dist, k, largest=False)[0].max()
     
@@ -94,23 +124,21 @@ def visualize_yz_plane(btjc, name="pose"):
     
     # 目标：让身体占据约 400 像素
     scale_factor = 200 / scale_ref
-    yz = yz * scale_factor
+    xy = xy * scale_factor
     print(f"缩放参考: {scale_ref:.4f}, 缩放因子: {scale_factor:.2f}")
     
-    # 5. 翻转 Z 轴（让头在上方）
-    # 从你的数据看，脖子向量 Z=1.7140 是正的，说明头在 Z 正方向
-    # 显示时需要翻转，让头在屏幕上方
-    yz[..., 1] = -yz[..., 1]
+    # 5. 翻转 Y 轴（让头在上方）
+    xy[..., 1] = -xy[..., 1]
     
     # 6. 平移到屏幕中心
-    yz[..., 0] += 512  # Y → 屏幕 X (水平)
-    yz[..., 1] += 384  # Z → 屏幕 Y (垂直)
+    xy[..., 0] += 512
+    xy[..., 1] += 384
     
     # 7. 重新组装成 3D 坐标
     result = torch.zeros_like(x)
-    result[..., 0] = yz[..., 0]  # 显示 X ← 原始 Y
-    result[..., 1] = yz[..., 1]  # 显示 Y ← 原始 Z
-    result[..., 2] = x[..., 0]   # 保留原始 X（深度）
+    result[..., 0] = xy[..., 0]  # 显示 X
+    result[..., 1] = xy[..., 1]  # 显示 Y
+    result[..., 2] = x_corrected[..., 2] * scale_factor  # 修正后的 Z
     
     print(f"最终 X range: [{result[...,0].min():.1f}, {result[...,0].max():.1f}]")
     print(f"最终 Y range: [{result[...,1].min():.1f}, {result[...,1].max():.1f}]")
@@ -584,8 +612,8 @@ if __name__ == "__main__":
         best_plane_info = comprehensive_diagnosis(gt, "GT")
         print(f"\n最佳平面: {best_plane_info}")
         
-        gt_f = visualize_yz_plane(gt, "GT")
-        pred_f = visualize_yz_plane(pred, "PRED")
+        gt_f = visualize_xy_plane_fixed(gt, "GT")
+        pred_f = visualize_xy_plane_fixed(pred, "PRED")
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
