@@ -115,7 +115,7 @@ if __name__ == "__main__":
     # Inference
     # ============================================================
     print("\n" + "="*70)
-    print("INFERENCE")
+    print("INFERENCE (Fixed - No runtime std clamp)")
     print("="*70)
     
     model.eval()
@@ -138,7 +138,7 @@ if __name__ == "__main__":
         print(f"    GT shape: {gt.shape}")
 
         # ============================================================
-        # 诊断 PRED 的 unnormalize 问题
+        # 生成 PRED
         # ============================================================
         print(f"\n[2] 生成 PRED（归一化空间）")
         
@@ -154,83 +154,39 @@ if __name__ == "__main__":
         print(f"    pred_norm mean/std: {pred_norm.mean():.4f} / {pred_norm.std():.4f}")
 
         # ============================================================
-        # 诊断模型的统计量
+        # 检查模型统计量
         # ============================================================
-        print(f"\n[3] 检查模型的 mean 和 std:")
-        print(f"    mean_pose shape: {model.mean_pose.shape}")
-        print(f"    std_pose shape: {model.std_pose.shape}")
+        print(f"\n[3] 模型的 mean 和 std:")
         print(f"    mean range: [{model.mean_pose.min():.4f}, {model.mean_pose.max():.4f}]")
         print(f"    std range: [{model.std_pose.min():.4f}, {model.std_pose.max():.4f}]")
 
-        # 检查 std 的分布
         std_flat = model.std_pose.flatten()
-        std_percentiles = {
-            "min": std_flat.min().item(),
-            "1%": torch.quantile(std_flat, 0.01).item(),
-            "10%": torch.quantile(std_flat, 0.1).item(),
-            "50%": torch.quantile(std_flat, 0.5).item(),
-            "90%": torch.quantile(std_flat, 0.9).item(),
-            "99%": torch.quantile(std_flat, 0.99).item(),
-            "max": std_flat.max().item(),
-        }
-        
-        print(f"\n    std 分布（百分位数）:")
-        for k, v in std_percentiles.items():
-            print(f"      {k:>4s}: {v:.6f}")
-
-        std_near_zero = (model.std_pose < 1e-4).sum().item()
-        std_very_small = (model.std_pose < 1e-2).sum().item()
-        std_very_large = (model.std_pose > 100).sum().item()
-        
-        print(f"\n    异常 std 统计:")
-        print(f"      接近0 (<1e-4): {std_near_zero}")
-        print(f"      很小 (<0.01): {std_very_small}")
-        print(f"      很大 (>100): {std_very_large}")
+        print(f"\n    std 分布:")
+        print(f"      min: {std_flat.min().item():.6f}")
+        print(f"      50%: {torch.quantile(std_flat, 0.5).item():.6f}")
+        print(f"      max: {std_flat.max().item():.6f}")
 
         # ============================================================
-        # 测试 GT 的归一化循环
+        # 验证 GT normalize/unnormalize
         # ============================================================
-        print(f"\n[4] 测试 GT 的归一化→反归一化循环:")
+        print(f"\n[4] 验证 GT 的归一化循环:")
         gt_test = gt.clone()
         gt_norm_test = model.normalize(gt_test)
         gt_recon = model.unnormalize(gt_norm_test)
         recon_error = (gt_test - gt_recon).abs().mean().item()
-        recon_max_error = (gt_test - gt_recon).abs().max().item()
         
-        print(f"    平均误差: {recon_error:.6f}")
-        print(f"    最大误差: {recon_max_error:.6f}")
+        print(f"    平均误差: {recon_error:.8f}")
         
-        if recon_error > 0.01:
-            print("    ⚠️  重建误差过大！normalize/unnormalize 有问题")
+        if recon_error > 1e-4:
+            print("    ⚠️  重建误差过大！")
         else:
-            print("    ✓ GT 的归一化循环正常")
+            print("    ✓ 归一化循环正确")
 
         # ============================================================
-        # 修复 std（如果需要）
+        # ❌ 不要 clamp std！这是关键修复
         # ============================================================
-        needs_fix = False
-        
-        if std_near_zero > 0:
-            print(f"\n⚠️  发现问题：有 {std_near_zero} 个接近0的 std 值")
-            print(f"    这会导致反归一化时数值爆炸（x * std，当 std→0 时结果正常）")
-            print(f"    但如果训练时 std 被错误缩放，会导致问题")
-            needs_fix = True
-        
-        if std_percentiles["min"] < 1e-6:
-            print(f"\n⚠️  发现问题：std 最小值 = {std_percentiles['min']:.2e}")
-            print(f"    这个值太小，可能导致数值不稳定")
-            needs_fix = True
-        
-        if needs_fix:
-            print(f"\n[修复] 将 std clamp 到 [0.001, 100] 范围:")
-            model.std_pose = torch.clamp(model.std_pose, min=1e-3, max=100)
-            print(f"    修复后 std range: [{model.std_pose.min():.4f}, {model.std_pose.max():.4f}]")
-            
-            # 重新测试
-            gt_norm_test2 = model.normalize(gt_test)
-            gt_recon2 = model.unnormalize(gt_norm_test2)
-            recon_error2 = (gt_test - gt_recon2).abs().mean().item()
-            print(f"    修复后重建误差: {recon_error2:.6f}")
+        # 之前的代码在这里做了 std clamp，导致训练/推理不一致
+        # 现在完全移除这个步骤
 
         # ============================================================
         # Unnormalize PRED
@@ -238,7 +194,6 @@ if __name__ == "__main__":
         print(f"\n[5] 反归一化 PRED:")
         pred = model.unnormalize(pred_norm)
         
-        print(f"    PRED shape: {pred.shape}")
         print(f"    PRED range:")
         print(f"      X: [{pred[...,0].min():.4f}, {pred[...,0].max():.4f}]")
         print(f"      Y: [{pred[...,1].min():.4f}, {pred[...,1].max():.4f}]")
@@ -249,17 +204,18 @@ if __name__ == "__main__":
         print(f"      Y: [{gt[...,1].min():.4f}, {gt[...,1].max():.4f}]")
         print(f"      Z: [{gt[...,2].min():.4f}, {gt[...,2].max():.4f}]")
         
-        # 检查 PRED 是否合理
-        pred_range_ok = (
-            pred.abs().max() < 10 and
-            (pred[...,0].max() - pred[...,0].min()) < 5 and
-            (pred[...,1].max() - pred[...,1].min()) < 5
-        )
+        # 检查范围是否匹配
+        pred_x_range = pred[...,0].max() - pred[...,0].min()
+        gt_x_range = gt[...,0].max() - gt[...,0].min()
+        range_ratio = pred_x_range / gt_x_range
         
-        if pred_range_ok:
-            print(f"\n    ✓ PRED 数值范围正常")
+        print(f"\n    范围比率 (PRED/GT):")
+        print(f"      X: {range_ratio:.4f}")
+        
+        if 0.5 < range_ratio < 2.0:
+            print(f"    ✓ PRED 数值范围正常（与 GT 接近）")
         else:
-            print(f"\n    ⚠️  PRED 数值范围异常！可能需要进一步调试")
+            print(f"    ⚠️  PRED 数值范围异常（比率应接近 1.0）")
 
         # DTW evaluation
         mask_bt = torch.ones(1, future_len, device=device)
@@ -268,48 +224,34 @@ if __name__ == "__main__":
 
     print("="*70 + "\n")
 
+    # ============================================================
+    # 详细检查关键点分布
+    # ============================================================
     print("\n" + "="*70)
     print("详细检查 PRED 的关键点分布")
     print("="*70)
 
     pred_cpu = pred.cpu()
-    pred_frame0 = pred_cpu[0, 0]  # 第一帧 [J, 3]
+    pred_frame0 = pred_cpu[0, 0]
 
-    # 按关键点组分析
     groups = {
-        "Pose (身体)": (0, 33),      # MediaPipe Pose: 0-32
-        "左手": (33, 54),              # 左手 21 个点: 33-53
-        "右手": (54, 75),              # 右手 21 个点: 54-74  
-        "面部": (75, 178),             # 面部 103 个点: 75-177
+        "Pose (身体)": (0, 33),
+        "左手": (33, 54),
+        "右手": (54, 75),
+        "面部": (75, 178),
     }
 
     for name, (start, end) in groups.items():
         points = pred_frame0[start:end]
         
-        # 计算范围
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        z_range = points[:, 2].max() - points[:, 2].min()
         
-        # 计算中心
-        center = points.mean(dim=0)
-        
-        # 计算标准差（衡量分散程度）
-        std = points.std(dim=0)
-        
-        print(f"\n{name} ({start}-{end-1}, 共 {end-start} 个点):")
-        print(f"  X range: {x_range:.2f}, Y range: {y_range:.2f}, Z range: {z_range:.2f}")
-        print(f"  中心: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
-        print(f"  标准差: [{std[0]:.2f}, {std[1]:.2f}, {std[2]:.2f}]")
-        
-        # 检查是否有异常
-        if x_range > 500 or y_range > 500:
-            print(f"  ⚠️  范围异常大！")
-        if std[0] > 100 or std[1] > 100:
-            print(f"  ⚠️  标准差异常大，点分布很分散")
+        print(f"\n{name}:")
+        print(f"  X range: {x_range:.4f}, Y range: {y_range:.4f}")
 
     print("\n" + "-"*70)
-    print("对比 GT 的关键点分布:")
+    print("对比 GT:")
     print("-"*70)
     
     gt_cpu = gt.cpu()
@@ -317,22 +259,21 @@ if __name__ == "__main__":
 
     for name, (start, end) in groups.items():
         points = gt_frame0[start:end]
-        std = points.std(dim=0)
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        print(f"{name}: X_range={x_range:.4f}, Y_range={y_range:.4f}, std=[{std[0]:.4f}, {std[1]:.4f}, {std[2]:.4f}]")
+        print(f"{name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
 
     print("="*70 + "\n")
 
     # ============================================================
-    # 保存可视化文件
+    # 保存文件
     # ============================================================
     print("\n" + "="*70)
     print("保存可视化文件")
     print("="*70)
 
-    # 方案1：GT 从原始文件读取（最可靠）
-    print("\n[1] GT - 从原始文件读取:")
+    # GT
+    print("\n[1] GT:")
     gt_file_path = base_ds.records[0]["pose"]
     gt_file_path = gt_file_path if os.path.isabs(gt_file_path) else os.path.join(data_dir, gt_file_path)
     
@@ -343,106 +284,19 @@ if __name__ == "__main__":
     gt_pose_obj = gt_pose_obj.remove_components(["POSE_WORLD_LANDMARKS"])
     
     out_gt = os.path.join(out_dir, "gt_final.pose")
-    if os.path.exists(out_gt):
-        os.remove(out_gt)
-    
     with open(out_gt, "wb") as f:
         gt_pose_obj.write(f)
     
     print(f"  保存到: {out_gt}")
-    print(f"  ✓ 这个文件应该显示正常的人体姿态")
 
-    # 方案2：PRED 从模型输出转换
-    print("\n[2] PRED - 从模型输出转换:")
-    pred_cpu = pred.cpu()  # [1, T, J, 3]
-
-    # 计算缩放因子：根据身体部分的范围
-    pred_body = pred_cpu[0, :, 0:33]  # [T, 33, 3] 身体关键点
-    gt_body_cpu = gt.cpu()[0, :, 0:33]  # [T, 33, 3]
-
-    # 计算 X, Y 方向的范围（使用所有帧）
-    pred_x_range = pred_body[..., 0].max() - pred_body[..., 0].min()
-    pred_y_range = pred_body[..., 1].max() - pred_body[..., 1].min()
-
-    gt_x_range = gt_body_cpu[..., 0].max() - gt_body_cpu[..., 0].min()
-    gt_y_range = gt_body_cpu[..., 1].max() - gt_body_cpu[..., 1].min()
-
-    # 计算缩放因子
-    scale_x = gt_x_range / pred_x_range if pred_x_range > 1e-6 else 1.0
-    scale_y = gt_y_range / pred_y_range if pred_y_range > 1e-6 else 1.0
-    scale_factor = (scale_x + scale_y) / 2  # 使用平均值
-
-    print(f"  缩放因子: {scale_factor:.6f}")
-    print(f"    pred body X range: {pred_x_range:.2f} → GT: {gt_x_range:.4f}")
-    print(f"    pred body Y range: {pred_y_range:.2f} → GT: {gt_y_range:.4f}")
-
-    # 计算中心（只用身体部分）
-    pred_center = pred_body.mean(dim=(0, 1))  # [3] 对时间和关键点维度求平均
-    gt_center = gt_body_cpu.mean(dim=(0, 1))  # [3]
-
-    print(f"  PRED 中心: [{pred_center[0]:.2f}, {pred_center[1]:.2f}, {pred_center[2]:.2f}]")
-    print(f"  GT 中心: [{gt_center[0]:.4f}, {gt_center[1]:.4f}, {gt_center[2]:.4f}]")
-
-    # 缩放并平移 PRED
-    # pred_cpu shape: [1, T, J, 3]
-    pred_scaled = pred_cpu[0].clone()  # [T, J, 3]
-
-    # 先中心化（广播会自动处理）
-    pred_scaled = pred_scaled - pred_center.view(1, 1, 3)  # [T, J, 3] - [1, 1, 3]
-
-    # 再缩放
-    pred_scaled = pred_scaled * scale_factor
-
-    # 再平移到 GT 的中心
-    pred_scaled = pred_scaled + gt_center.view(1, 1, 3)  # [T, J, 3] + [1, 1, 3]
-
-    # 恢复 batch 维度
-    pred_scaled = pred_scaled.unsqueeze(0)  # [1, T, J, 3]
-
-    print(f"\n  缩放后 PRED range:")
-    print(f"    X: [{pred_scaled[...,0].min():.4f}, {pred_scaled[...,0].max():.4f}]")
-    print(f"    Y: [{pred_scaled[...,1].min():.4f}, {pred_scaled[...,1].max():.4f}]")
-    print(f"    Z: [{pred_scaled[...,2].min():.4f}, {pred_scaled[...,2].max():.4f}]")
-
-    # 检查各组关键点
-    print(f"\n  检查缩放后的各组关键点:")
-    pred_scaled_frame0 = pred_scaled[0, 0]
-
-    groups = {
-        "Pose": (0, 33),
-        "左手": (33, 54),
-        "右手": (54, 75),
-        "面部": (75, 178),
-    }
-
-    all_ok = True
-    for name, (start, end) in groups.items():
-        points = pred_scaled_frame0[start:end]
-        x_range = points[:, 0].max() - points[:, 0].min()
-        y_range = points[:, 1].max() - points[:, 1].min()
-        
-        if x_range < 0.001 and y_range < 0.001:
-            print(f"    ⚠️  {name}: 点聚集！x={x_range:.6f}, y={y_range:.6f}")
-            all_ok = False
-        else:
-            print(f"    ✓ {name}: x={x_range:.4f}, y={y_range:.4f}")
-
-    pose_pred = tensor_to_pose(pred_scaled, header)
+    print("\n[2] PRED (直接保存，不缩放):")
+    pose_pred = tensor_to_pose(pred, header)
     
     out_pred = os.path.join(out_dir, "pred_final.pose")
-    if os.path.exists(out_pred):
-        os.remove(out_pred)
-    
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
     
     print(f"  保存到: {out_pred}")
-    
-    if pred_range_ok:
-        print(f"  ✓ PRED 数值正常，应该能显示合理的姿态")
-    else:
-        print(f"  ⚠️  PRED 数值异常，可能显示不正确")
-        print(f"  建议：检查训练过程中的 std calibration")
 
     print("\n" + "="*70)
     print("完成！")
@@ -450,4 +304,3 @@ if __name__ == "__main__":
     print(f"\n在 pose viewer 中打开:")
     print(f"  - {out_gt}")
     print(f"  - {out_pred}")
-    print(f"\n对比两个文件，评估模型预测效果")
