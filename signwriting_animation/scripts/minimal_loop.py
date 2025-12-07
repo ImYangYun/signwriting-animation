@@ -27,6 +27,12 @@ def tensor_to_pose(t_btjc, header):
         raise ValueError("Expected 3D or 4D tensor")
 
     print(f"[tensor_to_pose] input shape: {t.shape}")
+    
+    # 检测零点
+    zero_mask = (t.abs().sum(dim=-1) < 1e-6)  # [T, J]
+    num_zeros = zero_mask.sum().item()
+    total_points = zero_mask.numel()
+    print(f"  零点数: {num_zeros}/{total_points} ({100*num_zeros/total_points:.1f}%)")
 
     arr = t[:, None, :, :].cpu().numpy().astype(np.float32)
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
@@ -162,32 +168,67 @@ if __name__ == "__main__":
         print(f"[DTW] masked_dtw = {dtw_val:.4f}")
 
     # ============================================================
-    # Save poses (NO transformation, direct conversion)
+    # 方案2：直接从文件读取完整的 GT（绕过 tensor 转换）
     # ============================================================
+    print("\n" + "="*70)
+    print("使用文件中的完整 GT（不经过 tensor 转换和 zero_filled）")
+    print("="*70)
     
-    # Convert to CPU for saving
+    # 找到对应的原始文件（注意：batch 可能是 shuffled 的）
+    # 这里简单使用第一个 record
+    gt_file_path = base_ds.records[0]["pose"]
+    gt_file_path = gt_file_path if os.path.isabs(gt_file_path) else os.path.join(data_dir, gt_file_path)
+    
+    print(f"Reading GT from: {gt_file_path}")
+    
+    with open(gt_file_path, "rb") as f:
+        gt_from_file = Pose.read(f)
+    
+    # Apply same reduction as dataset
+    gt_reduced = reduce_holistic(gt_from_file)
+    gt_reduced = gt_reduced.remove_components(["POSE_WORLD_LANDMARKS"])
+    
+    # 保存这个完整的 GT
+    out_gt_complete = os.path.join(out_dir, "gt_complete.pose")
+    if os.path.exists(out_gt_complete):
+        os.remove(out_gt_complete)
+    
+    with open(out_gt_complete, "wb") as f:
+        gt_reduced.write(f)
+    
+    print(f"[SAVE] Complete GT (from file) saved to: {out_gt_complete}")
+    print("="*70 + "\n")
+
+    # ============================================================
+    # 保存 tensor 版本的 GT（用于对比）
+    # ============================================================
+    print("\n保存 tensor 版本的 GT（经过 sanitize_btjc）")
+    
     gt_cpu = gt.cpu()
     pred_cpu = pred.cpu()
 
     # Create pose objects
-    pose_gt = tensor_to_pose(gt_cpu, header)
+    pose_gt_tensor = tensor_to_pose(gt_cpu, header)
     pose_pred = tensor_to_pose(pred_cpu, header)
 
     # Save files
-    out_gt = os.path.join(out_dir, "gt_178.pose")
+    out_gt_tensor = os.path.join(out_dir, "gt_from_tensor.pose")
     out_pred = os.path.join(out_dir, "pred_178.pose")
 
-    for path in [out_gt, out_pred]:
+    for path in [out_gt_tensor, out_pred]:
         if os.path.exists(path):
             os.remove(path)
 
-    with open(out_gt, "wb") as f:
-        pose_gt.write(f)
+    with open(out_gt_tensor, "wb") as f:
+        pose_gt_tensor.write(f)
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
 
-    print(f"\n[SAVE] Files saved:")
-    print(f"  - GT:   {out_gt}")
-    print(f"  - PRED: {out_pred}")
-    print(f"  - REF:  {out_original}")
-    print(f"\nOpen these files in pose viewer to compare!")
+    print(f"\n[SAVE] All files saved:")
+    print(f"  - GT (from file):   {out_gt_complete}  ← 应该正常显示")
+    print(f"  - GT (from tensor): {out_gt_tensor}   ← 可能只有一个点")
+    print(f"  - PRED:             {out_pred}")
+    print(f"  - REF:              {out_original}")
+    print(f"\n在 pose viewer 中对比这些文件:")
+    print(f"  1. original_ref.pose 和 gt_complete.pose 应该一样正常")
+    print(f"  2. gt_from_tensor.pose 可能只显示一个点（zero_filled 的问题）")
