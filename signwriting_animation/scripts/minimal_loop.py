@@ -354,13 +354,13 @@ if __name__ == "__main__":
 
     # 方案2：PRED 从模型输出转换
     print("\n[2] PRED - 从模型输出转换:")
-    pred_cpu = pred.cpu()
+    pred_cpu = pred.cpu()  # [1, T, J, 3]
 
     # 计算缩放因子：根据身体部分的范围
-    pred_body = pred_cpu[0, :, 0:33]  # 身体关键点
-    gt_body_cpu = gt.cpu()[0, :, 0:33]
+    pred_body = pred_cpu[0, :, 0:33]  # [T, 33, 3] 身体关键点
+    gt_body_cpu = gt.cpu()[0, :, 0:33]  # [T, 33, 3]
 
-    # 计算 X, Y 方向的范围
+    # 计算 X, Y 方向的范围（使用所有帧）
     pred_x_range = pred_body[..., 0].max() - pred_body[..., 0].min()
     pred_y_range = pred_body[..., 1].max() - pred_body[..., 1].min()
 
@@ -376,30 +376,56 @@ if __name__ == "__main__":
     print(f"    pred body X range: {pred_x_range:.2f} → GT: {gt_x_range:.4f}")
     print(f"    pred body Y range: {pred_y_range:.2f} → GT: {gt_y_range:.4f}")
 
-    # 计算中心偏移
-    pred_center = torch.stack([
-        pred_body[..., 0].mean(),
-        pred_body[..., 1].mean(),
-        pred_body[..., 2].mean()
-    ])
-    gt_center = torch.stack([
-        gt_body_cpu[..., 0].mean(),
-        gt_body_cpu[..., 1].mean(),
-        gt_body_cpu[..., 2].mean()
-    ])
+    # 计算中心（只用身体部分）
+    pred_center = pred_body.mean(dim=(0, 1))  # [3] 对时间和关键点维度求平均
+    gt_center = gt_body_cpu.mean(dim=(0, 1))  # [3]
+
+    print(f"  PRED 中心: [{pred_center[0]:.2f}, {pred_center[1]:.2f}, {pred_center[2]:.2f}]")
+    print(f"  GT 中心: [{gt_center[0]:.4f}, {gt_center[1]:.4f}, {gt_center[2]:.4f}]")
 
     # 缩放并平移 PRED
-    pred_scaled = pred_cpu.clone()
-    # 先中心化
-    pred_scaled = pred_scaled - pred_center
+    # pred_cpu shape: [1, T, J, 3]
+    pred_scaled = pred_cpu[0].clone()  # [T, J, 3]
+
+    # 先中心化（广播会自动处理）
+    pred_scaled = pred_scaled - pred_center.view(1, 1, 3)  # [T, J, 3] - [1, 1, 3]
+
     # 再缩放
     pred_scaled = pred_scaled * scale_factor
-    # 再平移到 GT 的中心
-    pred_scaled = pred_scaled + gt_center
 
-    print(f"  缩放后 PRED range:")
+    # 再平移到 GT 的中心
+    pred_scaled = pred_scaled + gt_center.view(1, 1, 3)  # [T, J, 3] + [1, 1, 3]
+
+    # 恢复 batch 维度
+    pred_scaled = pred_scaled.unsqueeze(0)  # [1, T, J, 3]
+
+    print(f"\n  缩放后 PRED range:")
     print(f"    X: [{pred_scaled[...,0].min():.4f}, {pred_scaled[...,0].max():.4f}]")
     print(f"    Y: [{pred_scaled[...,1].min():.4f}, {pred_scaled[...,1].max():.4f}]")
+    print(f"    Z: [{pred_scaled[...,2].min():.4f}, {pred_scaled[...,2].max():.4f}]")
+
+    # 检查各组关键点
+    print(f"\n  检查缩放后的各组关键点:")
+    pred_scaled_frame0 = pred_scaled[0, 0]
+
+    groups = {
+        "Pose": (0, 33),
+        "左手": (33, 54),
+        "右手": (54, 75),
+        "面部": (75, 178),
+    }
+
+    all_ok = True
+    for name, (start, end) in groups.items():
+        points = pred_scaled_frame0[start:end]
+        x_range = points[:, 0].max() - points[:, 0].min()
+        y_range = points[:, 1].max() - points[:, 1].min()
+        
+        if x_range < 0.001 and y_range < 0.001:
+            print(f"    ⚠️  {name}: 点聚集！x={x_range:.6f}, y={y_range:.6f}")
+            all_ok = False
+        else:
+            print(f"    ✓ {name}: x={x_range:.4f}, y={y_range:.4f}")
 
     pose_pred = tensor_to_pose(pred_scaled, header)
     
