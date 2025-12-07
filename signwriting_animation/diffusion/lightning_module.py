@@ -227,15 +227,6 @@ class LitMinimal(pl.LightningModule):
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img  = cond_raw["sign_image"].float()
 
-        # ---- one-time std calibration ----
-        if not self._std_calibrated:
-            raw = sanitize_btjc(batch["data"]).to(self.device)
-            cur = ((raw - self.mean_pose) / (self.std_pose + 1e-6)).float().std().item()
-            factor = max(cur, 1e-3)
-            self.std_pose[:] = self.std_pose * factor
-            print(f"[Calib] normalized std={cur:.3f} → scale={factor:.3f}")
-            self._std_calibrated = True
-
         gt   = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)[:, -gt.size(1):]
         cond = {"input_pose": past, "sign_image": sign_img}
