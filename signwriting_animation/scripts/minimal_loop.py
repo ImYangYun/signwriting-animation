@@ -43,7 +43,7 @@ def temporal_smooth(x, k=5):
 
 
 def debug_and_visualize(btjc, name="pose"):
-    """诊断 + 可视化一体函数"""
+    """诊断 + 可视化一体函数（支持 deterministic mode）"""
     if btjc.dim() == 4:
         x = btjc[0].clone()
     else:
@@ -56,7 +56,7 @@ def debug_and_visualize(btjc, name="pose"):
     print(f"Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
     print(f"Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
     
-    # 检查是否所有点都在同一位置（导致只显示一个点）
+    # 检查是否所有点都在同一位置
     x_std = x[0, :, 0].std()
     y_std = x[0, :, 1].std()
     print(f"First frame std: X={x_std:.6f}, Y={y_std:.6f}")
@@ -64,11 +64,10 @@ def debug_and_visualize(btjc, name="pose"):
     if x_std < 0.01 and y_std < 0.01:
         print("⚠️  警告：所有关键点几乎在同一位置！")
     
-    # ===== 新的可视化策略 =====
-    # 1. 使用第一帧的所有点计算边界
+    # ===== 可视化变换 =====
     x0 = x[0]  # [J, 3]
     
-    # 2. 找到有效点（假设全0或NaN是无效的）
+    # 找到有效点
     valid_mask = (x0.abs().sum(dim=-1) > 1e-6)
     if valid_mask.sum() == 0:
         print("⚠️  错误：没有有效的关键点！")
@@ -77,28 +76,39 @@ def debug_and_visualize(btjc, name="pose"):
     x_valid = x0[valid_mask]
     print(f"有效关键点数: {valid_mask.sum()}/{J}")
     
-    # 3. 中心化：使用有效点的中位数（比均值更稳健）
-    center = x_valid.median(dim=0)[0]  # [3]
+    # 1. 中心化：使用均值（deterministic-safe）
+    center = x_valid.mean(dim=0)  # [3]
     x = x - center
+    print(f"中心点: [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
     
-    # 4. 翻转Y（如果需要）
+    # 2. 翻转Y轴（让人物正立）
     x[..., 1] = -x[..., 1]
     
-    # 5. 自适应缩放：基于有效点的90百分位距离
+    # 3. 自适应缩放：基于有效点的距离分布
     dist = torch.norm(x[0, valid_mask, :2], dim=-1)
-    scale_ref = torch.quantile(dist, 0.9)
+    # 使用90百分位数来排除异常点
+    k = int(len(dist) * 0.9)
+    scale_ref = torch.topk(dist, k, largest=False)[0].max()
+    
     if scale_ref < 1e-3:
         scale_ref = 1.0
     
     scale_factor = 250 / scale_ref  # 让90%的点在250像素内
     x[..., :2] *= scale_factor
     
-    # 6. 平移到屏幕中心
+    print(f"缩放参考距离: {scale_ref:.4f}, 缩放因子: {scale_factor:.2f}")
+    
+    # 4. 平移到屏幕中心（pose-viewer 默认分辨率 1024x768）
     x[..., 0] += 512
     x[..., 1] += 384
     
     print(f"变换后 X range: [{x[...,0].min():.1f}, {x[...,0].max():.1f}]")
     print(f"变换后 Y range: [{x[...,1].min():.1f}, {x[...,1].max():.1f}]")
+    
+    # 检查是否有点超出屏幕
+    out_of_bounds = (x[..., 0] < 0) | (x[..., 0] > 1024) | (x[..., 1] < 0) | (x[..., 1] > 768)
+    if out_of_bounds.any():
+        print(f"⚠️  警告：{out_of_bounds.sum().item()} 个点超出屏幕范围")
     
     return x.unsqueeze(0)
 
