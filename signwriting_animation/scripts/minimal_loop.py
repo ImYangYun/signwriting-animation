@@ -316,6 +316,7 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
+        visualize_with_rotation_test(gt, "GT")
         # 替换你的可视化部分
         gt_f = visualize_gt_correctly(gt, "GT")
         pred_f = visualize_gt_correctly(pred, "PRED")
