@@ -268,6 +268,62 @@ if __name__ == "__main__":
 
     print("="*70 + "\n")
 
+    print("\n" + "="*70)
+    print("详细检查 PRED 的关键点分布")
+    print("="*70)
+
+    pred_cpu = pred.cpu()
+    pred_frame0 = pred_cpu[0, 0]  # 第一帧 [J, 3]
+
+    # 按关键点组分析
+    groups = {
+        "Pose (身体)": (0, 33),      # MediaPipe Pose: 0-32
+        "左手": (33, 54),              # 左手 21 个点: 33-53
+        "右手": (54, 75),              # 右手 21 个点: 54-74  
+        "面部": (75, 178),             # 面部 103 个点: 75-177
+    }
+
+    for name, (start, end) in groups.items():
+        points = pred_frame0[start:end]
+        
+        # 计算范围
+        x_range = points[:, 0].max() - points[:, 0].min()
+        y_range = points[:, 1].max() - points[:, 1].min()
+        z_range = points[:, 2].max() - points[:, 2].min()
+        
+        # 计算中心
+        center = points.mean(dim=0)
+        
+        # 计算标准差（衡量分散程度）
+        std = points.std(dim=0)
+        
+        print(f"\n{name} ({start}-{end-1}, 共 {end-start} 个点):")
+        print(f"  X range: {x_range:.2f}, Y range: {y_range:.2f}, Z range: {z_range:.2f}")
+        print(f"  中心: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
+        print(f"  标准差: [{std[0]:.2f}, {std[1]:.2f}, {std[2]:.2f}]")
+        
+        # 检查是否有异常
+        if x_range > 500 or y_range > 500:
+            print(f"  ⚠️  范围异常大！")
+        if std[0] > 100 or std[1] > 100:
+            print(f"  ⚠️  标准差异常大，点分布很分散")
+
+    print("\n" + "-"*70)
+    print("对比 GT 的关键点分布:")
+    print("-"*70)
+    
+    gt_cpu = gt.cpu()
+    gt_frame0 = gt_cpu[0, 0]
+
+    for name, (start, end) in groups.items():
+        points = gt_frame0[start:end]
+        std = points.std(dim=0)
+        x_range = points[:, 0].max() - points[:, 0].min()
+        y_range = points[:, 1].max() - points[:, 1].min()
+        print(f"{name}: X_range={x_range:.4f}, Y_range={y_range:.4f}, std=[{std[0]:.4f}, {std[1]:.4f}, {std[2]:.4f}]")
+
+    print("="*70 + "\n")
+
     # ============================================================
     # 保存可视化文件
     # ============================================================
