@@ -9,26 +9,41 @@ from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusi
 
 
 def _to_dense(x):
-    """Convert MaskedTensor / sparse tensor to dense contiguous float32."""
-    if hasattr(x, "zero_filled"):
+    """
+    Convert MaskedTensor / sparse tensor to dense contiguous float32.
+    
+    修复：保留原始数据，不使用 zero_filled()
+    """
+    # 优先获取原始数据（不填充零）
+    if hasattr(x, "tensor"):
+        # MaskedTensor.tensor 包含原始数据
+        x = x.tensor
+    elif hasattr(x, "_data"):
+        # 某些版本的 MaskedTensor 用 _data
+        x = x._data
+    elif hasattr(x, "data") and callable(getattr(x, "data", None)) is False:
+        # 如果有 .data 属性（非方法）
+        x = x.data
+    elif hasattr(x, "zero_filled"):
+        print("⚠️  Warning: Using zero_filled() - may cause visualization issues")
         x = x.zero_filled()
     if getattr(x, "is_sparse", False):
         x = x.to_dense()
     if x.dtype != torch.float32:
         x = x.float()
+    
     return x.contiguous()
 
 
 def sanitize_btjc(x):
-    """
-    Ensure tensor is [B,T,J,C]. Strip P dim if exists.
-    This is the most stable version you used in your previous working PR.
-    """
     x = _to_dense(x)
-    if x.dim() == 5:  # [B,T,P,J,C]
+    
+    # Strip P dimension if exists [B,T,P,J,C] → [B,T,J,C]
+    if x.dim() == 5:
         x = x[:, :, 0]
+    
     if x.dim() != 4:
-        raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
+        raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")  
     return x
 
 

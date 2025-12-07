@@ -134,6 +134,25 @@ if __name__ == "__main__":
     with torch.no_grad():
         batch = next(iter(loader))
         cond = batch["conditions"]
+        raw_data = batch["data"][0]
+
+        print("\n===== MaskedTensor 结构检查 =====")
+        print(f"类型: {type(raw_data)}")
+        print(f"属性列表: {[attr for attr in dir(raw_data) if not attr.startswith('_')]}")
+
+        # 检查可用的数据访问方法
+        if hasattr(raw_data, "tensor"):
+            print("✓ 有 .tensor 属性")
+            print(f"  tensor shape: {raw_data.tensor.shape}")
+        if hasattr(raw_data, "_data"):
+            print("✓ 有 ._data 属性")
+        if hasattr(raw_data, "zero_filled"):
+            print("✓ 有 .zero_filled() 方法")
+            zf = raw_data.zero_filled()
+            print(f"  zero_filled shape: {zf.shape}")
+            print(f"  零点数: {(zf.abs().sum(dim=-1) < 1e-6).sum()}")
+
+        print("=" * 50)
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
