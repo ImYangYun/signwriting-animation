@@ -42,75 +42,125 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def debug_and_visualize(btjc, name="pose"):
-    """诊断 + 可视化一体函数（支持 deterministic mode）"""
+def visualize_gt_correctly(btjc, name="pose"):
+    """
+    专门为你的 178 关键点数据设计的可视化函数
+    假设数据已经过中心化，Z轴是深度
+    """
     if btjc.dim() == 4:
-        x = btjc[0].clone()
+        x = btjc[0].clone()  # [T, J, 3]
     else:
         x = btjc.clone()
     
     T, J, C = x.shape
-    print(f"\n====== {name} 诊断 ======")
+    print(f"\n====== {name} 可视化 ======")
     print(f"Shape: {x.shape}")
-    print(f"X range: [{x[...,0].min():.4f}, {x[...,0].max():.4f}]")
-    print(f"Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
-    print(f"Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
+    print(f"原始 X range: [{x[...,0].min():.4f}, {x[...,0].max():.4f}]")
+    print(f"原始 Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
+    print(f"原始 Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
     
-    # 检查是否所有点都在同一位置
-    x_std = x[0, :, 0].std()
-    y_std = x[0, :, 1].std()
-    print(f"First frame std: X={x_std:.6f}, Y={y_std:.6f}")
+    # ============================================
+    # 策略 1: 直接使用 X, Y，忽略 Z
+    # ============================================
     
-    if x_std < 0.01 and y_std < 0.01:
-        print("⚠️  警告：所有关键点几乎在同一位置！")
+    # 1. 找到有效点（排除全0点）
+    valid_mask = (x[0].abs().sum(dim=-1) > 1e-6)
+    print(f"有效关键点: {valid_mask.sum()}/{J}")
     
-    # ===== 可视化变换 =====
-    x0 = x[0]  # [J, 3]
-    
-    # 找到有效点
-    valid_mask = (x0.abs().sum(dim=-1) > 1e-6)
     if valid_mask.sum() == 0:
-        print("⚠️  错误：没有有效的关键点！")
+        print("⚠️ 没有有效点！")
         return x.unsqueeze(0)
     
-    x_valid = x0[valid_mask]
-    print(f"有效关键点数: {valid_mask.sum()}/{J}")
+    # 2. 只处理 XY 平面（忽略 Z）
+    xy = x[..., :2].clone()  # [T, J, 2]
     
-    # 1. 中心化：使用均值（deterministic-safe）
-    center = x_valid.mean(dim=0)  # [3]
-    x = x - center
-    print(f"中心点: [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
+    # 3. 使用第一帧的有效点计算中心
+    xy_valid = xy[0, valid_mask]
+    center = xy_valid.mean(dim=0)  # [2]
+    print(f"中心点 (XY): [{center[0]:.4f}, {center[1]:.4f}]")
     
-    # 2. 翻转Y轴（让人物正立）
-    x[..., 1] = -x[..., 1]
+    # 4. 中心化
+    xy = xy - center
     
-    # 3. 自适应缩放：基于有效点的距离分布
-    dist = torch.norm(x[0, valid_mask, :2], dim=-1)
-    # 使用90百分位数来排除异常点
-    k = int(len(dist) * 0.9)
+    # 5. 计算缩放因子（使用95百分位避免异常值）
+    dist = torch.norm(xy[0, valid_mask], dim=-1)
+    k = max(1, int(len(dist) * 0.95))
     scale_ref = torch.topk(dist, k, largest=False)[0].max()
     
     if scale_ref < 1e-3:
         scale_ref = 1.0
     
-    scale_factor = 250 / scale_ref  # 让90%的点在250像素内
-    x[..., :2] *= scale_factor
+    # 目标：让身体宽度约为 400 像素
+    scale_factor = 200 / scale_ref
+    xy = xy * scale_factor
     
-    print(f"缩放参考距离: {scale_ref:.4f}, 缩放因子: {scale_factor:.2f}")
+    print(f"缩放参考: {scale_ref:.4f}, 缩放因子: {scale_factor:.2f}")
     
-    # 4. 平移到屏幕中心（pose-viewer 默认分辨率 1024x768）
-    x[..., 0] += 512
-    x[..., 1] += 384
+    # 6. 翻转 Y 轴（让人正立）
+    xy[..., 1] = -xy[..., 1]
     
-    print(f"变换后 X range: [{x[...,0].min():.1f}, {x[...,0].max():.1f}]")
-    print(f"变换后 Y range: [{x[...,1].min():.1f}, {x[...,1].max():.1f}]")
+    # 7. 平移到屏幕中心
+    xy[..., 0] += 512
+    xy[..., 1] += 384
+    
+    # 8. 重新组装成 3D（Z 保持不变或清零）
+    result = torch.zeros_like(x)
+    result[..., :2] = xy
+    result[..., 2] = x[..., 2]  # 保留原始 Z（如果需要的话）
+    
+    print(f"最终 X range: [{result[...,0].min():.1f}, {result[...,0].max():.1f}]")
+    print(f"最终 Y range: [{result[...,1].min():.1f}, {result[...,1].max():.1f}]")
     
     # 检查是否有点超出屏幕
-    out_of_bounds = (x[..., 0] < 0) | (x[..., 0] > 1024) | (x[..., 1] < 0) | (x[..., 1] > 768)
-    if out_of_bounds.any():
-        print(f"⚠️  警告：{out_of_bounds.sum().item()} 个点超出屏幕范围")
+    out_x = ((result[..., 0] < 0) | (result[..., 0] > 1024)).sum()
+    out_y = ((result[..., 1] < 0) | (result[..., 1] > 768)).sum()
+    if out_x > 0 or out_y > 0:
+        print(f"⚠️ 超出屏幕: X={out_x}, Y={out_y}")
     
-    return x.unsqueeze(0)
+    return result.unsqueeze(0)
+
+
+def visualize_with_rotation_test(btjc, name="pose"):
+    """
+    测试不同的坐标轴组合，找到正确的视角
+    """
+    if btjc.dim() == 4:
+        x = btjc[0].clone()
+    else:
+        x = btjc.clone()
+    
+    print(f"\n====== {name} 旋转测试 ======")
+    
+    # 测试 6 种主要视角
+    views = {
+        "XY平面 (原始)": (0, 1, 2),      # X→X, Y→Y, Z→Z
+        "XZ平面 (俯视)": (0, 2, 1),      # X→X, Z→Y, Y→Z
+        "YZ平面 (侧视)": (1, 2, 0),      # Y→X, Z→Y, X→Z
+        "XY平面 (Y翻转)": (0, 1, 2, True),  # X→X, -Y→Y, Z→Z
+        "XZ平面 (Z翻转)": (0, 2, 1, True),  # X→X, -Z→Y, Y→Z
+        "ZY平面 (旋转90°)": (2, 1, 0),   # Z→X, Y→Y, X→Z
+    }
+    
+    for view_name, indices in views.items():
+        flip_y = len(indices) == 4 and indices[3]
+        i, j, k = indices[:3]
+        
+        # 重新排列坐标轴
+        x_view = x.clone()
+        x_view_new = torch.zeros_like(x_view)
+        x_view_new[..., 0] = x_view[..., i]
+        x_view_new[..., 1] = x_view[..., j] if not flip_y else -x_view[..., j]
+        x_view_new[..., 2] = x_view[..., k]
+        
+        # 计算第一帧的空间分布
+        valid = (x_view_new[0].abs().sum(dim=-1) > 1e-6)
+        if valid.sum() > 0:
+            std_x = x_view_new[0, valid, 0].std().item()
+            std_y = x_view_new[0, valid, 1].std().item()
+            aspect_ratio = std_x / std_y if std_y > 1e-6 else 0
+            
+            print(f"{view_name:20s} | X_std={std_x:.3f}, Y_std={std_y:.3f}, "
+                  f"ratio={aspect_ratio:.2f}")
 
 
 def tensor_to_pose(t_btjc, header):
@@ -267,8 +317,8 @@ if __name__ == "__main__":
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
         # 替换你的可视化部分
-        gt_f   = debug_and_visualize(gt, "GT")
-        pred_f = debug_and_visualize(pred, "PRED")
+        gt_f = visualize_gt_correctly(gt, "GT")
+        pred_f = visualize_gt_correctly(pred, "PRED")
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
