@@ -3,6 +3,7 @@ import os
 import torch
 import numpy as np
 import lightning as pl
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 from pose_format import Pose
@@ -303,6 +304,125 @@ def analyze_upper_body_structure(btjc, name="pose"):
     return orientation, shoulder_main, neck_main
 
 
+def comprehensive_diagnosis(btjc, name="pose"):
+    """
+    全面诊断数据的空间分布，找出正确的可视化方法
+    """
+    if btjc.dim() == 4:
+        x = btjc[0, 0].clone()  # 只看第一帧 [J, 3]
+    else:
+        x = btjc[0].clone()
+    
+    print(f"\n{'='*70}")
+    print(f"{name} 全面诊断")
+    print(f"{'='*70}")
+    
+    # 关键点定义
+    keypoints = {
+        'nose': 0,
+        'left_shoulder': 11,
+        'right_shoulder': 12,
+        'left_wrist': 15,
+        'right_wrist': 16,
+    }
+    
+    print("\n[1] 关键点的原始坐标:")
+    for kp_name, idx in keypoints.items():
+        coord = x[idx]
+        print(f"  {kp_name:15s}: X={coord[0]:7.4f}, Y={coord[1]:7.4f}, Z={coord[2]:7.4f}")
+    
+    # 计算关键距离
+    left_shoulder = x[keypoints['left_shoulder']]
+    right_shoulder = x[keypoints['right_shoulder']]
+    nose = x[keypoints['nose']]
+    left_wrist = x[keypoints['left_wrist']]
+    right_wrist = x[keypoints['right_wrist']]
+    
+    shoulder_center = (left_shoulder + right_shoulder) / 2
+    
+    # 各个轴上的距离
+    print("\n[2] 肩宽在各个轴上的分量:")
+    shoulder_diff = right_shoulder - left_shoulder
+    print(f"  ΔX = {shoulder_diff[0]:7.4f}")
+    print(f"  ΔY = {shoulder_diff[1]:7.4f}")
+    print(f"  ΔZ = {shoulder_diff[2]:7.4f}")
+    shoulder_width = shoulder_diff.norm().item()
+    print(f"  总肩宽 = {shoulder_width:.4f}")
+    
+    print("\n[3] 脖子长度在各个轴上的分量:")
+    neck_diff = nose - shoulder_center
+    print(f"  ΔX = {neck_diff[0]:7.4f}")
+    print(f"  ΔY = {neck_diff[1]:7.4f}")
+    print(f"  ΔZ = {neck_diff[2]:7.4f}")
+    neck_length = neck_diff.norm().item()
+    print(f"  总脖子长度 = {neck_length:.4f}")
+    
+    print("\n[4] 左臂长度在各个轴上的分量:")
+    left_arm_diff = left_wrist - left_shoulder
+    print(f"  ΔX = {left_arm_diff[0]:7.4f}")
+    print(f"  ΔY = {left_arm_diff[1]:7.4f}")
+    print(f"  ΔZ = {left_arm_diff[2]:7.4f}")
+    left_arm_length = left_arm_diff.norm().item()
+    print(f"  总左臂长度 = {left_arm_length:.4f}")
+    
+    # 人体比例检查
+    print("\n[5] 人体比例检查:")
+    print(f"  脖子长度 / 肩宽 = {neck_length / shoulder_width:.2f}")
+    print(f"    (正常人体应该是 0.3-0.5)")
+    print(f"  左臂长度 / 肩宽 = {left_arm_length / shoulder_width:.2f}")
+    print(f"    (正常人体应该是 1.5-2.0)")
+    
+    # 测试所有可能的平面投影
+    print("\n[6] 测试所有平面投影的人体比例:")
+    
+    planes = {
+        'XY平面': (0, 1),
+        'XZ平面': (0, 2),
+        'YZ平面': (1, 2),
+    }
+    
+    best_plane = None
+    best_score = float('inf')
+    
+    for plane_name, (axis1, axis2) in planes.items():
+        # 在这个平面上重新计算比例
+        shoulder_2d = torch.tensor([shoulder_diff[axis1], shoulder_diff[axis2]])
+        neck_2d = torch.tensor([neck_diff[axis1], neck_diff[axis2]])
+        arm_2d = torch.tensor([left_arm_diff[axis1], left_arm_diff[axis2]])
+        
+        shoulder_w = shoulder_2d.norm().item()
+        neck_l = neck_2d.norm().item()
+        arm_l = arm_2d.norm().item()
+        
+        if shoulder_w > 1e-6:
+            neck_ratio = neck_l / shoulder_w
+            arm_ratio = arm_l / shoulder_w
+        else:
+            neck_ratio = 999
+            arm_ratio = 999
+        
+        # 计算与理想比例的偏差
+        neck_error = abs(neck_ratio - 0.4)  # 理想脖子/肩宽 = 0.4
+        arm_error = abs(arm_ratio - 1.8)    # 理想手臂/肩宽 = 1.8
+        total_error = neck_error + arm_error
+        
+        print(f"\n  {plane_name}:")
+        print(f"    肩宽: {shoulder_w:.4f}")
+        print(f"    脖子/肩宽: {neck_ratio:.2f} (误差: {neck_error:.2f})")
+        print(f"    手臂/肩宽: {arm_ratio:.2f} (误差: {arm_error:.2f})")
+        print(f"    总误差: {total_error:.2f}")
+        
+        if total_error < best_score:
+            best_score = total_error
+            best_plane = (plane_name, axis1, axis2)
+    
+    print(f"\n[7] 推荐使用: {best_plane[0]} (轴 {best_plane[1]}, {best_plane[2]})")
+    print(f"    总误差最小: {best_score:.2f}")
+    
+    print(f"\n{'='*70}\n")
+    
+    return best_plane
+
 
 def tensor_to_pose(t_btjc, header):
     """Convert tensor → Pose-format object."""
@@ -461,7 +581,9 @@ if __name__ == "__main__":
 
         #orientation, shoulder_axis, neck_axis = analyze_upper_body_structure(gt, "GT")
 
-        # 再可视化
+        best_plane_info = comprehensive_diagnosis(gt, "GT")
+        print(f"\n最佳平面: {best_plane_info}")
+        
         gt_f = visualize_yz_plane(gt, "GT")
         pred_f = visualize_yz_plane(pred, "PRED")
 
