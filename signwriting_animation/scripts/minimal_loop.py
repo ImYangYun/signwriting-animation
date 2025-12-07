@@ -355,7 +355,53 @@ if __name__ == "__main__":
     # 方案2：PRED 从模型输出转换
     print("\n[2] PRED - 从模型输出转换:")
     pred_cpu = pred.cpu()
-    pose_pred = tensor_to_pose(pred_cpu, header)
+
+    # 计算缩放因子：根据身体部分的范围
+    pred_body = pred_cpu[0, :, 0:33]  # 身体关键点
+    gt_body_cpu = gt.cpu()[0, :, 0:33]
+
+    # 计算 X, Y 方向的范围
+    pred_x_range = pred_body[..., 0].max() - pred_body[..., 0].min()
+    pred_y_range = pred_body[..., 1].max() - pred_body[..., 1].min()
+
+    gt_x_range = gt_body_cpu[..., 0].max() - gt_body_cpu[..., 0].min()
+    gt_y_range = gt_body_cpu[..., 1].max() - gt_body_cpu[..., 1].min()
+
+    # 计算缩放因子
+    scale_x = gt_x_range / pred_x_range if pred_x_range > 1e-6 else 1.0
+    scale_y = gt_y_range / pred_y_range if pred_y_range > 1e-6 else 1.0
+    scale_factor = (scale_x + scale_y) / 2  # 使用平均值
+
+    print(f"  缩放因子: {scale_factor:.6f}")
+    print(f"    pred body X range: {pred_x_range:.2f} → GT: {gt_x_range:.4f}")
+    print(f"    pred body Y range: {pred_y_range:.2f} → GT: {gt_y_range:.4f}")
+
+    # 计算中心偏移
+    pred_center = torch.stack([
+        pred_body[..., 0].mean(),
+        pred_body[..., 1].mean(),
+        pred_body[..., 2].mean()
+    ])
+    gt_center = torch.stack([
+        gt_body_cpu[..., 0].mean(),
+        gt_body_cpu[..., 1].mean(),
+        gt_body_cpu[..., 2].mean()
+    ])
+
+    # 缩放并平移 PRED
+    pred_scaled = pred_cpu.clone()
+    # 先中心化
+    pred_scaled = pred_scaled - pred_center
+    # 再缩放
+    pred_scaled = pred_scaled * scale_factor
+    # 再平移到 GT 的中心
+    pred_scaled = pred_scaled + gt_center
+
+    print(f"  缩放后 PRED range:")
+    print(f"    X: [{pred_scaled[...,0].min():.4f}, {pred_scaled[...,0].max():.4f}]")
+    print(f"    Y: [{pred_scaled[...,1].min():.4f}, {pred_scaled[...,1].max():.4f}]")
+
+    pose_pred = tensor_to_pose(pred_scaled, header)
     
     out_pred = os.path.join(out_dir, "pred_final.pose")
     if os.path.exists(out_pred):
