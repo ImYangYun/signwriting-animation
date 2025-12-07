@@ -9,24 +9,22 @@ from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
 from pose_format.utils.generic import reduce_holistic
-from pose_anonymization.data.normalization import normalize_mean_std
+from pose_anonymization.data.normalization import normalize_mean_std, pre_process_pose
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
 
 def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
-    """
-    Normalize a Pose object using an externally provided mean/std dict.
-    This replaces the default per-file normalization for global consistency.
-    """
+    
     pose = copy.deepcopy(pose)
+    pose = pre_process_pose(pose)
+
     mean = torch.tensor(mean_std["mean"]).float()
     std = torch.tensor(mean_std["std"]).float()
-
+    
     data = torch.from_numpy(pose.body.data).float()
     data = (data - mean) / std
     pose.body.data = data.numpy()
-
     return pose
 
 def _coalesce_maybe_nan(x) -> Optional[int]:
