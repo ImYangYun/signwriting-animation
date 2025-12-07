@@ -236,6 +236,7 @@ class LitMinimal(pl.LightningModule):
 
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
         pred_bjct = torch.clamp(pred_bjct, -3.0, 3.0)
+        target_bjct = torch.clamp(target_bjct, -3.0, 3.0)
 
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
