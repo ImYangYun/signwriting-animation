@@ -49,7 +49,7 @@ if __name__ == "__main__":
     out_dir = "logs/minimal_178"
     os.makedirs(out_dir, exist_ok=True)
 
-    stats_path = f"{data_dir}/mean_std_178_fixed.pt"
+    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     stats = torch.load(stats_path)
 
     # Dataset
