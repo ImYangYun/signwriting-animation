@@ -162,6 +162,144 @@ def visualize_with_rotation_test(btjc, name="pose"):
             print(f"{view_name:20s} | X_std={std_x:.3f}, Y_std={std_y:.3f}, "
                   f"ratio={aspect_ratio:.2f}")
 
+# 专门为上半身手语数据设计的诊断函数
+
+def analyze_upper_body_structure(btjc, name="pose"):
+    """
+    分析上半身关键点的空间关系
+    
+    MediaPipe Holistic 上半身关键点:
+    - 0: 鼻子
+    - 7, 8: 左耳、右耳
+    - 11, 12: 左肩、右肩
+    - 13, 14: 左肘、右肘
+    - 15, 16: 左手腕、右手腕
+    - 33-53: 左手21个点
+    - 54-74: 右手21个点
+    """
+    
+    if btjc.dim() == 4:
+        x = btjc[0, 0].clone()  # 只看第一帧 [J, 3]
+    else:
+        x = btjc[0].clone()
+    
+    print(f"\n{'='*60}")
+    print(f"{name} 上半身结构分析")
+    print(f"{'='*60}")
+    
+    # 定义关键点
+    keypoints = {
+        'nose': 0,
+        'left_ear': 7,
+        'right_ear': 8,
+        'left_shoulder': 11,
+        'right_shoulder': 12,
+        'left_elbow': 13,
+        'right_elbow': 14,
+        'left_wrist': 15,
+        'right_wrist': 16,
+    }
+    
+    print("\n关键点坐标 (原始):")
+    for name_key, idx in keypoints.items():
+        if idx < x.shape[0]:
+            coord = x[idx]
+            print(f"  {name_key:15s} [{idx:3d}]: X={coord[0]:7.4f}, Y={coord[1]:7.4f}, Z={coord[2]:7.4f}")
+    
+    # 计算关键向量
+    print("\n关键向量分析:")
+    
+    # 1. 肩膀向量 (左肩 → 右肩) - 应该是水平的
+    shoulder_vec = x[keypoints['right_shoulder']] - x[keypoints['left_shoulder']]
+    shoulder_len = shoulder_vec.norm().item()
+    print(f"  肩膀向量 (L→R): X={shoulder_vec[0]:7.4f}, Y={shoulder_vec[1]:7.4f}, Z={shoulder_vec[2]:7.4f}")
+    print(f"  肩宽: {shoulder_len:.4f}")
+    
+    shoulder_abs = shoulder_vec.abs()
+    shoulder_main = torch.argmax(shoulder_abs).item()
+    axis_names = ['X', 'Y', 'Z']
+    print(f"  → 肩膀主要沿 {axis_names[shoulder_main]} 轴 (值={shoulder_vec[shoulder_main]:.4f})")
+    
+    # 2. 脖子向量 (肩膀中心 → 鼻子) - 应该是垂直的
+    shoulder_center = (x[keypoints['left_shoulder']] + x[keypoints['right_shoulder']]) / 2
+    neck_vec = x[keypoints['nose']] - shoulder_center
+    neck_len = neck_vec.norm().item()
+    print(f"\n  脖子向量 (shoulder→nose): X={neck_vec[0]:7.4f}, Y={neck_vec[1]:7.4f}, Z={neck_vec[2]:7.4f}")
+    print(f"  脖子长度: {neck_len:.4f}")
+    
+    neck_abs = neck_vec.abs()
+    neck_main = torch.argmax(neck_abs).item()
+    print(f"  → 脖子主要沿 {axis_names[neck_main]} 轴 (值={neck_vec[neck_main]:.4f})")
+    
+    # 3. 头部宽度向量 (左耳 → 右耳) - 应该和肩膀平行
+    ear_vec = x[keypoints['right_ear']] - x[keypoints['left_ear']]
+    ear_len = ear_vec.norm().item()
+    print(f"\n  头部向量 (L_ear→R_ear): X={ear_vec[0]:7.4f}, Y={ear_vec[1]:7.4f}, Z={ear_vec[2]:7.4f}")
+    print(f"  头宽: {ear_len:.4f}")
+    
+    # 4. 手臂向量
+    left_arm_vec = x[keypoints['left_wrist']] - x[keypoints['left_shoulder']]
+    right_arm_vec = x[keypoints['right_wrist']] - x[keypoints['right_shoulder']]
+    print(f"\n  左臂向量 (shoulder→wrist): X={left_arm_vec[0]:7.4f}, Y={left_arm_vec[1]:7.4f}, Z={left_arm_vec[2]:7.4f}")
+    print(f"  右臂向量 (shoulder→wrist): X={right_arm_vec[0]:7.4f}, Y={right_arm_vec[1]:7.4f}, Z={right_arm_vec[2]:7.4f}")
+    
+    # 5. 判断正确的坐标系
+    print(f"\n{'='*60}")
+    print("坐标系判断:")
+    print(f"{'='*60}")
+    
+    # 理想情况：肩膀应该是水平的，脖子应该是垂直的
+    if shoulder_main == neck_main:
+        print("⚠️  异常：肩膀和脖子在同一个轴上！")
+    
+    # 判断当前坐标系
+    if shoulder_main == 0 and neck_main == 1:
+        print("✓ 当前配置：X=水平(左右), Y=垂直(上下)")
+        print("  → 这是标准正视图")
+        if neck_vec[1] > 0:
+            print("  → 头在上方 ✓")
+            orientation = "upright"
+        else:
+            print("  → 头在下方，需要翻转Y轴")
+            orientation = "flip_y"
+    
+    elif shoulder_main == 0 and neck_main == 2:
+        print("✗ 肩膀在X轴，脖子在Z轴")
+        print("  → 这是俯视/仰视图")
+        print("  → 建议：将 Z 映射为 Y (垂直方向)")
+        orientation = "use_xz_plane"
+    
+    elif shoulder_main == 1 and neck_main == 0:
+        print("✗ 肩膀在Y轴，脖子在X轴")
+        print("  → 坐标系旋转了90度")
+        print("  → 建议：交换 X 和 Y")
+        orientation = "swap_xy"
+    
+    elif shoulder_main == 1 and neck_main == 2:
+        print("✗ 肩膀在Y轴，脖子在Z轴")
+        print("  → 建议：将 Y 映射为 X, Z 映射为 Y")
+        orientation = "use_yz_plane"
+    
+    elif shoulder_main == 2 and neck_main == 0:
+        print("✗ 肩膀在Z轴，脖子在X轴")
+        print("  → 建议：将 Z 映射为 X, X 映射为 Y")
+        orientation = "use_zx_plane"
+    
+    elif shoulder_main == 2 and neck_main == 1:
+        print("✗ 肩膀在Z轴，脖子在Y轴")
+        print("  → 建议：将 Z 映射为 X")
+        orientation = "use_zy_plane"
+    
+    else:
+        print("⚠️  无法判断，使用默认配置")
+        orientation = "default"
+    
+    print(f"\n推荐配置: {orientation}")
+    print(f"{'='*60}\n")
+    
+    return orientation, shoulder_main, neck_main
+
+
 
 def tensor_to_pose(t_btjc, header):
     """Convert tensor → Pose-format object."""
@@ -316,8 +454,11 @@ if __name__ == "__main__":
         #pred_f = visualize_pose(pred, scale=250, offset=(500, 500))
         #gt_f   = visualize_pose(gt,  scale=250, offset=(500, 500))
 
-        visualize_with_rotation_test(gt, "GT")
-        # 替换你的可视化部分
+        #visualize_with_rotation_test(gt, "GT")
+
+        orientation, shoulder_axis, neck_axis = analyze_upper_body_structure(gt, "GT")
+
+        # 再可视化
         gt_f = visualize_gt_correctly(gt, "GT")
         pred_f = visualize_gt_correctly(pred, "PRED")
 
