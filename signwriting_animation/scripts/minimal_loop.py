@@ -63,10 +63,13 @@ if __name__ == "__main__":
     )
     base_ds.mean_std = torch.load(stats_path)
 
-    small_ds = torch.utils.data.Subset(base_ds, [0, 1, 2, 3])
+    #small_ds = torch.utils.data.Subset(base_ds, [0, 1, 2, 3])
+    num_samples = min(100, len(base_ds))  # 使用100个样本（或数据集的全部，如果不足100）
+    train_indices = list(range(num_samples))
+    train_ds = torch.utils.data.Subset(base_ds, train_indices)
     loader = DataLoader(
-        small_ds,
-        batch_size=4,
+        train_ds,
+        batch_size=8,
         shuffle=True,
         collate_fn=zero_pad_collator,
     )
@@ -84,16 +87,18 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=200,
+        max_epochs=50,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        limit_train_batches=1,
-        limit_val_batches=1,
         enable_checkpointing=False,
-        deterministic=True,
+        deterministic=False,
     )
 
-    print("\n[TRAIN] Overfit 4 samples...")
+    print("\n[TRAIN] 开始训练...")
+    print(f"  - 样本数: {len(train_ds)}")
+    print(f"  - Batch size: 8")
+    print(f"  - 每个epoch: {len(loader)} batches")
+    print(f"  - 总训练步数: {len(loader) * 50}")
     trainer.fit(model, loader, loader)
 
     # ============================================================
