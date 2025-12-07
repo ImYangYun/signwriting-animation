@@ -42,10 +42,16 @@ def temporal_smooth(x, k=5):
     return x.contiguous()
 
 
-def visualize_gt_correctly(btjc, name="pose"):
+import torch
+
+def visualize_yz_plane(btjc, name="pose"):
     """
-    专门为你的 178 关键点数据设计的可视化函数
-    假设数据已经过中心化，Z轴是深度
+    使用 YZ 平面进行可视化（适用于你的数据）
+    
+    坐标映射：
+    - 原始 Y → 显示 X (水平方向)
+    - 原始 Z → 显示 Y (垂直方向)
+    - 原始 X → 深度 (忽略)
     """
     if btjc.dim() == 4:
         x = btjc[0].clone()  # [T, J, 3]
@@ -53,65 +59,62 @@ def visualize_gt_correctly(btjc, name="pose"):
         x = btjc.clone()
     
     T, J, C = x.shape
-    print(f"\n====== {name} 可视化 ======")
-    print(f"Shape: {x.shape}")
-    print(f"原始 X range: [{x[...,0].min():.4f}, {x[...,0].max():.4f}]")
+    print(f"\n====== {name} 可视化 (YZ平面) ======")
+    print(f"原始 shape: {x.shape}")
     print(f"原始 Y range: [{x[...,1].min():.4f}, {x[...,1].max():.4f}]")
     print(f"原始 Z range: [{x[...,2].min():.4f}, {x[...,2].max():.4f}]")
     
-    # ============================================
-    # 策略 1: 直接使用 X, Y，忽略 Z
-    # ============================================
+    # 1. 提取 YZ 平面
+    yz = x[..., 1:3].clone()  # [T, J, 2] - 取 Y 和 Z
     
-    # 1. 找到有效点（排除全0点）
-    valid_mask = (x[0].abs().sum(dim=-1) > 1e-6)
+    # 2. 找到有效点
+    valid_mask = (yz[0].abs().sum(dim=-1) > 1e-6)
     print(f"有效关键点: {valid_mask.sum()}/{J}")
     
     if valid_mask.sum() == 0:
-        print("⚠️ 没有有效点！")
-        return x.unsqueeze(0)
+        print("⚠️ 没有有效点")
+        result = torch.zeros_like(x)
+        result[..., :2] = yz
+        return result.unsqueeze(0)
     
-    # 2. 只处理 XY 平面（忽略 Z）
-    xy = x[..., :2].clone()  # [T, J, 2]
+    # 3. 中心化（使用有效点的均值）
+    yz_valid = yz[0, valid_mask]
+    center = yz_valid.mean(dim=0)  # [2]
+    yz = yz - center
+    print(f"中心点 (YZ): [{center[0]:.4f}, {center[1]:.4f}]")
     
-    # 3. 使用第一帧的有效点计算中心
-    xy_valid = xy[0, valid_mask]
-    center = xy_valid.mean(dim=0)  # [2]
-    print(f"中心点 (XY): [{center[0]:.4f}, {center[1]:.4f}]")
-    
-    # 4. 中心化
-    xy = xy - center
-    
-    # 5. 计算缩放因子（使用95百分位避免异常值）
-    dist = torch.norm(xy[0, valid_mask], dim=-1)
+    # 4. 计算缩放因子
+    dist = torch.norm(yz[0, valid_mask], dim=-1)
     k = max(1, int(len(dist) * 0.95))
     scale_ref = torch.topk(dist, k, largest=False)[0].max()
     
     if scale_ref < 1e-3:
         scale_ref = 1.0
     
-    # 目标：让身体宽度约为 400 像素
+    # 目标：让身体占据约 400 像素
     scale_factor = 200 / scale_ref
-    xy = xy * scale_factor
-    
+    yz = yz * scale_factor
     print(f"缩放参考: {scale_ref:.4f}, 缩放因子: {scale_factor:.2f}")
     
-    # 6. 翻转 Y 轴（让人正立）
-    xy[..., 1] = -xy[..., 1]
+    # 5. 翻转 Z 轴（让头在上方）
+    # 从你的数据看，脖子向量 Z=1.7140 是正的，说明头在 Z 正方向
+    # 显示时需要翻转，让头在屏幕上方
+    yz[..., 1] = -yz[..., 1]
     
-    # 7. 平移到屏幕中心
-    xy[..., 0] += 512
-    xy[..., 1] += 384
+    # 6. 平移到屏幕中心
+    yz[..., 0] += 512  # Y → 屏幕 X (水平)
+    yz[..., 1] += 384  # Z → 屏幕 Y (垂直)
     
-    # 8. 重新组装成 3D（Z 保持不变或清零）
+    # 7. 重新组装成 3D 坐标
     result = torch.zeros_like(x)
-    result[..., :2] = xy
-    result[..., 2] = x[..., 2]  # 保留原始 Z（如果需要的话）
+    result[..., 0] = yz[..., 0]  # 显示 X ← 原始 Y
+    result[..., 1] = yz[..., 1]  # 显示 Y ← 原始 Z
+    result[..., 2] = x[..., 0]   # 保留原始 X（深度）
     
     print(f"最终 X range: [{result[...,0].min():.1f}, {result[...,0].max():.1f}]")
     print(f"最终 Y range: [{result[...,1].min():.1f}, {result[...,1].max():.1f}]")
     
-    # 检查是否有点超出屏幕
+    # 检查超出屏幕
     out_x = ((result[..., 0] < 0) | (result[..., 0] > 1024)).sum()
     out_y = ((result[..., 1] < 0) | (result[..., 1] > 768)).sum()
     if out_x > 0 or out_y > 0:
@@ -456,11 +459,11 @@ if __name__ == "__main__":
 
         #visualize_with_rotation_test(gt, "GT")
 
-        orientation, shoulder_axis, neck_axis = analyze_upper_body_structure(gt, "GT")
+        #orientation, shoulder_axis, neck_axis = analyze_upper_body_structure(gt, "GT")
 
         # 再可视化
-        gt_f = visualize_gt_correctly(gt, "GT")
-        pred_f = visualize_gt_correctly(pred, "PRED")
+        gt_f = visualize_yz_plane(gt, "GT")
+        pred_f = visualize_yz_plane(pred, "PRED")
 
         print("gt_f shape:", gt_f.shape)
         print("pred_f shape:", pred_f.shape)
