@@ -235,6 +235,8 @@ class LitMinimal(pl.LightningModule):
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
+        pred_bjct = torch.clamp(pred_bjct, -3.0, 3.0)
+
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
         # velocity / acceleration
@@ -261,7 +263,9 @@ class LitMinimal(pl.LightningModule):
             "train/vel": loss_vel,
             "train/acc": loss_acc,
         }, prog_bar=True)
-
+        # ==== PATCH 5: debug 检查 ====
+        if pred_bjct.abs().max() > 10:
+            print("⚠ WARNING: pred_norm explosion →", pred_bjct.abs().max().item())
         return loss
 
     #  Validation Step
@@ -351,9 +355,10 @@ class LitMinimal(pl.LightningModule):
                 wrapped,
                 shape=bjct_shape,
                 model_kwargs={"y": cond},
-                clip_denoised=False,
+                clip_denoised=True,
                 progress=False,
             )
+            x_bjct = torch.clamp(x_bjct, -3.0, 3.0)
             x_btjc = self.bjct_to_btjc(x_bjct)
             frames.append(x_btjc)
 
@@ -376,5 +381,8 @@ class LitMinimal(pl.LightningModule):
         print(f"[on_predict_start] stats moved to {self.device}")
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
-    
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        return {
+            "optimizer": optimizer,
+            "gradient_clip_val": 1.0,      # ==== PATCH 4 ====
+        }
