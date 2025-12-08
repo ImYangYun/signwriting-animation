@@ -130,52 +130,53 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
-        time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
-        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
-        
-        past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
-        future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
+        time_emb = self.embed_timestep(timesteps)
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)
 
-        Tf = future_motion_emb.size(0)
-        B  = future_motion_emb.size(1)
-        t = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
-        t_latent = self.future_time_proj(t).expand(-1, B, -1)
+        past_motion_emb = self.past_motion_process(past_motion)
+        future_motion_emb = self.future_motion_process(x)
 
+        T = future_motion_emb.size(0)
+        B = future_motion_emb.size(1)
+
+        t_lin = torch.linspace(0, 1, steps=T, device=future_motion_emb.device).view(T, 1, 1)
+        t_latent = self.future_time_proj(t_lin).expand(-1, B, -1)
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
-        Tf = future_motion_emb.shape[0]
 
-        time_cond = time_emb.repeat(Tf, 1, 1)
-        sign_cond = signwriting_emb.repeat(Tf, 1, 1)
+        future_motion_emb = self.sequence_pos_encoder(future_motion_emb)
 
-        # 🔧 FIX 2: 增大条件信号权重从 0.1 → 0.3
-        xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
-        xseq = self.sequence_pos_encoder(xseq)
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
             key=past_motion_emb,
             value=past_motion_emb
         )
+        fused = self.cross_ln(future_motion_emb + attn_out)
 
-        future_motion_emb = self.cross_ln(future_motion_emb + attn_out)
+        time_cond = time_emb.repeat(T, 1, 1)
+        sign_cond = signwriting_emb.repeat(T, 1, 1)
 
-        xseq = xseq + future_motion_emb
+        xseq = fused + 0.3 * time_cond + 0.3 * sign_cond
 
-        output = self.seqEncoder(xseq)[-num_frames:]
-        
-        # 🔍 DEBUG: 检查输出维度
-        print(f"[DEBUG models.py forward]")
-        print(f"  num_frames: {num_frames}")
-        print(f"  xseq.shape: {xseq.shape}")
-        print(f"  output (after slice).shape: {output.shape}")
-        
-        output = self.pose_projection(output)
+        # ------------------ DEBUG -------------------
+        print("\n[DEBUG models.py forward]")
+        print(f"  num_frames input: {num_frames}")
+        print(f"  past_motion_emb.shape:   {past_motion_emb.shape}")
+        print(f"  future_motion_emb.shape: {future_motion_emb.shape}")
+        print(f"  fused.shape:             {fused.shape}")
+        print(f"  xseq.shape before encoder: {xseq.shape}")
+
+        output = self.seqEncoder(xseq)   # [T,B,D]
+
+        print(f"  output (after seqEncoder).shape: {output.shape}")
+
+
+        output = self.pose_projection(output)  # [T,B,J,C]
+
         print(f"  output (after projection).shape: {output.shape}")
-        
         result = output.permute(1, 2, 3, 0).contiguous()
-        print(f"  result (after permute).shape: {result.shape}")
-        
+        print(f"  result (after permute).shape: {result.shape}\n")
         return result
 
     def interface(self,
