@@ -23,15 +23,28 @@ def _to_dense(x):
 
 
 def sanitize_btjc(x):
-    x = _to_dense(x)
-    
-    # Strip P dimension if exists [B,T,P,J,C] → [B,T,J,C]
+    """
+    SAFE version:
+    - Converts pose-format tensors to dense
+    - Removes P dimension ONLY if it's really [B,T,1,J,C]
+    - Never squeezes J or C axes
+    """
+    if hasattr(x, "zero_filled"):
+        x = x.zero_filled()
+    if hasattr(x, "tensor"):
+        x = x.tensor
+
     if x.dim() == 5:
-        x = x[:, :, 0]
-    
+        # only safe to strip if P==1
+        if x.size(2) != 1:
+            raise ValueError(f"sanitize_btjc ERROR: unexpected P dimension size={x.size(2)} "
+                             f"(expected 1). Shape={tuple(x.shape)}")
+        x = x[:, :, 0]   # [B,T,P,J,C] → [B,T,J,C]
+
     if x.dim() != 4:
-        raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")  
-    return x
+        raise ValueError(f"sanitize_btjc ERROR: expected [B,T,J,C], got {tuple(x.shape)}")
+
+    return x.float().contiguous()
 
 
 def masked_mse(pred_btjc, tgt_btjc, mask_bt):
