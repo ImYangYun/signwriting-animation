@@ -217,27 +217,33 @@ class LitMinimal(pl.LightningModule):
     #  Diffusion training step
     def _diffuse_once(self, x0_btjc, t_long, cond):
         """
-        Single diffusion training step:
+        Unified diffusion step:
         q_sample(x0, t) → model.forward(x_t) → pred of x0 or eps
-        Training ALWAYS uses BTJC (not BJCT!)
+        Uses the NEW forward() path for prediction.
         """
-        noise = torch.randn_like(x0_btjc)   # correct shape: [B,T,J,C]
-        x_t = self.diffusion.q_sample(x0_btjc, t_long, noise=noise)
+
+        x0_bjct = self.btjc_to_bjct(x0_btjc)
+
+        noise = torch.randn_like(x0_bjct)
+
+        x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
 
         t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
 
-        print(">>> past_motion shape =", cond["input_pose"].shape)  # expected [B,J,C,Tp] OR [B,Tp,J,C] depending on model
-        print(">>> noisy x_t shape   =", x_t.shape)                 # should be [B,T,J,C]
-        print(">>> gt shape          =", x0_btjc.shape)             # should be [B,T,J,C]
+        past_bjct = self.btjc_to_bjct(cond["input_pose"])
+
+        print(">>> past_motion BJCT =", past_bjct.shape)
+        print(">>> noisy x_t BJCT   =", x_t.shape)
+        print(">>> gt BJCT          =", x0_bjct.shape)
 
         pred_bjct = self.model.forward(
-            x_t,                         # BTJC (correct)
+            x_t,
             t_scaled,
-            cond["input_pose"],          # BJCT (correct)
+            past_bjct,
             cond["sign_image"],
         )
 
-        target = noise if self.pred_target == "eps" else x0_btjc
+        target = noise if self.pred_target == "eps" else x0_bjct
         return pred_bjct, target
 
     #  Training Step
