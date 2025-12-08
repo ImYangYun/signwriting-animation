@@ -267,7 +267,6 @@ class LitMinimal(pl.LightningModule):
         }, prog_bar=True)
         return loss
 
-    #  Validation Step
     @torch.no_grad()
     def validation_step(self, batch, _):
         cond_raw  = batch["conditions"]
@@ -276,10 +275,8 @@ class LitMinimal(pl.LightningModule):
         mask_bt   = cond_raw.get("target_mask", None)
         sign_img  = cond_raw["sign_image"].float()
 
-        # normalize
         gt   = self.normalize(gt_btjc)
-        #past = self.normalize(past_btjc)[:, -gt.size(1):]
-        past = self.normalize(past_btjc)
+        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()  # [B,T,J,C] -> [B,J,C,T]
 
         cond = {"input_pose": past, "sign_image": sign_img}
 

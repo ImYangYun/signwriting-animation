@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+最终版本 - 避免重复归一化
+
+关键修改：
+1. data_loader.py 返回原始数据（未归一化）
+2. LightningModule 使用全局统计量进行归一化
+3. 这样只归一化一次，避免数据被过度压缩
+"""
 import os
 import torch
 import numpy as np
@@ -46,11 +54,20 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_178"
+    out_dir = "logs/minimal_178_fixed"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     stats = torch.load(stats_path)
+
+    print("\n" + "="*70)
+    print("最终修复版本")
+    print("="*70)
+    print("归一化策略：")
+    print("  - DataLoader: 返回原始数据（不归一化）")
+    print("  - LightningModule: 使用全局统计量归一化")
+    print("  - 结果: 只归一化一次，避免重复压缩")
+    print("="*70 + "\n")
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -61,18 +78,61 @@ if __name__ == "__main__":
         with_metadata=True,
         split="train",
     )
-    base_ds.mean_std = torch.load(stats_path)
+    
+    # 🔧 关键：不设置 mean_std
+    # DataLoader 将返回原始数据（未归一化）
+    # 归一化在 LightningModule 中统一处理
+    # base_ds.mean_std = torch.load(stats_path)  # ❌ 不要设置！
 
-    #small_ds = torch.utils.data.Subset(base_ds, [0, 1, 2, 3])
-    num_samples = min(100, len(base_ds))  # 使用100个样本（或数据集的全部，如果不足100）
+    # 使用合理的样本量
+    num_samples = min(2000, len(base_ds))  # 初步训练：2000 样本
+    max_epochs = 100
+    
+    print(f"[INFO] 训练配置:")
+    print(f"  - 样本数: {num_samples} / {len(base_ds)}")
+    print(f"  - Epochs: {max_epochs}")
+    print(f"  - Batch size: 8")
+    print(f"  - 每个epoch: {num_samples // 8} batches")
+    print(f"  - 总训练步数: {(num_samples // 8) * max_epochs}")
+    print(f"  - 预计时间: ~2-3 小时")
+    print()
+    
     train_indices = list(range(num_samples))
     train_ds = torch.utils.data.Subset(base_ds, train_indices)
+    
     loader = DataLoader(
         train_ds,
         batch_size=8,
         shuffle=True,
         collate_fn=zero_pad_collator,
     )
+
+    # 🔍 验证 DataLoader 输出
+    print("\n" + "="*70)
+    print("验证 DataLoader 输出")
+    print("="*70)
+    
+    test_batch = next(iter(loader))
+    test_data = test_batch["data"]
+    test_data_dense = test_data.tensor if hasattr(test_data, "tensor") else test_data
+    
+    print(f"DataLoader 输出统计:")
+    print(f"  Shape: {test_data_dense.shape}")
+    print(f"  Min: {test_data_dense.min().item():.4f}")
+    print(f"  Max: {test_data_dense.max().item():.4f}")
+    print(f"  Mean: {test_data_dense.mean().item():.4f}")
+    print(f"  Std: {test_data_dense.std().item():.4f}")
+    
+    # 判断数据是否已归一化
+    if abs(test_data_dense.mean().item()) < 0.1 and abs(test_data_dense.std().item() - 1.0) < 0.2:
+        print("\n❌ 错误：数据已被归一化！")
+        print("   请确保 data_loader.py 已按照说明修改")
+        print("   或者检查是否错误地调用了 normalize_pose_with_global_stats")
+        raise RuntimeError("DataLoader 不应该返回归一化的数据")
+    else:
+        print("\n✓ 正确：数据是原始范围（未归一化）")
+    
+    print("="*70 + "\n")
 
     num_joints = base_ds[0]["data"].shape[-2]
     num_dims = base_ds[0]["data"].shape[-1]
@@ -83,22 +143,20 @@ if __name__ == "__main__":
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=1e-4,
+        lr=5e-5,
+        diffusion_steps=500,
     )
 
     trainer = pl.Trainer(
-        max_epochs=50,
+        max_epochs=max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_checkpointing=False,
         deterministic=False,
+        log_every_n_steps=50,
     )
 
     print("\n[TRAIN] 开始训练...")
-    print(f"  - 样本数: {len(train_ds)}")
-    print(f"  - Batch size: 8")
-    print(f"  - 每个epoch: {len(loader)} batches")
-    print(f"  - 总训练步数: {len(loader) * 50}")
     trainer.fit(model, loader, loader)
 
     # ============================================================
@@ -120,7 +178,7 @@ if __name__ == "__main__":
     # Inference
     # ============================================================
     print("\n" + "="*70)
-    print("INFERENCE (Fixed - No runtime std clamp)")
+    print("INFERENCE - 最终修复版本")
     print("="*70)
     
     model.eval()
@@ -141,62 +199,32 @@ if __name__ == "__main__":
         print(f"\n[1] 基本信息:")
         print(f"    future_len = {future_len}")
         print(f"    GT shape: {gt.shape}")
+        
+        # 🔍 关键检查：输入数据应该是原始范围
+        print(f"\n[2] 输入数据范围检查:")
+        print(f"    GT range: [{gt.min():.4f}, {gt.max():.4f}]")
+        print(f"    GT mean: {gt.mean():.4f}")
+        
+        if abs(gt.mean().item()) < 0.1:
+            print("    ❌ 输入数据已被归一化！存在重复归一化问题！")
+        else:
+            print("    ✓ 输入数据是原始范围（正确）")
 
-        # ============================================================
         # 生成 PRED
-        # ============================================================
-        print(f"\n[2] 生成 PRED（归一化空间）")
+        print(f"\n[3] 生成 PRED:")
         
         pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
             future_len=future_len,
-            chunk=1,
+            chunk=20,
         )
         
         print(f"    pred_norm shape: {pred_norm.shape}")
         print(f"    pred_norm range: [{pred_norm.min():.4f}, {pred_norm.max():.4f}]")
-        print(f"    pred_norm mean/std: {pred_norm.mean():.4f} / {pred_norm.std():.4f}")
 
-        # ============================================================
-        # 检查模型统计量
-        # ============================================================
-        print(f"\n[3] 模型的 mean 和 std:")
-        print(f"    mean range: [{model.mean_pose.min():.4f}, {model.mean_pose.max():.4f}]")
-        print(f"    std range: [{model.std_pose.min():.4f}, {model.std_pose.max():.4f}]")
-
-        std_flat = model.std_pose.flatten()
-        print(f"\n    std 分布:")
-        print(f"      min: {std_flat.min().item():.6f}")
-        print(f"      50%: {torch.quantile(std_flat, 0.5).item():.6f}")
-        print(f"      max: {std_flat.max().item():.6f}")
-
-        # ============================================================
-        # 验证 GT normalize/unnormalize
-        # ============================================================
-        print(f"\n[4] 验证 GT 的归一化循环:")
-        gt_test = gt.clone()
-        gt_norm_test = model.normalize(gt_test)
-        gt_recon = model.unnormalize(gt_norm_test)
-        recon_error = (gt_test - gt_recon).abs().mean().item()
-        
-        print(f"    平均误差: {recon_error:.8f}")
-        
-        if recon_error > 1e-4:
-            print("    ⚠️  重建误差过大！")
-        else:
-            print("    ✓ 归一化循环正确")
-
-        # ============================================================
-        # ❌ 不要 clamp std！这是关键修复
-        # ============================================================
-        # 之前的代码在这里做了 std clamp，导致训练/推理不一致
-        # 现在完全移除这个步骤
-
-        # ============================================================
         # Unnormalize PRED
-        # ============================================================
-        print(f"\n[5] 反归一化 PRED:")
+        print(f"\n[4] 反归一化 PRED:")
         pred = model.unnormalize(pred_norm)
         
         print(f"    PRED range:")
@@ -219,21 +247,20 @@ if __name__ == "__main__":
         
         if 0.5 < range_ratio < 2.0:
             print(f"    ✓ PRED 数值范围正常（与 GT 接近）")
+            print(f"    ✓ 修复成功！PRED 不再是'一点'")
         else:
-            print(f"    ⚠️  PRED 数值范围异常（比率应接近 1.0）")
+            print(f"    ⚠️  PRED 数值范围异常")
 
         # DTW evaluation
         mask_bt = torch.ones(1, future_len, device=device)
         dtw_val = masked_dtw(pred, gt, mask_bt)
-        print(f"\n[6] DTW: {dtw_val:.4f}")
+        print(f"\n[5] DTW: {dtw_val:.4f}")
 
     print("="*70 + "\n")
 
-    # ============================================================
     # 详细检查关键点分布
-    # ============================================================
     print("\n" + "="*70)
-    print("详细检查 PRED 的关键点分布")
+    print("关键点分布检查")
     print("="*70)
 
     pred_cpu = pred.cpu()
@@ -246,19 +273,14 @@ if __name__ == "__main__":
         "面部": (75, 178),
     }
 
+    print("\nPRED:")
     for name, (start, end) in groups.items():
         points = pred_frame0[start:end]
-        
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        
-        print(f"\n{name}:")
-        print(f"  X range: {x_range:.4f}, Y range: {y_range:.4f}")
+        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
 
-    print("\n" + "-"*70)
-    print("对比 GT:")
-    print("-"*70)
-    
+    print("\nGT (对比):")
     gt_cpu = gt.cpu()
     gt_frame0 = gt_cpu[0, 0]
 
@@ -266,13 +288,11 @@ if __name__ == "__main__":
         points = gt_frame0[start:end]
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        print(f"{name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
+        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
 
     print("="*70 + "\n")
 
-    # ============================================================
     # 保存文件
-    # ============================================================
     print("\n" + "="*70)
     print("保存可视化文件")
     print("="*70)
@@ -294,7 +314,7 @@ if __name__ == "__main__":
     
     print(f"  保存到: {out_gt}")
 
-    print("\n[2] PRED (直接保存，不缩放):")
+    print("\n[2] PRED:")
     pose_pred = tensor_to_pose(pred, header)
     
     out_pred = os.path.join(out_dir, "pred_final.pose")
@@ -304,8 +324,9 @@ if __name__ == "__main__":
     print(f"  保存到: {out_pred}")
 
     print("\n" + "="*70)
-    print("完成！")
+    print("✓ 完成！")
     print("="*70)
     print(f"\n在 pose viewer 中打开:")
-    print(f"  - {out_gt}")
-    print(f"  - {out_pred}")
+    print(f"  - GT:   {out_gt}")
+    print(f"  - PRED: {out_pred}")
+    print(f"\n如果 PRED 不再是'一点'，说明修复成功！")

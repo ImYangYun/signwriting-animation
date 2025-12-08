@@ -14,19 +14,6 @@ from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
 
-def normalize_pose_with_global_stats(pose: Pose, mean_std: dict):
-    
-    pose = copy.deepcopy(pose)
-    pose = pre_process_pose(pose)
-
-    mean = torch.tensor(mean_std["mean"]).float()
-    std = torch.tensor(mean_std["std"]).float()
-    
-    data = torch.from_numpy(pose.body.data).float()
-    data = (data - mean) / std
-    pose.body.data = data.numpy()
-    return pose
-
 def _coalesce_maybe_nan(x) -> Optional[int]:
     """Return None if value is NaN/None/empty; else return the value."""
     if x is None:
@@ -38,14 +25,11 @@ def _coalesce_maybe_nan(x) -> Optional[int]:
 
 class DynamicPosePredictionDataset(Dataset):
     """
-    A PyTorch Dataset for dynamic sampling of normalized pose sequences,
+    A PyTorch Dataset for dynamic sampling of pose sequences,
     conditioned on SignWriting images and optional scalar metadata.
-
-    Changes:
-    - Optional `reduce_holistic`: reduce keypoints (for testing/CI speedups).
-      We apply reduction *before* normalization.
-    - Do NOT call `.zero_filled()` here; rely on `zero_pad_collator` to pad.
-    - Safe pivot in [1, total_frames-1] to ensure non-empty past/future.
+    
+    🔧 修复版本：不在 DataLoader 中进行归一化
+    归一化统一在 LightningModule 中处理
     """
     def __init__(
         self,
@@ -103,12 +87,7 @@ class DynamicPosePredictionDataset(Dataset):
 
         if self.use_reduce_holistic:
             raw = reduce_holistic(raw)
-
-        if hasattr(self, "mean_std") and self.mean_std is not None:
-            pose = normalize_pose_with_global_stats(raw, self.mean_std)
-        else:
-            pose = normalize_mean_std(raw)
-
+        pose = raw
         total_frames = len(pose.body.data)
 
         if total_frames < 5:
@@ -145,9 +124,9 @@ class DynamicPosePredictionDataset(Dataset):
         sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
 
         sample = {
-            "data": target_data,  # future window
+            "data": target_data,
             "conditions": {
-                "input_pose": input_data,   # past window
+                "input_pose": input_data,
                 "input_mask": input_mask,
                 "target_mask": target_mask,
                 "sign_image": sign_img,
@@ -185,8 +164,6 @@ def main():
         split="train",
         use_reduce_holistic=True,
     )
-    stats = torch.load("/data/yayun/pose_data/mean_std_586.pt")
-    dataset.mean_std = stats
 
     loader = DataLoader(
         dataset,
@@ -203,6 +180,21 @@ def main():
     print("Input mask:", batch["conditions"]["input_mask"].shape)
     print("Target mask:", batch["conditions"]["target_mask"].shape)
     print("Sign image:", batch["conditions"]["sign_image"].shape)
+
+    data = batch["data"]
+    if hasattr(data, "tensor"):
+        data = data.tensor
+    print(f"\nData statistics:")
+    print(f"  Min: {data.min().item():.4f}")
+    print(f"  Max: {data.max().item():.4f}")
+    print(f"  Mean: {data.mean().item():.4f}")
+    print(f"  Std: {data.std().item():.4f}")
+    
+    if abs(data.mean().item()) < 0.1 and abs(data.std().item() - 1.0) < 0.2:
+        print("  ⚠️  Warning: Data appears normalized (should be raw)")
+    else:
+        print("  ✓ Data is in raw range (correct)")
+    
     if "metadata" in batch:
         for k, v in batch["metadata"].items():
             print(f"Metadata {k}:", v.shape)

@@ -140,7 +140,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         t = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
         t_latent = self.future_time_proj(t).expand(-1, B, -1)
 
-        future_motion_emb = future_motion_emb + 0.02 * t_latent
+        future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
         Tf = future_motion_emb.shape[0]
@@ -148,7 +148,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        xseq = future_motion_emb + 0.1 * time_cond + 0.1 * sign_cond
+        xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
         xseq = self.sequence_pos_encoder(xseq)
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
@@ -245,7 +245,6 @@ class OutputProcessMLP(nn.Module):
         """
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.mlp(x)  # use MLP instead of single linear layer
-        x = x * 0.1
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x
