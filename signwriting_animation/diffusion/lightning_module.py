@@ -23,28 +23,28 @@ def _to_dense(x):
 
 
 def sanitize_btjc(x):
-    """
-    SAFE version:
-    - Converts pose-format tensors to dense
-    - Removes P dimension ONLY if it's really [B,T,1,J,C]
-    - Never squeezes J or C axes
-    """
+    # convert dense
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     if hasattr(x, "tensor"):
         x = x.tensor
 
     if x.dim() == 5:
-        # only safe to strip if P==1
-        if x.size(2) != 1:
-            raise ValueError(f"sanitize_btjc ERROR: unexpected P dimension size={x.size(2)} "
-                             f"(expected 1). Shape={tuple(x.shape)}")
-        x = x[:, :, 0]   # [B,T,P,J,C] → [B,T,J,C]
+        x = x[:, :, 0]
 
     if x.dim() != 4:
-        raise ValueError(f"sanitize_btjc ERROR: expected [B,T,J,C], got {tuple(x.shape)}")
+        raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
 
-    return x.float().contiguous()
+    B, T, A, B2 = x.shape
+
+    # If last dim is not 3 but second-last is 3, swap J and C
+    if x.shape[-1] != 3 and x.shape[-2] == 3:
+        x = x.permute(0,1,3,2)   # [B,T,C,J] → [B,T,J,C]
+
+    if x.shape[-1] != 3:
+        raise ValueError(f"sanitize_btjc: last dim must be C=3, got {x.shape}")
+
+    return x.contiguous().float()
 
 
 def masked_mse(pred_btjc, tgt_btjc, mask_bt):
@@ -226,6 +226,9 @@ class LitMinimal(pl.LightningModule):
         x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
 
         t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
+        print(">>> past_motion shape =", cond["input_pose"].shape)
+        print(">>> noisy x_t shape   =", x_t.shape)
+        print(">>> gt shape          =", x0_btjc.shape)
 
         pred_bjct = self.model.forward(
             x_t,
