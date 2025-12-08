@@ -227,28 +227,29 @@ class LitMinimal(pl.LightningModule):
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img  = cond_raw["sign_image"].float()
 
-        gt   = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc)[:, -gt.size(1):]
+        gt   = self.normalize(gt_btjc)        # [B,T,J,C]
+        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()
+
         cond = {"input_pose": past, "sign_image": sign_img}
 
         B = gt.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
-        pred_bjct = torch.clamp(pred_bjct, -3.0, 3.0)
-        target_bjct = torch.clamp(target_bjct, -3.0, 3.0)
 
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
-        # velocity / acceleration
         pred_btjc = self.bjct_to_btjc(pred_bjct)
+
+        gt_raw   = self.unnormalize(gt)
+        pred_raw = self.unnormalize(pred_btjc)
 
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
 
-        if pred_btjc.size(1) > 1:
-            v_pred = pred_btjc[:, 1:] - pred_btjc[:, :-1]
-            v_gt   = gt[:, 1:]         - gt[:, :-1]
+        if pred_raw.size(1) > 1:
+            v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
+            v_gt   = gt_raw[:, 1:]   - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.l1_loss(v_pred, v_gt)
 
             if v_pred.size(1) > 1:
@@ -264,9 +265,6 @@ class LitMinimal(pl.LightningModule):
             "train/vel": loss_vel,
             "train/acc": loss_acc,
         }, prog_bar=True)
-        # ==== PATCH 5: debug 检查 ====
-        if pred_bjct.abs().max() > 10:
-            print("⚠ WARNING: pred_norm explosion →", pred_bjct.abs().max().item())
         return loss
 
     #  Validation Step
@@ -280,7 +278,8 @@ class LitMinimal(pl.LightningModule):
 
         # normalize
         gt   = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc)[:, -gt.size(1):]
+        #past = self.normalize(past_btjc)[:, -gt.size(1):]
+        past = self.normalize(past_btjc)
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
@@ -326,13 +325,13 @@ class LitMinimal(pl.LightningModule):
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
 
-        past_norm = self.normalize(past_btjc.to(device))
-        sign = sign_img.to(device)
+        past_raw = past_btjc.to(device)
 
-        B, Tp, J, C = past_norm.shape
-        frames = []
-        remain = int(future_len)
-        cur_hist = past_norm.clone()
+        B, Tp, J, C = past_raw.shape
+        cur_hist_raw = past_raw.clone()
+        frames_raw = []
+
+        sign = sign_img.to(device)
 
         class _Wrapper(nn.Module):
             def __init__(self, mdl):
@@ -342,34 +341,42 @@ class LitMinimal(pl.LightningModule):
                 return self.m.interface(x, t, kw["y"])
 
         wrapped = _Wrapper(self.model)
+        remain = int(future_len)
 
         while remain > 0:
             n = min(chunk, remain)
-            bjct_shape = (B, J, C, n)
 
+            cur_hist_norm = self.normalize(cur_hist_raw)
             cond = {
-                "input_pose": self.btjc_to_bjct(cur_hist),
+                "input_pose": self.btjc_to_bjct(cur_hist_norm),
                 "sign_image": sign,
             }
+
+            bjct_shape = (B, J, C, n)
 
             x_bjct = self.diffusion.p_sample_loop(
                 wrapped,
                 shape=bjct_shape,
                 model_kwargs={"y": cond},
-                clip_denoised=True,
+                clip_denoised=False,
                 progress=False,
             )
-            x_bjct = torch.clamp(x_bjct, -3.0, 3.0)
-            x_btjc = self.bjct_to_btjc(x_bjct)
-            frames.append(x_btjc)
 
-            cur_hist = torch.cat([cur_hist, x_btjc], dim=1)
-            if cur_hist.size(1) > Tp:
-                cur_hist = cur_hist[:, -Tp:]
+            x_btjc_norm = self.bjct_to_btjc(x_bjct)
+
+            # unnormalize to raw (the key!)
+            x_btjc_raw = self.unnormalize(x_btjc_norm)
+
+            frames_raw.append(x_btjc_raw)
+
+            # sliding window on raw
+            cur_hist_raw = torch.cat([cur_hist_raw, x_btjc_raw], dim=1)
+            if cur_hist_raw.size(1) > Tp:
+                cur_hist_raw = cur_hist_raw[:, -Tp:]
 
             remain -= n
 
-        return torch.cat(frames, dim=1)
+        return torch.cat(frames_raw, dim=1)
 
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)

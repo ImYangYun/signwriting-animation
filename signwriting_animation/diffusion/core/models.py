@@ -162,7 +162,7 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         output = self.seqEncoder(xseq)[-num_frames:]
         output = self.pose_projection(output)
-        return output
+        return output.permute(1, 2, 3, 0).contiguous()
 
     def interface(self,
                   x: torch.Tensor,
@@ -192,10 +192,11 @@ class SignWritingToPoseDiffusion(nn.Module):
                 The predicted denoised motion at the current timestep.
                 Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
         """
-        batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint = x.shape
+        batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
         signwriting_image = y['sign_image']
         past_motion = y['input_pose']
+        past_motion = past_motion.permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
 
         # CFG on past motion
         keep_batch_idx = torch.rand(batch_size, device=past_motion.device) < (1 - self.cond_mask_prob)
@@ -244,7 +245,7 @@ class OutputProcessMLP(nn.Module):
         """
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.mlp(x)  # use MLP instead of single linear layer
-        x = torch.tanh(x) * 3.0
+        x = x * 0.1
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
         x = x.permute(1, 2, 3, 0)
         return x
