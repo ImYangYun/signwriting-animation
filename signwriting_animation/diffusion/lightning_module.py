@@ -228,7 +228,7 @@ class LitMinimal(pl.LightningModule):
         sign_img  = cond_raw["sign_image"].float()
 
         gt   = self.normalize(gt_btjc)        # [B,T,J,C]
-        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()
+        past = self.normalize(past_btjc)  # [B,T,J,C]
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
@@ -276,7 +276,7 @@ class LitMinimal(pl.LightningModule):
         sign_img  = cond_raw["sign_image"].float()
 
         gt   = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()  # [B,T,J,C] -> [B,J,C,T]
+        past = self.normalize(past_btjc)  # [B,T,J,C]
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
@@ -389,5 +389,5 @@ class LitMinimal(pl.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         return {
             "optimizer": optimizer,
-            "gradient_clip_val": 1.0,      # ==== PATCH 4 ====
+            "gradient_clip_val": 1.0,
         }
