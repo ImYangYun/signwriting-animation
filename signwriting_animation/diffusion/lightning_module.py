@@ -215,10 +215,10 @@ class LitMinimal(pl.LightningModule):
         t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
 
         pred_bjct = self.model.forward(
-            x_t,                     # noisy BJCT
-            t_scaled,                # long
-            cond["input_pose"],      # past BTJC (already normalized)
-            cond["sign_image"],      # signwriting images
+            x_t,
+            t_scaled,
+            self.btjc_to_bjct(cond["input_pose"]),
+            cond["sign_image"],
         )
 
         target = noise if self.pred_target == "eps" else x0_bjct
@@ -232,7 +232,7 @@ class LitMinimal(pl.LightningModule):
         sign_img  = cond_raw["sign_image"].float()
 
         gt   = self.normalize(gt_btjc)        # [B,T,J,C]
-        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
+        past = self.normalize(past_btjc)      # BTJC
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
