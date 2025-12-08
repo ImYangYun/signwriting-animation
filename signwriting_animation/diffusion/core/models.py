@@ -132,18 +132,9 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
-
-        past_motion_reshaped = past_motion.permute(3, 0, 1, 2)  # → [T_past, B, J, C]
-        T_past, B_past, J_past, C_past = past_motion_reshaped.shape
-        past_motion_reshaped = past_motion_reshaped.reshape(T_past, B_past, J_past * C_past)  # → [T_past, B, J*C]
         
-        past_motion_emb = self.past_motion_process(past_motion_reshaped)  # [past_frames, batch_size, num_latent_dims]
-
-        x_reshaped = x.permute(3, 0, 1, 2)  # → [T, B, J, C]
-        T_future, B_future, J_future, C_future = x_reshaped.shape
-        x_reshaped = x_reshaped.reshape(T_future, B_future, J_future * C_future)  # → [T, B, J*C]
-        
-        future_motion_emb = self.future_motion_process(x_reshaped)  # [future_frames, batch_size, num_latent_dims]
+        past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
+        future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
 
         Tf = future_motion_emb.size(0)
         B  = future_motion_emb.size(1)
