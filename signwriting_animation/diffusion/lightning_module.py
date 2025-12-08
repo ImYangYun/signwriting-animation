@@ -230,7 +230,7 @@ class LitMinimal(pl.LightningModule):
         pred_bjct = self.model.forward(
             x_t,
             t_scaled,
-            self.btjc_to_bjct(cond["input_pose"]),
+            cond["input_pose"],
             cond["sign_image"],
         )
 
@@ -245,7 +245,7 @@ class LitMinimal(pl.LightningModule):
         sign_img  = cond_raw["sign_image"].float()
 
         gt   = self.normalize(gt_btjc)        # [B,T,J,C]
-        past = self.btjc_to_bjct(self.normalize(past_btjc))
+        past = self.normalize(past_btjc)
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
@@ -294,7 +294,7 @@ class LitMinimal(pl.LightningModule):
 
         # normalize
         gt   = self.normalize(gt_btjc)
-        past = self.btjc_to_bjct(self.normalize(past_btjc))
+        past = self.normalize(past_btjc)
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
