@@ -203,19 +203,23 @@ class LitMinimal(pl.LightningModule):
 
     #  Diffusion training step
     def _diffuse_once(self, x0_btjc, t_long, cond):
-        x0_bjct = self.btjc_to_bjct(x0_btjc)
-        noise   = torch.randn_like(x0_bjct)
-        x_t     = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
+        """
+        Unified diffusion step:
+        q_sample(x0, t) → model.forward(x_t) → pred of x0 or eps
+        Uses the NEW forward() path for prediction.
+        """
+        x0_bjct = self.btjc_to_bjct(x0_btjc)   # [B,J,C,T]
+        noise   = torch.randn_like(x0_bjct)    # same shape
+        x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
 
         t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
 
-        pred_bjct = self._forward_bjct(
-            x_bjct=x_t,
-            t_long=t_scaled,
-            past_btjc=cond["input_pose"],
-            sign_img=cond["sign_image"]
+        pred_bjct = self.model.forward(
+            x_t,                     # noisy BJCT
+            t_scaled,                # long
+            cond["input_pose"],      # past BTJC (already normalized)
+            cond["sign_image"],      # signwriting images
         )
-
 
         target = noise if self.pred_target == "eps" else x0_bjct
         return pred_bjct, target
@@ -228,7 +232,7 @@ class LitMinimal(pl.LightningModule):
         sign_img  = cond_raw["sign_image"].float()
 
         gt   = self.normalize(gt_btjc)        # [B,T,J,C]
-        past = self.normalize(past_btjc)  # [B,T,J,C]
+        past = self.normalize(past_btjc).permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
@@ -275,24 +279,35 @@ class LitMinimal(pl.LightningModule):
         mask_bt   = cond_raw.get("target_mask", None)
         sign_img  = cond_raw["sign_image"].float()
 
+        # normalize
         gt   = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc)  # [B,T,J,C]
+        past = self.normalize(past_btjc)
 
         cond = {"input_pose": past, "sign_image": sign_img}
 
         B = gt.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
-        # NOTE: _diffuse_once has safe timestep now
         pred_bjct, _ = self._diffuse_once(gt, t, cond)
 
-        # -- FIX: convert GT to BJCT for correct loss --
+        # GT → BJCT for comparison
         gt_bjct = self.btjc_to_bjct(gt)
-        loss_main = torch.nn.functional.mse_loss(pred_bjct, gt_bjct)
 
+        Tpred = pred_bjct.size(-1)
+        Tgt   = gt_bjct.size(-1)
+        Tmin  = min(Tpred, Tgt)
+
+        if Tpred != Tgt:
+            print(f"[VAL ALIGN] pred T={Tpred}, gt T={Tgt} → using Tmin={Tmin}")
+
+        pred_bjct = pred_bjct[..., :Tmin]
+        gt_bjct   = gt_bjct[..., :Tmin]
+
+        # main validation loss
+        loss_main = torch.nn.functional.mse_loss(pred_bjct, gt_bjct)
         self.log("val/mse", loss_main, prog_bar=True)
 
-        # Only evaluate DTW when predicting x0
+        # DTW evaluation (only if predicting x0)
         if self.pred_target == "x0":
             pred_btjc = self.bjct_to_btjc(pred_bjct)
 
@@ -303,11 +318,10 @@ class LitMinimal(pl.LightningModule):
             else:
                 mask_use = (mask_bt.sum((2,3)) > 0).float()
 
-            # unnormalize sequences
             pred_btjc_u = self.unnormalize(pred_btjc)
-            gt_btjc_u   = self.unnormalize(gt)
+            gt_btjc_u   = self.unnormalize(gt[:, :Tmin])
 
-            dtw_val = masked_dtw(pred_btjc_u, gt_btjc_u, mask_use)
+            dtw_val = masked_dtw(pred_btjc_u, gt_btjc_u, mask_use[:, :Tmin])
             self.log("val/dtw", dtw_val, prog_bar=True)
 
         return loss_main
@@ -316,18 +330,20 @@ class LitMinimal(pl.LightningModule):
     def sample_autoregressive_fast(
         self, past_btjc, sign_img, future_len=20, chunk=1, guidance_scale=None
     ):
+        """
+        Unified autoregressive sampling using the new forward path.
+        """
         self.eval()
         device = self.device
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
 
-        past_raw = past_btjc.to(device)
-
+        past_raw = past_btjc.to(device)  # [B,Tp,J,C]
         B, Tp, J, C = past_raw.shape
-        cur_hist_raw = past_raw.clone()
-        frames_raw = []
 
+        cur_hist = past_raw.clone()
+        frames_out = []
         sign = sign_img.to(device)
 
         class _Wrapper(nn.Module):
@@ -338,42 +354,40 @@ class LitMinimal(pl.LightningModule):
                 return self.m.interface(x, t, kw["y"])
 
         wrapped = _Wrapper(self.model)
-        remain = int(future_len)
 
+        remain = future_len
         while remain > 0:
             n = min(chunk, remain)
 
-            cur_hist_norm = self.normalize(cur_hist_raw)
+            cur_hist_norm = self.normalize(cur_hist)
             cond = {
                 "input_pose": self.btjc_to_bjct(cur_hist_norm),
                 "sign_image": sign,
             }
 
-            bjct_shape = (B, J, C, n)
+            shape = (B, J, C, n)
 
             x_bjct = self.diffusion.p_sample_loop(
                 wrapped,
-                shape=bjct_shape,
+                shape=shape,
                 model_kwargs={"y": cond},
                 clip_denoised=False,
-                progress=False,
+                progress=False
             )
 
             x_btjc_norm = self.bjct_to_btjc(x_bjct)
 
-            # unnormalize to raw (the key!)
             x_btjc_raw = self.unnormalize(x_btjc_norm)
 
-            frames_raw.append(x_btjc_raw)
+            frames_out.append(x_btjc_raw)
 
-            # sliding window on raw
-            cur_hist_raw = torch.cat([cur_hist_raw, x_btjc_raw], dim=1)
-            if cur_hist_raw.size(1) > Tp:
-                cur_hist_raw = cur_hist_raw[:, -Tp:]
+            cur_hist = torch.cat([cur_hist, x_btjc_raw], dim=1)
+            if cur_hist.size(1) > Tp:
+                cur_hist = cur_hist[:, -Tp:]
 
             remain -= n
 
-        return torch.cat(frames_raw, dim=1)
+        return torch.cat(frames_out, dim=1)
 
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)

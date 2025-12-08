@@ -211,7 +211,6 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         signwriting_image = y['sign_image']
         past_motion = y['input_pose']
-        past_motion = past_motion.permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
 
         # CFG on past motion
         keep_batch_idx = torch.rand(batch_size, device=past_motion.device) < (1 - self.cond_mask_prob)
