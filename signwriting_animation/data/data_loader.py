@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_format.pose import Pose
 from pose_format.utils.generic import reduce_holistic
-from pose_anonymization.data.normalization import normalize_mean_std, pre_process_pose
+from pose_anonymization.data.normalization import pre_process_pose
 from signwriting_evaluation.metrics.clip import signwriting_to_clip_image
 from transformers import CLIPProcessor
 
@@ -28,8 +28,14 @@ class DynamicPosePredictionDataset(Dataset):
     A PyTorch Dataset for dynamic sampling of pose sequences,
     conditioned on SignWriting images and optional scalar metadata.
     
-    🔧 修复版本：不在 DataLoader 中进行归一化
-    归一化统一在 LightningModule 中处理
+    🔧 最终修复版本：
+    1. reduce_holistic: 减少关键点数量（与统计量一致）
+    2. pre_process_pose: 数据预处理（与统计量一致）✅
+    3. 不归一化: 返回原始数据，归一化在 LightningModule 中进行
+    
+    数据流：
+    原始 pose → reduce_holistic → pre_process_pose → 返回
+    （不归一化，避免重复归一化）
     """
     def __init__(
         self,
@@ -51,6 +57,7 @@ class DynamicPosePredictionDataset(Dataset):
         self.with_metadata = with_metadata
         self.use_reduce_holistic = use_reduce_holistic
 
+        # 保留 mean_std 属性（用于兼容性），但不使用
         self.mean_std = None
 
         df_records = pd.read_csv(csv_path)
@@ -87,7 +94,9 @@ class DynamicPosePredictionDataset(Dataset):
 
         if self.use_reduce_holistic:
             raw = reduce_holistic(raw)
+        raw = pre_process_pose(raw)
         pose = raw
+
         total_frames = len(pose.body.data)
 
         if total_frames < 5:
@@ -124,9 +133,9 @@ class DynamicPosePredictionDataset(Dataset):
         sign_img = self.clip_processor(images=pil_img, return_tensors="pt").pixel_values.squeeze(0)
 
         sample = {
-            "data": target_data,
+            "data": target_data,  # future window - 原始数据（未归一化）
             "conditions": {
-                "input_pose": input_data,
+                "input_pose": input_data,   # past window - 原始数据（未归一化）
                 "input_mask": input_mask,
                 "target_mask": target_mask,
                 "sign_image": sign_img,
@@ -164,6 +173,9 @@ def main():
         split="train",
         use_reduce_holistic=True,
     )
+    
+    # ✅ 不设置 mean_std，返回原始数据
+    # dataset.mean_std = torch.load("/data/yayun/pose_data/mean_std_586.pt")
 
     loader = DataLoader(
         dataset,
