@@ -149,6 +149,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
+        # 🔧 FIX 2: 增大条件信号权重从 0.1 → 0.3
         xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
         xseq = self.sequence_pos_encoder(xseq)
         attn_out, _ = self.cross_attn(
@@ -162,8 +163,20 @@ class SignWritingToPoseDiffusion(nn.Module):
         xseq = xseq + future_motion_emb
 
         output = self.seqEncoder(xseq)[-num_frames:]
+        
+        # 🔍 DEBUG: 检查输出维度
+        print(f"[DEBUG models.py forward]")
+        print(f"  num_frames: {num_frames}")
+        print(f"  xseq.shape: {xseq.shape}")
+        print(f"  output (after slice).shape: {output.shape}")
+        
         output = self.pose_projection(output)
-        return output.permute(1, 2, 3, 0).contiguous()
+        print(f"  output (after projection).shape: {output.shape}")
+        
+        result = output.permute(1, 2, 3, 0).contiguous()
+        print(f"  result (after permute).shape: {result.shape}")
+        
+        return result
 
     def interface(self,
                   x: torch.Tensor,
