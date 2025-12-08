@@ -130,53 +130,51 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
-        time_emb = self.embed_timestep(timesteps)
-        signwriting_emb = self.embed_signwriting(signwriting_im_batch)
+        time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
+        
+        past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
+        future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
 
-        past_motion_emb = self.past_motion_process(past_motion)
-        future_motion_emb = self.future_motion_process(x)
+        Tf = future_motion_emb.size(0)
+        B  = future_motion_emb.size(1)
+        t = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
+        t_latent = self.future_time_proj(t).expand(-1, B, -1)
 
-        T = future_motion_emb.size(0)
-        B = future_motion_emb.size(1)
-
-        t_lin = torch.linspace(0, 1, steps=T, device=future_motion_emb.device).view(T, 1, 1)
-        t_latent = self.future_time_proj(t_lin).expand(-1, B, -1)
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
+        Tf = future_motion_emb.shape[0]
 
-        future_motion_emb = self.sequence_pos_encoder(future_motion_emb)
+        time_cond = time_emb.repeat(Tf, 1, 1)
+        sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
+        xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
+        xseq = self.sequence_pos_encoder(xseq)
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
             key=past_motion_emb,
             value=past_motion_emb
         )
-        fused = self.cross_ln(future_motion_emb + attn_out)
 
-        time_cond = time_emb.repeat(T, 1, 1)
-        sign_cond = signwriting_emb.repeat(T, 1, 1)
+        future_motion_emb = self.cross_ln(future_motion_emb + attn_out)
 
-        xseq = fused + 0.3 * time_cond + 0.3 * sign_cond
+        xseq = xseq + future_motion_emb
 
-        # ------------------ DEBUG -------------------
-        print("\n[DEBUG models.py forward]")
-        print(f"  num_frames input: {num_frames}")
-        print(f"  past_motion_emb.shape:   {past_motion_emb.shape}")
-        print(f"  future_motion_emb.shape: {future_motion_emb.shape}")
-        print(f"  fused.shape:             {fused.shape}")
-        print(f"  xseq.shape before encoder: {xseq.shape}")
-
-        output = self.seqEncoder(xseq)   # [T,B,D]
-
-        print(f"  output (after seqEncoder).shape: {output.shape}")
-
-
-        output = self.pose_projection(output)  # [T,B,J,C]
-
+        output = self.seqEncoder(xseq)[-num_frames:]
+        
+        # 🔍 DEBUG: 检查输出维度
+        print(f"[DEBUG models.py forward]")
+        print(f"  num_frames: {num_frames}")
+        print(f"  xseq.shape: {xseq.shape}")
+        print(f"  output (after slice).shape: {output.shape}")
+        
+        output = self.pose_projection(output)
         print(f"  output (after projection).shape: {output.shape}")
+        
         result = output.permute(1, 2, 3, 0).contiguous()
-        print(f"  result (after permute).shape: {result.shape}\n")
+        print(f"  result (after permute).shape: {result.shape}")
+        
         return result
 
     def interface(self,
@@ -211,6 +209,7 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         signwriting_image = y['sign_image']
         past_motion = y['input_pose']
+        past_motion = past_motion.permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
 
         # CFG on past motion
         keep_batch_idx = torch.rand(batch_size, device=past_motion.device) < (1 - self.cond_mask_prob)
@@ -260,8 +259,7 @@ class OutputProcessMLP(nn.Module):
         num_frames, batch_size, num_latent_dims = x.shape
         x = self.mlp(x)  # use MLP instead of single linear layer
         x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
-        x = x.permute(1, 2, 3, 0)
-        return x
+        return x  # 返回 [T, B, J, C]
 
 
 class EmbedSignWriting(nn.Module):
