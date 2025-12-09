@@ -130,6 +130,9 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
+        if past_motion.shape[1] != num_keypoints:
+            past_motion = past_motion.permute(0, 2, 3, 1).contiguous()
+
         time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
         
@@ -209,7 +212,6 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         signwriting_image = y['sign_image']
         past_motion = y['input_pose']
-        past_motion = past_motion.permute(0, 2, 3, 1).contiguous()  # BTJC → BJCT
 
         # CFG on past motion
         keep_batch_idx = torch.rand(batch_size, device=past_motion.device) < (1 - self.cond_mask_prob)
