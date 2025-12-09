@@ -73,51 +73,58 @@ if __name__ == "__main__":
 
     num_samples = min(200, len(base_ds))
     max_epochs = 20
-    
     print(f"[INFO] 训练配置:")
     print(f"  - 样本数: {num_samples} / {len(base_ds)}")
     print(f"  - Epochs: {max_epochs}")
     print(f"  - Batch size: 8")
     print(f"  - 每个epoch: {num_samples // 8} batches")
     print(f"  - 总训练步数: {(num_samples // 8) * max_epochs}")
-    print(f"  - 预计时间: ~2-3 小时")
+    print(f"  - 预计时间: ~30-40 分钟")
     print()
-    
+
     train_indices = list(range(num_samples))
     train_ds = torch.utils.data.Subset(base_ds, train_indices)
-    
-    loader = DataLoader(
+
+    train_loader = DataLoader(
         train_ds,
         batch_size=8,
         shuffle=True,
         collate_fn=zero_pad_collator,
     )
 
-    # 🔍 验证 DataLoader 输出
+    val_indices = list(range(num_samples, min(num_samples + 20, len(base_ds))))
+    if len(val_indices) == 0:
+        val_indices = list(range(max(0, num_samples - 20), num_samples))
+    val_ds = torch.utils.data.Subset(base_ds, val_indices)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=zero_pad_collator,
+    )
+
     print("\n" + "="*70)
     print("验证 DataLoader 输出")
     print("="*70)
-    
-    test_batch = next(iter(loader))
+
+    test_batch = next(iter(train_loader))
     test_data = test_batch["data"]
     test_data_dense = test_data.tensor if hasattr(test_data, "tensor") else test_data
-    
+
     print(f"DataLoader 输出统计:")
     print(f"  Shape: {test_data_dense.shape}")
     print(f"  Min: {test_data_dense.min().item():.4f}")
     print(f"  Max: {test_data_dense.max().item():.4f}")
     print(f"  Mean: {test_data_dense.mean().item():.4f}")
     print(f"  Std: {test_data_dense.std().item():.4f}")
-    
-    # 判断数据是否已归一化
+
     if abs(test_data_dense.mean().item()) < 0.1 and abs(test_data_dense.std().item() - 1.0) < 0.2:
         print("\n❌ 错误：数据已被归一化！")
         print("   请确保 data_loader.py 已按照说明修改")
-        print("   或者检查是否错误地调用了 normalize_pose_with_global_stats")
         raise RuntimeError("DataLoader 不应该返回归一化的数据")
     else:
         print("\n✓ 正确：数据是原始范围（未归一化）")
-    
+
     print("="*70 + "\n")
 
     num_joints = base_ds[0]["data"].shape[-2]
@@ -139,18 +146,19 @@ if __name__ == "__main__":
         devices=1,
         enable_checkpointing=False,
         deterministic=False,
-        log_every_n_steps=50,
+        log_every_n_steps=5,  # 更频繁的日志
     )
 
     print("\n[TRAIN] 开始训练...")
-    trainer.fit(model, loader, loader)
+    # 🔧 使用分离的 train 和 val loader
+    trainer.fit(model, train_loader, val_loader)
 
     # ============================================================
     # Load header
     # ============================================================
     ref_path = base_ds.records[0]["pose"]
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
-    
+
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
@@ -159,14 +167,13 @@ if __name__ == "__main__":
     header = ref_reduced.header
 
     print(f"\n[HEADER] total joints: {header.total_points()}")
-
-    # ============================================================
+   # ============================================================
     # Inference
     # ============================================================
     print("\n" + "="*70)
     print("INFERENCE - 最终修复版本")
     print("="*70)
-    
+
     model.eval()
     device = trainer.strategy.root_device
     model = model.to(device)
@@ -174,7 +181,20 @@ if __name__ == "__main__":
     model.std_pose = model.std_pose.to(device)
 
     with torch.no_grad():
-        batch = next(iter(loader))
+        # 🔧 FIX: 使用 train_loader 而不是 val_loader
+        # 确保数据来源正确
+        print("\n[DEBUG] 使用的 loader:")
+        print(f"  train_loader: {len(train_loader)} batches")
+        
+        # 重新创建一个 iterator 确保拿到第一个 batch
+        inference_loader = DataLoader(
+            train_ds,
+            batch_size=1,  # 只要 1 个样本
+            shuffle=False,  # 不打乱，拿第一个
+            collate_fn=zero_pad_collator,
+        )
+        
+        batch = next(iter(inference_loader))
         cond = batch["conditions"]
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
@@ -186,13 +206,22 @@ if __name__ == "__main__":
         print(f"    future_len = {future_len}")
         print(f"    GT shape: {gt.shape}")
         
-        # 🔍 关键检查：输入数据应该是原始范围
+        # 🔍 详细检查：输入数据范围
         print(f"\n[2] 输入数据范围检查:")
         print(f"    GT range: [{gt.min():.4f}, {gt.max():.4f}]")
         print(f"    GT mean: {gt.mean():.4f}")
+        print(f"    GT std: {gt.std():.4f}")
+        
+        # 🔍 检查前 5 个关键点
+        print(f"\n[2.1] GT 第一帧前 5 个关键点:")
+        gt_frame0 = gt[0, 0]
+        for i in range(5):
+            x, y, z = gt_frame0[i]
+            print(f"      关键点 {i}: x={x:.4f}, y={y:.4f}, z={z:.4f}")
         
         if abs(gt.mean().item()) < 0.1:
             print("    ❌ 输入数据已被归一化！存在重复归一化问题！")
+            print("    这会导致 PRED 的数值范围异常")
         else:
             print("    ✓ 输入数据是原始范围（正确）")
 
@@ -208,6 +237,15 @@ if __name__ == "__main__":
         
         print(f"    pred_norm shape: {pred_norm.shape}")
         print(f"    pred_norm range: [{pred_norm.min():.4f}, {pred_norm.max():.4f}]")
+        print(f"    pred_norm mean: {pred_norm.mean():.4f}")
+        print(f"    pred_norm std: {pred_norm.std():.4f}")
+        
+        # 🔍 检查归一化后的前 5 个关键点
+        print(f"\n[3.1] pred_norm 第一帧前 5 个关键点:")
+        pred_norm_frame0 = pred_norm[0, 0]
+        for i in range(5):
+            x, y, z = pred_norm_frame0[i]
+            print(f"      关键点 {i}: x={x:.4f}, y={y:.4f}, z={z:.4f}")
 
         # Unnormalize PRED
         print(f"\n[4] 反归一化 PRED:")
@@ -223,6 +261,18 @@ if __name__ == "__main__":
         print(f"      Y: [{gt[...,1].min():.4f}, {gt[...,1].max():.4f}]")
         print(f"      Z: [{gt[...,2].min():.4f}, {gt[...,2].max():.4f}]")
         
+        # 🔍 检查反归一化后的前 5 个关键点
+        print(f"\n[4.1] PRED 第一帧前 5 个关键点:")
+        pred_frame0 = pred[0, 0]
+        for i in range(5):
+            x, y, z = pred_frame0[i]
+            print(f"      关键点 {i}: x={x:.4f}, y={y:.4f}, z={z:.4f}")
+        
+        print(f"\n[4.2] GT 第一帧前 5 个关键点 (对比):")
+        for i in range(5):
+            x, y, z = gt_frame0[i]
+            print(f"      关键点 {i}: x={x:.4f}, y={y:.4f}, z={z:.4f}")
+        
         # 检查范围是否匹配
         pred_x_range = pred[...,0].max() - pred[...,0].min()
         gt_x_range = gt[...,0].max() - gt[...,0].min()
@@ -236,6 +286,25 @@ if __name__ == "__main__":
             print(f"    ✓ 修复成功！PRED 不再是'一点'")
         else:
             print(f"    ⚠️  PRED 数值范围异常")
+        
+        # 🔍 检查唯一点数量
+        print(f"\n[4.3] 关键点唯一性检查:")
+        unique_points = torch.unique(pred_frame0, dim=0)
+        print(f"    PRED 唯一点数量: {len(unique_points)} / {pred_frame0.shape[0]}")
+        
+        if len(unique_points) < 10:
+            print(f"    ❌ 警告：几乎所有关键点都一样！")
+            print(f"    这就是为什么在 pose viewer 中只看到一个点")
+        else:
+            print(f"    ✓ 关键点有多样性")
+        
+        # 🔍 检查零点
+        zero_mask = (pred_frame0.abs().sum(dim=-1) < 1e-6)
+        num_zeros = zero_mask.sum().item()
+        print(f"\n[4.4] 零点检查:")
+        print(f"    零点数量: {num_zeros} / {pred_frame0.shape[0]}")
+        if num_zeros > 0:
+            print(f"    零点索引: {torch.where(zero_mask)[0].tolist()[:10]}...")  # 只显示前10个
 
         # DTW evaluation
         mask_bt = torch.ones(1, future_len, device=device)
@@ -264,7 +333,8 @@ if __name__ == "__main__":
         points = pred_frame0[start:end]
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
+        z_range = points[:, 2].max() - points[:, 2].min()
+        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}, Z_range={z_range:.4f}")
 
     print("\nGT (对比):")
     gt_cpu = gt.cpu()
@@ -274,7 +344,8 @@ if __name__ == "__main__":
         points = gt_frame0[start:end]
         x_range = points[:, 0].max() - points[:, 0].min()
         y_range = points[:, 1].max() - points[:, 1].min()
-        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}")
+        z_range = points[:, 2].max() - points[:, 2].min()
+        print(f"  {name}: X_range={x_range:.4f}, Y_range={y_range:.4f}, Z_range={z_range:.4f}")
 
     print("="*70 + "\n")
 
@@ -287,26 +358,26 @@ if __name__ == "__main__":
     print("\n[1] GT:")
     gt_file_path = base_ds.records[0]["pose"]
     gt_file_path = gt_file_path if os.path.isabs(gt_file_path) else os.path.join(data_dir, gt_file_path)
-    
+
     with open(gt_file_path, "rb") as f:
         gt_from_file = Pose.read(f)
-    
+
     gt_pose_obj = reduce_holistic(gt_from_file)
     gt_pose_obj = gt_pose_obj.remove_components(["POSE_WORLD_LANDMARKS"])
-    
+
     out_gt = os.path.join(out_dir, "gt_final.pose")
     with open(out_gt, "wb") as f:
         gt_pose_obj.write(f)
-    
+
     print(f"  保存到: {out_gt}")
 
     print("\n[2] PRED:")
     pose_pred = tensor_to_pose(pred, header)
-    
+
     out_pred = os.path.join(out_dir, "pred_final.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
-    
+
     print(f"  保存到: {out_pred}")
 
     print("\n" + "="*70)
