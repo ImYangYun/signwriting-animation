@@ -211,7 +211,39 @@ if __name__ == "__main__":
     header = ref_reduced.header
 
     print(f"\n[HEADER] total joints: {header.total_points()}")
+        # 在 minimal_loop.py 的 header 加载后添加这些代码
 
+    print("\n" + "="*70)
+    print("检查 Pose Header 的坐标轴定义")
+    print("="*70)
+
+    print(f"\nHeader components:")
+    for comp_name, comp in header._components.items():
+        print(f"  {comp_name}:")
+        print(f"    points: {comp.points}")
+        if hasattr(comp, 'format'):
+            print(f"    format: {comp.format}")
+        if hasattr(comp, 'dimensions'):
+            print(f"    dimensions: {comp.dimensions}")
+
+    # 检查维度顺序
+    print(f"\nHeader dimensions: {header.dimensions}")
+
+    # 尝试从 GT 文件读取来对比
+    print(f"\nGT pose body dimensions:")
+    with open(ref_path, "rb") as f:
+        gt_pose = Pose.read(f)
+
+    print(f"  GT data shape: {gt_pose.body.data.shape}")
+    print(f"  GT 第一帧第一个点: {gt_pose.body.data[0, 0, 0]}")
+
+    # 检查 GT 的实际坐标范围
+    print(f"\n  GT 数据范围:")
+    print(f"    Dim 0: [{gt_pose.body.data[:, :, :, 0].min():.4f}, {gt_pose.body.data[:, :, :, 0].max():.4f}]")
+    print(f"    Dim 1: [{gt_pose.body.data[:, :, :, 1].min():.4f}, {gt_pose.body.data[:, :, :, 1].max():.4f}]")
+    print(f"    Dim 2: [{gt_pose.body.data[:, :, :, 2].min():.4f}, {gt_pose.body.data[:, :, :, 2].max():.4f}]")
+
+    print("="*70 + "\n")
     # ============================================================
     # Inference
     # ============================================================
