@@ -125,19 +125,44 @@ class SignWritingToPoseDiffusion(nn.Module):
         Returns:
             Tensor:
                 The predicted denoised motion at the current timestep.
-                Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
         """
+        
 
+        print(f"\n[FORWARD DEBUG - START]")
+        print(f"  x.shape: {x.shape}")
+        print(f"  past_motion.shape (input): {past_motion.shape}")  # 应该是 [B, J, C, T_past]
+        print(f"  timesteps: {timesteps}")
+        
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
+        
+        print(f"  Parsed: B={batch_size}, J={num_keypoints}, C={num_dims_per_keypoint}, T={num_frames}")
+        print(f"  past_motion.shape[1]: {past_motion.shape[1]}")
 
-        if past_motion.shape[1] != num_keypoints:
-            past_motion = past_motion.permute(0, 2, 3, 1).contiguous()
+
+        if past_motion.dim() == 4:
+            if past_motion.shape[1] == num_keypoints and past_motion.shape[2] == num_dims_per_keypoint:
+                print(f"  ✓ past_motion format correct: [B={past_motion.shape[0]}, J={past_motion.shape[1]}, C={past_motion.shape[2]}, T_past={past_motion.shape[3]}]")
+            elif past_motion.shape[2] == num_keypoints and past_motion.shape[3] == num_dims_per_keypoint:
+                print(f"  ⚠️ past_motion format wrong: [B, T_past, J, C], permuting to [B, J, C, T_past]")
+                past_motion = past_motion.permute(0, 2, 3, 1).contiguous()
+                print(f"  past_motion.shape (after permute): {past_motion.shape}")
+            else:
+                raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}, expected [B, J={num_keypoints}, C={num_dims_per_keypoint}, T_past]")
+        else:
+            raise ValueError(f"past_motion should be 4D, got {past_motion.dim()}D: {past_motion.shape}")
 
         time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
         
+        print(f"  time_emb.shape: {time_emb.shape}")
+        print(f"  signwriting_emb.shape: {signwriting_emb.shape}")
+        
         past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
         future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
+
+        print(f"  past_motion_emb.shape: {past_motion_emb.shape}")
+        print(f"  future_motion_emb.shape: {future_motion_emb.shape}")
 
         Tf = future_motion_emb.size(0)
         B  = future_motion_emb.size(1)
@@ -154,6 +179,9 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
         xseq = self.sequence_pos_encoder(xseq)
+        
+        print(f"  xseq.shape (before cross-attn): {xseq.shape}")
+        
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
             key=past_motion_emb,
@@ -164,19 +192,21 @@ class SignWritingToPoseDiffusion(nn.Module):
 
         xseq = xseq + future_motion_emb
 
+        print(f"  xseq.shape (before encoder): {xseq.shape}")
+        
         output = self.seqEncoder(xseq)[-num_frames:]
         
-        # 🔍 DEBUG: 检查输出维度
-        print(f"[DEBUG models.py forward]")
-        print(f"  num_frames: {num_frames}")
-        print(f"  xseq.shape: {xseq.shape}")
-        print(f"  output (after slice).shape: {output.shape}")
+        print(f"  output (after encoder slice).shape: {output.shape}")
         
         output = self.pose_projection(output)
+        
         print(f"  output (after projection).shape: {output.shape}")
         
         result = output.permute(1, 2, 3, 0).contiguous()
+        
         print(f"  result (after permute).shape: {result.shape}")
+        print(f"  result range: [{result.min():.4f}, {result.max():.4f}]")
+        print(f"[FORWARD DEBUG - END]\n")
         
         return result
 
@@ -192,7 +222,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         Args:
             x (Tensor):
                 The noisy input tensor at the current diffusion step, denoted as x_t in the CAMDM paper.
-                Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
 
             timesteps (Tensor):
                 Diffusion timesteps for each sample in the batch.
@@ -206,7 +236,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         Returns:
             Tensor:
                 The predicted denoised motion at the current timestep.
-                Shape: [batch_size, num_past_frames, num_keypoints, num_dims_per_keypoint].
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
         """
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
@@ -239,8 +269,8 @@ class ResidualBlock(nn.Module):
 class OutputProcessMLP(nn.Module):
     """
     Strong version replacing weak fluent-pose MLP:
-    - Wider hidden dims
-    - Residual layers
+    - Wider hidden dims (1024)
+    - Residual layers (6 blocks)
     - GELU activation
     - Much more stable for 178*3 outputs
     """
@@ -269,7 +299,7 @@ class OutputProcessMLP(nn.Module):
         Args:
             x: [T, B, D]
         Returns:
-            [T, B, J*K]
+            [T, B, J, C]
         """
         T, B, D = x.shape
 
