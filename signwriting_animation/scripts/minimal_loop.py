@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-完全修复版：
-1. 修复 confidence shape (去掉多余维度)
-2. 修复 FPS (使用 GT 的 FPS)
-3. 保留连续的 confidence 值
-4. 对比数据范围
-"""
 import os
 import torch
 import numpy as np
@@ -20,13 +13,22 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
 
+try:
+    from pose_anonymization.data.normalization import unshift_hands
+    HAS_UNSHIFT = True
+    print("[✓] Successfully imported unshift_hands")
+except ImportError as e:
+    print(f"[✗] Warning: Could not import unshift_hands: {e}")
+    print("[!] PRED poses will have incorrect hand positions!")
+    HAS_UNSHIFT = False
 
-def tensor_to_pose_fixed(t_btjc, header, gt_body):
+
+def tensor_to_pose_complete(t_btjc, header, ref_pose):
     """
-    修复所有问题：
-    1. Confidence shape 正确 (3D 不是 4D)
-    2. 使用 GT 的 FPS
-    3. 从 GT 学习 confidence
+    完整的 tensor → pose 转换：
+    1. 正确的 confidence shape (3D)
+    2. 使用 GT 的 FPS 和 confidence
+    3. 调用 unshift_hands
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -37,72 +39,38 @@ def tensor_to_pose_fixed(t_btjc, header, gt_body):
     
     t_np = t.cpu().numpy().astype(np.float32)
     
-    print(f"\n[tensor_to_pose_fixed] 修复版:")
-    print(f"  PRED data shape: {t_np.shape}")
-    print(f"  PRED data range: [{t_np.min():.4f}, {t_np.max():.4f}]")
+    print(f"\n[tensor_to_pose_complete]")
+    print(f"  输入 shape: {t_np.shape}")
+    print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
     
-    # arr: [T, 1, J, C]
-    arr = t_np[:, None, :, :]
-    
-    # 🔧 修复 1: Confidence shape 正确 - 3D 不是 4D
-    # 错误：conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), ...)  # 4D
-    # 正确：conf = np.ones((arr.shape[0], 1, arr.shape[2]), ...)     # 3D
-    
-    # 🔧 修复 2: 从 GT 学习 confidence 的模式
-    # GT 的前 20 帧 confidence
-    gt_conf_20 = gt_body.confidence[:20]  # shape: (20, 1, 178)
-    
-    print(f"\n  GT confidence (前20帧):")
-    print(f"    shape: {gt_conf_20.shape}")
-    print(f"    range: [{gt_conf_20.min():.4f}, {gt_conf_20.max():.4f}]")
-    print(f"    唯一值数量: {len(np.unique(gt_conf_20))}")
-    
-    # 使用 GT 的 confidence
-    conf = gt_conf_20.copy()
-    
-    print(f"\n  PRED confidence (使用GT的):")
-    print(f"    shape: {conf.shape}")
-    print(f"    =0: {(conf == 0).sum()} / {conf.size}")
-    print(f"    =1: {(conf == 1).sum()} / {conf.size}")
-    print(f"    (0,1): {((conf > 0) & (conf < 1)).sum()} / {conf.size}")
-    
-    # 🔧 修复 3: 使用 GT 的 FPS
-    fps = gt_body.fps
-    print(f"\n  使用 GT 的 FPS: {fps}")
+    # 创建 pose 对象
+    arr = t_np[:, None, :, :]  # [T, 1, J, C]
+    conf = ref_pose.body.confidence[:len(t_np)].copy()  # 使用 GT 的 confidence
+    fps = ref_pose.body.fps  # 使用 GT 的 FPS
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
+    pose_obj = Pose(header=header, body=body)
     
-    print(f"\n  最终 body:")
-    print(f"    fps: {body.fps}")
-    print(f"    data shape: {body.data.shape}")
-    print(f"    conf shape: {body.confidence.shape}")
+    print(f"  创建 Pose:")
+    print(f"    fps: {fps}")
+    print(f"    data shape: {pose_obj.body.data.shape}")
+    print(f"    conf shape: {pose_obj.body.confidence.shape}")
+    print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
     
-    return Pose(header=header, body=body)
-
-
-def analyze_data_range(gt_body, pred_tensor):
-    """分析数据范围差异"""
-    print(f"\n" + "="*70)
-    print("数据范围分析")
-    print("="*70)
+    # ✅ 关键：调用 unshift_hands
+    if HAS_UNSHIFT:
+        print(f"\n  调用 unshift_hands...")
+        try:
+            unshift_hands(pose_obj)
+            print(f"    ✓ unshift 成功")
+            print(f"    new range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
+        except Exception as e:
+            print(f"    ✗ unshift 失败: {e}")
+    else:
+        print(f"\n  ⚠️  跳过 unshift_hands (未导入)")
+        print(f"    警告：手部位置可能不正确！")
     
-    gt_data = gt_body.data
-    pred_np = pred_tensor[0].cpu().numpy() if pred_tensor.dim() == 4 else pred_tensor.cpu().numpy()
-    
-    print(f"\n[GT (文件中)]")
-    print(f"  shape: {gt_data.shape}")
-    print(f"  range: [{gt_data.min():.4f}, {gt_data.max():.4f}]")
-    print(f"  非零 range: [{gt_data[gt_data != 0].min():.4f}, {gt_data[gt_data != 0].max():.4f}]")
-    
-    print(f"\n[PRED (归一化空间)]")
-    print(f"  shape: {pred_np.shape}")
-    print(f"  range: [{pred_np.min():.4f}, {pred_np.max():.4f}]")
-    
-    print(f"\n⚠️ 注意：")
-    print(f"  GT 文件中的数据是原始像素坐标 (range ~600)")
-    print(f"  PRED 是归一化后的坐标 (range ~2)")
-    print(f"  这是正常的 - 我们的 PRED 已经经过 unnormalize")
-    print(f"  但 unnormalize 后的范围应该和训练时的 GT 一致")
+    return pose_obj
 
 
 if __name__ == "__main__":
@@ -110,13 +78,18 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_178_fixed_all"
+    out_dir = "logs/minimal_178_aligned"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "="*70)
-    print("完全修复版")
+    print("完全对齐版本")
+    print("="*70)
+    print("  ✅ LightningModule.unnormalize: 只做数值反归一化")
+    print("  ✅ tensor_to_pose: 调用 unshift_hands")
+    print("  ✅ Confidence: 3D shape, GT 的连续值")
+    print("  ✅ FPS: 使用 GT 的 FPS")
     print("="*70 + "\n")
 
     # Dataset
@@ -164,6 +137,7 @@ if __name__ == "__main__":
         pred_target="x0",
     )
 
+    print("\n[训练中...]")
     trainer.fit(model, train_loader)
 
     # Inference
@@ -185,6 +159,8 @@ if __name__ == "__main__":
 
         future_len = gt.size(1)
         
+        print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
+        
         pred_norm = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -192,58 +168,69 @@ if __name__ == "__main__":
             chunk=20,
         )
 
+        # ✅ LightningModule 的 unnormalize（只做数值反归一化）
         pred = model.unnormalize(pred_norm)
 
         print(f"\nGT (训练时):   [{gt.min():.4f}, {gt.max():.4f}]")
-        print(f"PRED (生成):   [{pred.min():.4f}, {pred.max():.4f}]")
+        print(f"PRED (unnorm): [{pred.min():.4f}, {pred.max():.4f}]")
 
         mask_bt = torch.ones(1, future_len, device=device)
         dtw_val = masked_dtw(pred, gt, mask_bt)
         print(f"DTW: {dtw_val:.4f}")
 
-    # 加载 GT 文件
+    # 加载 GT
+    print("\n" + "="*70)
+    print("加载参考 pose")
+    print("="*70)
+    
     ref_path = base_ds.records[0]["pose"]
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
 
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
 
-    ref_reduced = reduce_holistic(ref_pose)
-    ref_reduced = ref_reduced.remove_components(["POSE_WORLD_LANDMARKS"])
-    header = ref_reduced.header
-
-    gt_pose_obj = reduce_holistic(ref_pose)
-    gt_pose_obj = gt_pose_obj.remove_components(["POSE_WORLD_LANDMARKS"])
+    ref_pose = reduce_holistic(ref_pose)
+    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # 分析数据范围
-    analyze_data_range(gt_pose_obj.body, pred)
+    header = ref_pose.header
 
-    # 保存 GT
-    out_gt = os.path.join(out_dir, "gt_final.pose")
+    # 保存 GT（参考）
+    out_gt = os.path.join(out_dir, "gt_reference.pose")
     with open(out_gt, "wb") as f:
-        gt_pose_obj.write(f)
-    print(f"\n✓ GT 保存: {out_gt}")
+        ref_pose.write(f)
+    print(f"\n✓ GT (参考) 保存: {out_gt}")
 
-    # 保存 PRED (完全修复)
+    # 保存 PRED（完整流程）
     print("\n" + "="*70)
-    print("保存 PRED (完全修复版)")
+    print("保存 PRED（完整流程）")
     print("="*70)
     
-    pose_pred = tensor_to_pose_fixed(pred, header, gt_pose_obj.body)
-    out_pred = os.path.join(out_dir, "pred_fully_fixed.pose")
+    pose_pred = tensor_to_pose_complete(pred, header, ref_pose)
+    out_pred = os.path.join(out_dir, "pred_complete.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
     print(f"\n✓ PRED 保存: {out_pred}")
 
+    # 最终总结
     print("\n" + "="*70)
     print("✓ 完成！")
     print("="*70)
     print(f"\n生成的文件:")
-    print(f"  1. GT:                {out_gt}")
-    print(f"  2. PRED (完全修复):   {out_pred}")
-    print(f"\n修复内容:")
-    print(f"  ✅ Confidence shape: (20, 1, 178) - 去掉多余维度")
-    print(f"  ✅ FPS: 使用 GT 的 {gt_pose_obj.body.fps}")
-    print(f"  ✅ Confidence 值: 使用 GT 的连续值")
-    print(f"\n在 sign.mt 中打开 pred_fully_fixed.pose")
-    print(f"应该能正常显示了！")
+    print(f"  1. GT (参考):  {out_gt}")
+    print(f"  2. PRED:       {out_pred}")
+    
+    print(f"\n数据流程:")
+    print(f"  训练时:")
+    print(f"    原始 pose → pre_process (shift_hands) → normalize → 训练")
+    print(f"  Inference:")
+    print(f"    模型输出 → unnormalize → unshift_hands → 保存")
+    
+    print(f"\n在 sign.mt 中测试:")
+    print(f"  1. 打开 gt_reference.pose - 应该能显示")
+    print(f"  2. 打开 pred_complete.pose - 应该也能显示了！")
+    
+    if not HAS_UNSHIFT:
+        print(f"\n⚠️  警告:")
+        print(f"  unshift_hands 未成功导入")
+        print(f"  PRED 的手部位置可能不正确")
+        print(f"  请确保 pose_anonymization 包可用")

@@ -7,6 +7,15 @@ from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeas
 from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
+try:
+    from pose_anonymization.data.normalization import unshift_hands
+    HAS_UNSHIFT = True
+    print("[✓] Successfully imported unshift_hands from pose_anonymization")
+except ImportError as e:
+    print(f"[!] Warning: Could not import unshift_hands: {e}")
+    print("[!] PRED poses will have incorrect hand positions!")
+    HAS_UNSHIFT = False
+
 
 def sanitize_btjc(x):
     if hasattr(x, "zero_filled"):
@@ -69,7 +78,12 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 
 class LitMinimal(pl.LightningModule):
-    """Optimized version with selective debug output."""
+    """
+    Optimized version with selective debug output.
+    
+    ✅ 修复：unnormalize 现在只做数值反归一化
+    ⚠️ 重要：保存 pose 时必须调用 unshift_hands(pose_obj)
+    """
 
     def __init__(
         self,
