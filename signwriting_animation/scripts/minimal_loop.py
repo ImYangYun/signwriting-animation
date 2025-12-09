@@ -28,6 +28,10 @@ def tensor_to_pose(t_btjc, header):
     Returns:
         Pose object
     """
+    import numpy as np
+    from pose_format.numpy.pose_body import NumPyPoseBody
+    from pose_format import Pose
+    
     # 处理维度
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -48,19 +52,33 @@ def tensor_to_pose(t_btjc, header):
     t_np = t.cpu().numpy().astype(np.float32)
     print(f"  [tensor_to_pose] numpy shape: {t_np.shape}")
     
-    # 检查数据范围
-    print(f"  [tensor_to_pose] 数据范围:")
+    # 检查原始数据范围
+    print(f"  [tensor_to_pose] 原始数据范围:")
     print(f"    X: [{t_np[:, :, 0].min():.4f}, {t_np[:, :, 0].max():.4f}]")
     print(f"    Y: [{t_np[:, :, 1].min():.4f}, {t_np[:, :, 1].max():.4f}]")
     print(f"    Z: [{t_np[:, :, 2].min():.4f}, {t_np[:, :, 2].max():.4f}]")
     
+    # 🔧 FIX: 调换坐标轴顺序
+    # pose_format 似乎会循环移位坐标: X→Y, Y→Z, Z→X
+    # 所以我们提前反向移位: Z→X, X→Y, Y→Z
+    print(f"\n  [tensor_to_pose] 应用坐标轴修正...")
+    t_np_fixed = np.stack([
+        t_np[:, :, 2],  # Z → 新的 X
+        t_np[:, :, 0],  # X → 新的 Y
+        t_np[:, :, 1]   # Y → 新的 Z
+    ], axis=-1)
+    
+    print(f"  [tensor_to_pose] 修正后的数据范围:")
+    print(f"    X: [{t_np_fixed[:, :, 0].min():.4f}, {t_np_fixed[:, :, 0].max():.4f}]")
+    print(f"    Y: [{t_np_fixed[:, :, 1].min():.4f}, {t_np_fixed[:, :, 1].max():.4f}]")
+    print(f"    Z: [{t_np_fixed[:, :, 2].min():.4f}, {t_np_fixed[:, :, 2].max():.4f}]")
+    
     # NumPyPoseBody 期望: [frames, people, points, dims]
-    arr = t_np[:, None, :, :]  # [T, 1, J, C]
+    arr = t_np_fixed[:, None, :, :]  # [T, 1, J, C]
     print(f"  [tensor_to_pose] arr shape: {arr.shape}")
     
     # 置信度
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
-    print(f"  [tensor_to_pose] conf shape: {conf.shape}")
     
     # 创建 body
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
