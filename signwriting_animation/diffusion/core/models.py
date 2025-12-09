@@ -220,48 +220,68 @@ class SignWritingToPoseDiffusion(nn.Module):
         return self.forward(x, timesteps, past_motion, signwriting_image)
 
 
+class ResidualBlock(nn.Module):
+    """Small residual MLP block."""
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim * 2)
+        self.fc2 = nn.Linear(dim * 2, dim)
+        self.act = nn.GELU()
+        self.ln = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        residual = x
+        x = self.act(self.fc1(x))
+        x = self.fc2(x)
+        return self.ln(x + residual * 0.5)
+
+
 class OutputProcessMLP(nn.Module):
     """
-    Output process for the Sign Language Pose Diffusion model: project to pose space.
-
-    Obtained module from https://github.com/sign-language-processing/fluent-pose-synthesis
+    Strong version replacing weak fluent-pose MLP:
+    - Wider hidden dims
+    - Residual layers
+    - GELU activation
+    - Much more stable for 178*3 outputs
     """
     def __init__(self,
                  num_latent_dims: int,
                  num_keypoints: int,
                  num_dims_per_keypoint: int,
-                 hidden_dim: int = 512):
+                 hidden_dim: int = 1024,
+                 num_layers: int = 6):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
 
-        # MLP layers
-        self.mlp = nn.Sequential(
-            nn.Linear(num_latent_dims, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, num_keypoints * num_dims_per_keypoint)
-        )
+        self.in_proj = nn.Linear(num_latent_dims, hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim)
+            for _ in range(num_layers)
+        ])
+
+        self.out_proj = nn.Linear(hidden_dim,
+                                  num_keypoints * num_dims_per_keypoint)
+
+    def forward(self, x):
         """
-        Decodes a sequence of latent vectors into keypoint motion data using a multi-layer perceptron (MLP).
-
         Args:
-            x (Tensor):
-                Input latent tensor.
-                Shape: [num_frames, batch_size, num_latent_dims].
-
+            x: [T, B, D]
         Returns:
-            Tensor:
-                Decoded keypoint motion.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
+            [T, B, J*K]
         """
-        num_frames, batch_size, num_latent_dims = x.shape
-        x = self.mlp(x)  # use MLP instead of single linear layer
-        x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
-        return x  # 返回 [T, B, J, C]
+        T, B, D = x.shape
+
+        h = self.in_proj(x)
+
+        for blk in self.blocks:
+            h = blk(h)
+
+        y = self.out_proj(h)
+
+        return y.reshape(T, B, self.num_keypoints, self.num_dims_per_keypoint)
+
 
 
 class EmbedSignWriting(nn.Module):

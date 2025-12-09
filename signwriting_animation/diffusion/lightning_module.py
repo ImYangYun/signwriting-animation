@@ -136,7 +136,7 @@ class LitMinimal(pl.LightningModule):
         diffusion_steps=200,
         beta_start=1e-4,
         beta_end=1e-3,
-        pred_target="eps",
+        pred_target="x0",
         guidance_scale=0.0,
     ):
         super().__init__()

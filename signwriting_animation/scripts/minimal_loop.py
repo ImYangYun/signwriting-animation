@@ -196,9 +196,11 @@ if __name__ == "__main__":
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=5e-5,
+        lr=3e-4,
         diffusion_steps=50,
-        pred_target="eps",
+        beta_start=1e-4,
+        beta_end=1e-2,
+        pred_target="x0",
     )
 
     #print("\n[TRAIN] 跳过训练（使用已训练的模型）...")
