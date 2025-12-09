@@ -194,6 +194,13 @@ class LitMinimal(pl.LightningModule):
         self._std_calibrated = False
         print(f"[LitMinimal] diffusion ready (target={self.pred_target}, T={diffusion_steps})")
 
+        self.train_logs = {
+            "loss": [],
+            "mse": [],
+            "vel": [],
+            "acc": []
+        }
+
     #  Normalization
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
@@ -291,6 +298,12 @@ class LitMinimal(pl.LightningModule):
             "train/vel": loss_vel,
             "train/acc": loss_acc,
         }, prog_bar=True)
+
+        self.train_logs["loss"].append(loss.item())
+        self.train_logs["mse"].append(loss_main.item())
+        self.train_logs["vel"].append(loss_vel.item())
+        self.train_logs["acc"].append(loss_acc.item())
+
         return loss
 
     @torch.no_grad()
@@ -427,3 +440,29 @@ class LitMinimal(pl.LightningModule):
             "optimizer": optimizer,
             "gradient_clip_val": 1.0,
         }
+    
+    def on_train_end(self):
+        import matplotlib.pyplot as plt
+        import os
+
+        out_dir = "logs/minimal_178_fixed"
+        os.makedirs(out_dir, exist_ok=True)
+
+        fig, ax = plt.subplots(2, 2, figsize=(10, 8))
+
+        ax[0,0].plot(self.train_logs["loss"])
+        ax[0,0].set_title("train/loss")
+
+        ax[0,1].plot(self.train_logs["mse"])
+        ax[0,1].set_title("train/mse")
+
+        ax[1,0].plot(self.train_logs["vel"])
+        ax[1,0].set_title("train/vel")
+
+        ax[1,1].plot(self.train_logs["acc"])
+        ax[1,1].set_title("train/acc")
+
+        plt.tight_layout()
+        out_path = f"{out_dir}/train_curve.png"
+        plt.savefig(out_path)
+        print(f"[TRAIN CURVE] saved → {out_path}")
