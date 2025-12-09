@@ -23,17 +23,6 @@ except ImportError as e:
     HAS_UNSHIFT = False
 
 
-def _compute_var_tjc(arr_tjc: np.ndarray) -> float:
-    """
-    arr_tjc: [T, J, C] numpy
-    返回所有帧整体的平均方差（关节在质心附近的分散程度）
-    """
-    T, J, C = arr_tjc.shape
-    center = arr_tjc.mean(axis=1, keepdims=True)         # [T, 1, C]
-    var_per_frame = ((arr_tjc - center) ** 2).mean(axis=(1, 2))  # [T]
-    return float(var_per_frame.mean())
-
-
 def tensor_to_pose_complete(
     t_btjc: torch.Tensor,
     header,
@@ -62,7 +51,7 @@ def tensor_to_pose_complete(
     print(f"  输入 shape: {t_np.shape}")
     print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
 
-    # ---- 先创建 pose 对象（还不缩放 / 不平移）----
+    # ---- 先创建 Pose 对象（还不缩放 / 不平移）----
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
     conf = ref_pose.body.confidence[:len(t_np)].copy()
     fps = ref_pose.body.fps
@@ -76,7 +65,6 @@ def tensor_to_pose_complete(
     print(f"    conf shape: {pose_obj.body.confidence.shape}")
     print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
 
-    # 1️⃣ 手部反平移（还在“训练坐标系”里）
     if apply_unshift and HAS_UNSHIFT:
         print(f"\n  调用 unshift_hands...")
         try:
@@ -90,14 +78,12 @@ def tensor_to_pose_complete(
     else:
         print(f"\n  ⚠️  本次不调用 unshift_hands，仅写入 raw 坐标")
 
-    # 2️⃣ 根据 ref_pose 方差整体缩放
     if match_scale_to_ref:
         try:
             T_pred = pose_obj.body.data.shape[0]
             ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)   # [T,J,C]
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)  # [T,J,C]
 
-            # 计算方差
             def _var_tjc(a):
                 center = a.mean(axis=1, keepdims=True)
                 return float(((a - center) ** 2).mean())
@@ -116,18 +102,18 @@ def tensor_to_pose_complete(
                 print("  [scale] var too small, skip scale")
         except Exception as e:
             print(f"  [scale] 计算缩放系数失败，跳过缩放: {e}")
+            T_pred = pose_obj.body.data.shape[0]
+            ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     else:
-        # 如果没缩放，就直接取当前数据
         T_pred = pose_obj.body.data.shape[0]
         ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
         pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
 
-    # 3️⃣ 平移对齐：把 PRED 的全局中心对齐到 ref 的全局中心
     try:
         ref_center = ref_arr.reshape(-1, 3).mean(axis=0)   # [3]
         pred_center = pred_arr.reshape(-1, 3).mean(axis=0) # [3]
-        delta = ref_center - pred_center                  # [3]
+        delta = ref_center - pred_center                   # [3]
         print(f"\n  [translate] ref_center={ref_center}, pred_center={pred_center}")
         print(f"  [translate] apply delta={delta}")
         pose_obj.body.data += delta  # broadcast 到 [T,1,J,C]
@@ -138,6 +124,9 @@ def tensor_to_pose_complete(
     return pose_obj
 
 
+# ---------------------------------------------------------------------
+# 读回 .pose 文件，做简单数值检查
+# ---------------------------------------------------------------------
 def inspect_pose(path: str, name: str):
     """
     读回 .pose 文件，打印:
@@ -177,14 +166,14 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "="*70)
-    print("完全对齐版本 + 可视化缩放修正")
+    print("完全对齐版本 + 可视化缩放 & 平移修正")
     print("="*70)
     print("  ✅ LightningModule.unnormalize: 只做数值反归一化")
-    print("  ✅ tensor_to_pose: 调用 unshift_hands")
-    print("  ✅ 可视化时自动根据 ref_pose 方差放大 PRED")
+    print("  ✅ tensor_to_pose: 调用 unshift_hands（若可用）")
+    print("  ✅ 可视化时根据 ref_pose 方差 + 中心对 PRED 做 scale & translate")
     print("="*70 + "\n")
 
-    # Dataset
+    # Dataset：只取一个样本做 overfit
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -210,7 +199,7 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=100,
+        max_epochs=100,       # 👉 想更强 overfit 可以改成 500 / 1000
         accelerator="gpu",
         devices=1,
         enable_checkpointing=False,
@@ -234,7 +223,6 @@ if __name__ == "__main__":
     print("\n[训练中...]")
     trainer.fit(model, train_loader)
 
-    # Inference
     print("\n" + "="*70)
     print("INFERENCE")
     print("="*70)
@@ -249,13 +237,12 @@ if __name__ == "__main__":
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
-        gt = sanitize_btjc(batch["data"][:1]).to(device)  # raw, 和训练前一样的坐标系
+        gt = sanitize_btjc(batch["data"][:1]).to(device)
 
         future_len = gt.size(1)
 
         print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
 
-        # sample_autoregressive_fast 已在内部做过 unnormalize
         pred = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -270,7 +257,14 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, gt, mask_bt)
         print(f"DTW: {dtw_val:.4f}")
 
-    # 加载原始参考 pose（大坐标系）
+        # 可选：检查帧间平均位移，看看是不是“几乎静止”
+        pred_np = pred.cpu().numpy()
+        disp = np.linalg.norm(pred_np[:, 1:] - pred_np[:, :-1], axis=-1).mean()
+        print(f"mean frame-to-frame displacement: {disp:.6f}")
+
+    # -----------------------------------------------------------------
+    # 加载原始参考 pose（大坐标系），并保存 GT / PRED
+    # -----------------------------------------------------------------
     print("\n" + "="*70)
     print("加载参考 pose")
     print("="*70)
@@ -292,9 +286,9 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"\n✓ GT (参考) 保存: {out_gt}")
 
-    # 保存 PRED（完整流程，有 unshift_hands + 缩放）
+    # 保存 PRED（完整流程：unshift + scale + translate）
     print("\n" + "="*70)
-    print("保存 PRED（完整流程，有 unshift_hands + scale）")
+    print("保存 PRED（unshift + scale + translate）")
     print("="*70)
 
     pose_pred = tensor_to_pose_complete(
@@ -305,41 +299,25 @@ if __name__ == "__main__":
         pose_pred.write(f)
     print(f"\n✓ PRED 保存: {out_pred}")
 
-    # 保存 PRED（no_unshift 版本，同样做缩放）
-    print("\n" + "="*70)
-    print("保存 PRED（no_unshift 版本，同样做 scale）")
-    print("="*70)
-
-    pose_pred_no = tensor_to_pose_complete(
-        pred, header, ref_pose, apply_unshift=False, match_scale_to_ref=True
-    )
-    out_pred_no = os.path.join(out_dir, "pred_no_unshift.pose")
-    with open(out_pred_no, "wb") as f:
-        pose_pred_no.write(f)
-    print(f"\n✓ PRED (no_unshift) 保存: {out_pred_no}")
-
-    # 读回三个 pose 做数值检查
+    # 读回两个 pose 做数值检查
     print("\n" + "="*70)
     print("DEBUG: 读回 .pose 文件检查分布")
     print("="*70)
 
     inspect_pose(out_gt, "GT")
-    inspect_pose(out_pred, "PRED_with_unshift")
-    inspect_pose(out_pred_no, "PRED_no_unshift")
+    inspect_pose(out_pred, "PRED")
 
-    # 最终总结
+    # 总结
     print("\n" + "="*70)
     print("✓ 完成！")
     print("="*70)
     print(f"\n生成的文件:")
-    print(f"  1. GT (参考):          {out_gt}")
-    print(f"  2. PRED (unshift):     {out_pred}")
-    print(f"  3. PRED (no_unshift):  {out_pred_no}")
+    print(f"  1. GT (参考): {out_gt}")
+    print(f"  2. PRED:      {out_pred}")
 
     print(f"\n在 sign.mt 中测试:")
     print(f"  1. 打开 gt_reference.pose")
-    print(f"  2. 打开 pred_complete.pose (有 unshift + scale)")
-    print(f"  3. 打开 pred_no_unshift.pose (无 unshift + scale)")
+    print(f"  2. 打开 pred_complete.pose")
 
     if not HAS_UNSHIFT:
         print(f"\n⚠️  警告:")
