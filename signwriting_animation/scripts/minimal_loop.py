@@ -47,43 +47,45 @@ def tensor_to_pose(t_btjc, header):
     num_zeros = zero_mask.sum().item()
     total = zero_mask.numel()
     print(f"  [tensor_to_pose] 零点: {num_zeros}/{total} ({100*num_zeros/total:.1f}%)")
-    
-    # 转换为 numpy
+
     t_np = t.cpu().numpy().astype(np.float32)
     print(f"  [tensor_to_pose] numpy shape: {t_np.shape}")
     
-    # 检查原始数据范围
     print(f"  [tensor_to_pose] 原始数据范围:")
     print(f"    X: [{t_np[:, :, 0].min():.4f}, {t_np[:, :, 0].max():.4f}]")
     print(f"    Y: [{t_np[:, :, 1].min():.4f}, {t_np[:, :, 1].max():.4f}]")
     print(f"    Z: [{t_np[:, :, 2].min():.4f}, {t_np[:, :, 2].max():.4f}]")
-    
-    # 🔧 FIX: 调换坐标轴顺序
-    # pose_format 似乎会循环移位坐标: X→Y, Y→Z, Z→X
-    # 所以我们提前反向移位: Z→X, X→Y, Y→Z
     print(f"\n  [tensor_to_pose] 应用坐标轴修正...")
+    print(f"    映射: X←Y, Y←Z, Z←X")
+    
     t_np_fixed = np.stack([
-        t_np[:, :, 2],  # Z → 新的 X
-        t_np[:, :, 0],  # X → 新的 Y
-        t_np[:, :, 1]   # Y → 新的 Z
+        t_np[:, :, 1],  # Y → 新的 X (让它变成文件的 Y)
+        t_np[:, :, 2],  # Z → 新的 Y (让它变成文件的 Z)
+        t_np[:, :, 0]   # X → 新的 Z (让它变成文件的 X)
+    ], axis=-1)
+    t_np_fixed = np.stack([
+        t_np[:, :, 1],
+        t_np[:, :, 2],  # 原Z → 输入Y → 文件Z ✓
+        t_np[:, :, 0]   # 原X → 输入Z → 文件X ✓
     ], axis=-1)
     
-    print(f"  [tensor_to_pose] 修正后的数据范围:")
-    print(f"    X: [{t_np_fixed[:, :, 0].min():.4f}, {t_np_fixed[:, :, 0].max():.4f}]")
-    print(f"    Y: [{t_np_fixed[:, :, 1].min():.4f}, {t_np_fixed[:, :, 1].max():.4f}]")
-    print(f"    Z: [{t_np_fixed[:, :, 2].min():.4f}, {t_np_fixed[:, :, 2].max():.4f}]")
+    print(f"  [tensor_to_pose] 修正后将输入 NumPyPoseBody:")
+    print(f"    输入 X: [{t_np_fixed[:, :, 0].min():.4f}, {t_np_fixed[:, :, 0].max():.4f}] (原Y)")
+    print(f"    输入 Y: [{t_np_fixed[:, :, 1].min():.4f}, {t_np_fixed[:, :, 1].max():.4f}] (原Z)")
+    print(f"    输入 Z: [{t_np_fixed[:, :, 2].min():.4f}, {t_np_fixed[:, :, 2].max():.4f}] (原X)")
+    print(f"  预期文件最终:")
+    print(f"    文件 X: 原X")
+    print(f"    文件 Y: 原Y")
+    print(f"    文件 Z: 原Z")
     
     # NumPyPoseBody 期望: [frames, people, points, dims]
     arr = t_np_fixed[:, None, :, :]  # [T, 1, J, C]
     print(f"  [tensor_to_pose] arr shape: {arr.shape}")
     
-    # 置信度
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     
-    # 创建 body
     body = NumPyPoseBody(fps=25, data=arr, confidence=conf)
-    
-    # 验证
+
     print(f"  [tensor_to_pose] body.data.shape: {body.data.shape}")
     print(f"  [tensor_to_pose] 第一帧第一个点: {body.data[0, 0, 0]}")
     
@@ -211,39 +213,7 @@ if __name__ == "__main__":
     header = ref_reduced.header
 
     print(f"\n[HEADER] total joints: {header.total_points()}")
-        # 在 minimal_loop.py 的 header 加载后添加这些代码
 
-    print("\n" + "="*70)
-    print("检查 Pose Header 的坐标轴定义")
-    print("="*70)
-
-    print(f"\nHeader components:")
-    for comp_name, comp in header._components.items():
-        print(f"  {comp_name}:")
-        print(f"    points: {comp.points}")
-        if hasattr(comp, 'format'):
-            print(f"    format: {comp.format}")
-        if hasattr(comp, 'dimensions'):
-            print(f"    dimensions: {comp.dimensions}")
-
-    # 检查维度顺序
-    print(f"\nHeader dimensions: {header.dimensions}")
-
-    # 尝试从 GT 文件读取来对比
-    print(f"\nGT pose body dimensions:")
-    with open(ref_path, "rb") as f:
-        gt_pose = Pose.read(f)
-
-    print(f"  GT data shape: {gt_pose.body.data.shape}")
-    print(f"  GT 第一帧第一个点: {gt_pose.body.data[0, 0, 0]}")
-
-    # 检查 GT 的实际坐标范围
-    print(f"\n  GT 数据范围:")
-    print(f"    Dim 0: [{gt_pose.body.data[:, :, :, 0].min():.4f}, {gt_pose.body.data[:, :, :, 0].max():.4f}]")
-    print(f"    Dim 1: [{gt_pose.body.data[:, :, :, 1].min():.4f}, {gt_pose.body.data[:, :, :, 1].max():.4f}]")
-    print(f"    Dim 2: [{gt_pose.body.data[:, :, :, 2].min():.4f}, {gt_pose.body.data[:, :, :, 2].max():.4f}]")
-
-    print("="*70 + "\n")
     # ============================================================
     # Inference
     # ============================================================
