@@ -122,11 +122,11 @@ if __name__ == "__main__":
         split="train",
     )
 
-    num_samples = min(200, len(base_ds))
-    max_epochs = 20
+    #num_samples = min(200, len(base_ds))
+    #max_epochs = 20
     print(f"[INFO] 训练配置:")
     print(f"  - 样本数: {num_samples} / {len(base_ds)}")
-    print(f"  - Epochs: {max_epochs}")
+    #print(f"  - Epochs: {max_epochs}")
     print(f"  - Batch size: 8")
     print()
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=1000,   # overfit 需要很多epoch
+        max_epochs=1000,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_checkpointing=False,
@@ -198,15 +198,6 @@ if __name__ == "__main__":
         stats_path=stats_path,
         lr=5e-5,
         diffusion_steps=100,
-    )
-
-    trainer = pl.Trainer(
-        max_epochs=max_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        enable_checkpointing=False,
-        deterministic=False,
-        log_every_n_steps=5,
     )
 
     #print("\n[TRAIN] 跳过训练（使用已训练的模型）...")
