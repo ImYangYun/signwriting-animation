@@ -23,12 +23,12 @@ except ImportError as e:
     HAS_UNSHIFT = False
 
 
-def tensor_to_pose_complete(t_btjc, header, ref_pose):
+def tensor_to_pose_complete(t_btjc, header, ref_pose, apply_unshift: bool = True):
     """
     完整的 tensor → pose 转换：
     1. 正确的 confidence shape (3D)
     2. 使用 GT 的 FPS 和 confidence
-    3. 调用 unshift_hands
+    3. 可选地调用 unshift_hands
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -36,28 +36,29 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose):
         t = t_btjc
     else:
         raise ValueError(f"Expected 3D or 4D tensor, got {t_btjc.dim()}D")
-    
+
     t_np = t.cpu().numpy().astype(np.float32)
-    
-    print(f"\n[tensor_to_pose_complete]")
+
+    print(f"\n[tensor_to_pose_complete] (apply_unshift={apply_unshift})")
     print(f"  输入 shape: {t_np.shape}")
     print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
-    
+
     # 创建 pose 对象
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
     conf = ref_pose.body.confidence[:len(t_np)].copy()  # 使用 GT 的 confidence
     fps = ref_pose.body.fps  # 使用 GT 的 FPS
-    
+
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-    
+
     print(f"  创建 Pose:")
     print(f"    fps: {fps}")
     print(f"    data shape: {pose_obj.body.data.shape}")
     print(f"    conf shape: {pose_obj.body.confidence.shape}")
     print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
 
-    if HAS_UNSHIFT:
+    # 是否调用 unshift_hands
+    if apply_unshift and HAS_UNSHIFT:
         print(f"\n  调用 unshift_hands...")
         try:
             unshift_hands(pose_obj)
@@ -65,11 +66,41 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose):
             print(f"    new range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
         except Exception as e:
             print(f"    ✗ unshift 失败: {e}")
+    elif apply_unshift and not HAS_UNSHIFT:
+        print(f"\n  ⚠️  预期 unshift_hands 但未导入成功")
     else:
-        print(f"\n  ⚠️  跳过 unshift_hands (未导入)")
-        print(f"    警告：手部位置可能不正确！")
-    
+        print(f"\n  ⚠️  本次不调用 unshift_hands，仅写入 raw 坐标")
+
     return pose_obj
+
+
+def inspect_pose(path: str, name: str):
+    """
+    读回 .pose 文件，打印:
+    - 数据 shape
+    - 全局最小/最大值
+    - 每帧骨架的方差（关节在质心附近的分散程度）
+    """
+    if not os.path.exists(path):
+        print(f"\n[{name}] 文件不存在: {path}")
+        return
+
+    with open(path, "rb") as f:
+        pose = Pose.read(f)
+
+    data = pose.body.data  # [T, P, J, C]，numpy
+    data_np = np.asarray(data, dtype=np.float32)
+    T, P, J, C = data_np.shape
+
+    # 把 person 和 joint 合并，只看一帧内的空间分布
+    data_tpjc = data_np.reshape(T, P * J, C)
+    center = data_tpjc.mean(axis=1, keepdims=True)  # [T, 1, C]
+    var = ((data_tpjc - center) ** 2).mean(axis=(1, 2))  # [T]
+
+    print(f"\n[{name}] {path}")
+    print(f"  shape: {data_np.shape}")
+    print(f"  range: [{data_np.min():.4f}, {data_np.max():.4f}]")
+    print(f"  per-frame var min/max: [{var.min():.6f}, {var.max():.6f}]")
 
 
 if __name__ == "__main__":
@@ -102,7 +133,7 @@ if __name__ == "__main__":
     )
 
     sample_0 = base_ds[0]
-    
+
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
             self.sample = sample
@@ -110,9 +141,11 @@ if __name__ == "__main__":
             return 1
         def __getitem__(self, idx):
             return self.sample
-    
+
     train_ds = FixedSampleDataset(sample_0)
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator)
+    train_loader = DataLoader(
+        train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator
+    )
 
     trainer = pl.Trainer(
         max_epochs=100,
@@ -157,10 +190,10 @@ if __name__ == "__main__":
         gt = sanitize_btjc(batch["data"][:1]).to(device)  # raw, 和训练前一样的坐标系
 
         future_len = gt.size(1)
-        
+
         print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
-        
-        # ⬇️ 这里 sample_autoregressive_fast 已经内部做过 unnormalize，不要再二次 unnormalize
+
+        # 这里 sample_autoregressive_fast 已在内部做过 unnormalize
         pred = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -179,7 +212,7 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("加载参考 pose")
     print("="*70)
-    
+
     ref_path = base_ds.records[0]["pose"]
     ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
 
@@ -188,8 +221,11 @@ if __name__ == "__main__":
 
     ref_pose = reduce_holistic(ref_pose)
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    
+
     header = ref_pose.header
+
+    print(f"\nheader points: {len(header.points)}")
+    print(f"pred joints:   {pred.shape[-2]}")
 
     # 保存 GT（参考）
     out_gt = os.path.join(out_dir, "gt_reference.pose")
@@ -197,35 +233,58 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"\n✓ GT (参考) 保存: {out_gt}")
 
-    # 保存 PRED（完整流程）
+    # 保存 PRED（完整流程，有 unshift_hands）
     print("\n" + "="*70)
-    print("保存 PRED（完整流程）")
+    print("保存 PRED（完整流程，有 unshift_hands）")
     print("="*70)
-    
-    pose_pred = tensor_to_pose_complete(pred, header, ref_pose)
+
+    pose_pred = tensor_to_pose_complete(pred, header, ref_pose, apply_unshift=True)
     out_pred = os.path.join(out_dir, "pred_complete.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
     print(f"\n✓ PRED 保存: {out_pred}")
+
+    # 保存 PRED（不做 unshift_hands 的版本，用于 AB 测试）
+    print("\n" + "="*70)
+    print("保存 PRED（no_unshift 版本）")
+    print("="*70)
+
+    pose_pred_no = tensor_to_pose_complete(pred, header, ref_pose, apply_unshift=False)
+    out_pred_no = os.path.join(out_dir, "pred_no_unshift.pose")
+    with open(out_pred_no, "wb") as f:
+        pose_pred_no.write(f)
+    print(f"\n✓ PRED (no_unshift) 保存: {out_pred_no}")
+
+    # 读回三个 pose 做数值检查
+    print("\n" + "="*70)
+    print("DEBUG: 读回 .pose 文件检查分布")
+    print("="*70)
+
+    inspect_pose(out_gt, "GT")
+    inspect_pose(out_pred, "PRED_with_unshift")
+    inspect_pose(out_pred_no, "PRED_no_unshift")
 
     # 最终总结
     print("\n" + "="*70)
     print("✓ 完成！")
     print("="*70)
     print(f"\n生成的文件:")
-    print(f"  1. GT (参考):  {out_gt}")
-    print(f"  2. PRED:       {out_pred}")
-    
+    print(f"  1. GT (参考):          {out_gt}")
+    print(f"  2. PRED (unshift):     {out_pred}")
+    print(f"  3. PRED (no_unshift):  {out_pred_no}")
+
     print(f"\n数据流程:")
     print(f"  训练时:")
     print(f"    原始 pose → pre_process (shift_hands) → normalize → 训练")
     print(f"  Inference:")
-    print(f"    模型输出 → unnormalize（已在 sample_autoregressive_fast 内部完成）→ unshift_hands → 保存")
-    
+    print(f"    模型输出 → unnormalize（已在 sample_autoregressive_fast 内部完成）"
+          f"→ (可选)unshift_hands → 保存")
+
     print(f"\n在 sign.mt 中测试:")
-    print(f"  1. 打开 gt_reference.pose - 应该能显示")
-    print(f"  2. 打开 pred_complete.pose - 应该也能显示了！")
-    
+    print(f"  1. 打开 gt_reference.pose")
+    print(f"  2. 打开 pred_complete.pose (有 unshift)")
+    print(f"  3. 打开 pred_no_unshift.pose (无 unshift)")
+
     if not HAS_UNSHIFT:
         print(f"\n⚠️  警告:")
         print(f"  unshift_hands 未成功导入")
