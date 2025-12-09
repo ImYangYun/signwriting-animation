@@ -197,7 +197,8 @@ if __name__ == "__main__":
         num_dims=num_dims,
         stats_path=stats_path,
         lr=5e-5,
-        diffusion_steps=100,
+        diffusion_steps=50,
+        pred_target="eps",
     )
 
     #print("\n[TRAIN] 跳过训练（使用已训练的模型）...")
