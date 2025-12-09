@@ -187,7 +187,7 @@ if __name__ == "__main__":
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
-        gt = sanitize_btjc(batch["data"][:1]).to(device)  # raw, 和训练前一样的坐标系
+        gt = sanitize_btjc(batch["data"][:1]).to(device)
 
         future_len = gt.size(1)
 
@@ -223,17 +223,15 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
 
     header = ref_pose.header
-
-    print(f"\nheader points: {len(header.points)}")
+    n_header_joints = ref_pose.body.data.shape[2] 
+    print(f"\nheader joints: {n_header_joints}")
     print(f"pred joints:   {pred.shape[-2]}")
 
-    # 保存 GT（参考）
     out_gt = os.path.join(out_dir, "gt_reference.pose")
     with open(out_gt, "wb") as f:
         ref_pose.write(f)
     print(f"\n✓ GT (参考) 保存: {out_gt}")
 
-    # 保存 PRED（完整流程，有 unshift_hands）
     print("\n" + "="*70)
     print("保存 PRED（完整流程，有 unshift_hands）")
     print("="*70)
