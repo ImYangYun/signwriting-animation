@@ -124,11 +124,11 @@ if __name__ == "__main__":
 
     #num_samples = min(200, len(base_ds))
     #max_epochs = 20
-    print(f"[INFO] 训练配置:")
-    print(f"  - 样本数: {num_samples} / {len(base_ds)}")
+    #print(f"[INFO] 训练配置:")
+    #print(f"  - 样本数: {num_samples} / {len(base_ds)}")
     #print(f"  - Epochs: {max_epochs}")
-    print(f"  - Batch size: 8")
-    print()
+    #print(f"  - Batch size: 8")
+    #print()
 
     #train_indices = list(range(num_samples))
     #train_ds = torch.utils.data.Subset(base_ds, train_indices)
