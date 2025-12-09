@@ -46,9 +46,8 @@ def tensor_to_pose_complete(
     1. 正确的 confidence shape (3D)
     2. 使用 GT 的 FPS 和 confidence
     3. 可选地调用 unshift_hands
-    4. 可选地根据 ref_pose 的空间方差对 PRED 做整体缩放（只影响可视化）
-
-    t_btjc: [B,T,J,C] 或 [T,J,C]，这里用 T=20, J=178, C=3
+    4. 可选地根据 ref_pose 的空间方差对 PRED 做整体缩放
+    5. 再把 PRED 的全局中心平移到和 ref_pose 对齐（只影响可视化）
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -63,10 +62,10 @@ def tensor_to_pose_complete(
     print(f"  输入 shape: {t_np.shape}")
     print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
 
-    # 创建 pose 对象（先不缩放）
+    # ---- 先创建 pose 对象（还不缩放 / 不平移）----
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
-    conf = ref_pose.body.confidence[:len(t_np)].copy()  # 使用 GT 的 confidence
-    fps = ref_pose.body.fps  # 使用 GT 的 FPS
+    conf = ref_pose.body.confidence[:len(t_np)].copy()
+    fps = ref_pose.body.fps
 
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
@@ -77,7 +76,7 @@ def tensor_to_pose_complete(
     print(f"    conf shape: {pose_obj.body.confidence.shape}")
     print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
 
-    # 1️⃣ 先做 unshift_hands（把手挪回去）
+    # 1️⃣ 手部反平移（还在“训练坐标系”里）
     if apply_unshift and HAS_UNSHIFT:
         print(f"\n  调用 unshift_hands...")
         try:
@@ -91,27 +90,50 @@ def tensor_to_pose_complete(
     else:
         print(f"\n  ⚠️  本次不调用 unshift_hands，仅写入 raw 坐标")
 
-    # 2️⃣ 再根据 ref_pose 的方差整体缩放，让 PRED 不再是一个点
+    # 2️⃣ 根据 ref_pose 方差整体缩放
     if match_scale_to_ref:
         try:
-            # 取与 pred 相同长度的 GT 片段
             T_pred = pose_obj.body.data.shape[0]
-            ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)    # [T,J,C]
-            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)   # [T,J,C]
+            ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)   # [T,J,C]
+            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)  # [T,J,C]
 
-            var_ref = _compute_var_tjc(ref_arr)
-            var_pred = _compute_var_tjc(pred_arr)
+            # 计算方差
+            def _var_tjc(a):
+                center = a.mean(axis=1, keepdims=True)
+                return float(((a - center) ** 2).mean())
+
+            var_ref = _var_tjc(ref_arr)
+            var_pred = _var_tjc(pred_arr)
 
             print(f"\n  [scale] ref_var={var_ref:.4f}, pred_var={var_pred:.4f}")
             if var_pred > 1e-8 and var_ref > 0:
                 scale = float(np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6)))
                 print(f"  [scale] apply scale={scale:.3f}")
                 pose_obj.body.data *= scale
+                pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
                 print(f"  scaled data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
             else:
                 print("  [scale] var too small, skip scale")
         except Exception as e:
             print(f"  [scale] 计算缩放系数失败，跳过缩放: {e}")
+            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
+    else:
+        # 如果没缩放，就直接取当前数据
+        T_pred = pose_obj.body.data.shape[0]
+        ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
+        pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
+
+    # 3️⃣ 平移对齐：把 PRED 的全局中心对齐到 ref 的全局中心
+    try:
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)   # [3]
+        pred_center = pred_arr.reshape(-1, 3).mean(axis=0) # [3]
+        delta = ref_center - pred_center                  # [3]
+        print(f"\n  [translate] ref_center={ref_center}, pred_center={pred_center}")
+        print(f"  [translate] apply delta={delta}")
+        pose_obj.body.data += delta  # broadcast 到 [T,1,J,C]
+        print(f"  translated data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
+    except Exception as e:
+        print(f"  [translate] 平移对齐失败，跳过平移: {e}")
 
     return pose_obj
 
