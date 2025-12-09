@@ -23,12 +23,32 @@ except ImportError as e:
     HAS_UNSHIFT = False
 
 
-def tensor_to_pose_complete(t_btjc, header, ref_pose, apply_unshift: bool = True):
+def _compute_var_tjc(arr_tjc: np.ndarray) -> float:
+    """
+    arr_tjc: [T, J, C] numpy
+    返回所有帧整体的平均方差（关节在质心附近的分散程度）
+    """
+    T, J, C = arr_tjc.shape
+    center = arr_tjc.mean(axis=1, keepdims=True)         # [T, 1, C]
+    var_per_frame = ((arr_tjc - center) ** 2).mean(axis=(1, 2))  # [T]
+    return float(var_per_frame.mean())
+
+
+def tensor_to_pose_complete(
+    t_btjc: torch.Tensor,
+    header,
+    ref_pose: Pose,
+    apply_unshift: bool = True,
+    match_scale_to_ref: bool = True,
+):
     """
     完整的 tensor → pose 转换：
     1. 正确的 confidence shape (3D)
     2. 使用 GT 的 FPS 和 confidence
     3. 可选地调用 unshift_hands
+    4. 可选地根据 ref_pose 的空间方差对 PRED 做整体缩放（只影响可视化）
+
+    t_btjc: [B,T,J,C] 或 [T,J,C]，这里用 T=20, J=178, C=3
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -37,13 +57,13 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose, apply_unshift: bool = True
     else:
         raise ValueError(f"Expected 3D or 4D tensor, got {t_btjc.dim()}D")
 
-    t_np = t.cpu().numpy().astype(np.float32)
+    t_np = t.detach().cpu().numpy().astype(np.float32)  # [T,J,C]
 
-    print(f"\n[tensor_to_pose_complete] (apply_unshift={apply_unshift})")
+    print(f"\n[tensor_to_pose_complete] (apply_unshift={apply_unshift}, match_scale_to_ref={match_scale_to_ref})")
     print(f"  输入 shape: {t_np.shape}")
     print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
 
-    # 创建 pose 对象
+    # 创建 pose 对象（先不缩放）
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
     conf = ref_pose.body.confidence[:len(t_np)].copy()  # 使用 GT 的 confidence
     fps = ref_pose.body.fps  # 使用 GT 的 FPS
@@ -57,7 +77,7 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose, apply_unshift: bool = True
     print(f"    conf shape: {pose_obj.body.confidence.shape}")
     print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
 
-    # 是否调用 unshift_hands
+    # 1️⃣ 先做 unshift_hands（把手挪回去）
     if apply_unshift and HAS_UNSHIFT:
         print(f"\n  调用 unshift_hands...")
         try:
@@ -71,6 +91,28 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose, apply_unshift: bool = True
     else:
         print(f"\n  ⚠️  本次不调用 unshift_hands，仅写入 raw 坐标")
 
+    # 2️⃣ 再根据 ref_pose 的方差整体缩放，让 PRED 不再是一个点
+    if match_scale_to_ref:
+        try:
+            # 取与 pred 相同长度的 GT 片段
+            T_pred = pose_obj.body.data.shape[0]
+            ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)    # [T,J,C]
+            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)   # [T,J,C]
+
+            var_ref = _compute_var_tjc(ref_arr)
+            var_pred = _compute_var_tjc(pred_arr)
+
+            print(f"\n  [scale] ref_var={var_ref:.4f}, pred_var={var_pred:.4f}")
+            if var_pred > 1e-8 and var_ref > 0:
+                scale = float(np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6)))
+                print(f"  [scale] apply scale={scale:.3f}")
+                pose_obj.body.data *= scale
+                print(f"  scaled data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
+            else:
+                print("  [scale] var too small, skip scale")
+        except Exception as e:
+            print(f"  [scale] 计算缩放系数失败，跳过缩放: {e}")
+
     return pose_obj
 
 
@@ -79,7 +121,7 @@ def inspect_pose(path: str, name: str):
     读回 .pose 文件，打印:
     - 数据 shape
     - 全局最小/最大值
-    - 每帧骨架的方差（关节在质心附近的分散程度）
+    - 每帧骨架的平均方差
     """
     if not os.path.exists(path):
         print(f"\n[{name}] 文件不存在: {path}")
@@ -88,14 +130,13 @@ def inspect_pose(path: str, name: str):
     with open(path, "rb") as f:
         pose = Pose.read(f)
 
-    data = pose.body.data  # [T, P, J, C]，numpy
+    data = pose.body.data  # [T, P, J, C]
     data_np = np.asarray(data, dtype=np.float32)
     T, P, J, C = data_np.shape
+    data_tjc = data_np.reshape(T, P * J, C)
 
-    # 把 person 和 joint 合并，只看一帧内的空间分布
-    data_tpjc = data_np.reshape(T, P * J, C)
-    center = data_tpjc.mean(axis=1, keepdims=True)  # [T, 1, C]
-    var = ((data_tpjc - center) ** 2).mean(axis=(1, 2))  # [T]
+    center = data_tjc.mean(axis=1, keepdims=True)  # [T,1,C]
+    var = ((data_tjc - center) ** 2).mean(axis=(1, 2))  # [T]
 
     print(f"\n[{name}] {path}")
     print(f"  shape: {data_np.shape}")
@@ -114,12 +155,11 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "="*70)
-    print("完全对齐版本")
+    print("完全对齐版本 + 可视化缩放修正")
     print("="*70)
     print("  ✅ LightningModule.unnormalize: 只做数值反归一化")
     print("  ✅ tensor_to_pose: 调用 unshift_hands")
-    print("  ✅ Confidence: 3D shape, GT 的连续值")
-    print("  ✅ FPS: 使用 GT 的 FPS")
+    print("  ✅ 可视化时自动根据 ref_pose 方差放大 PRED")
     print("="*70 + "\n")
 
     # Dataset
@@ -187,13 +227,13 @@ if __name__ == "__main__":
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
-        gt = sanitize_btjc(batch["data"][:1]).to(device)
+        gt = sanitize_btjc(batch["data"][:1]).to(device)  # raw, 和训练前一样的坐标系
 
         future_len = gt.size(1)
 
         print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
 
-        # 这里 sample_autoregressive_fast 已在内部做过 unnormalize
+        # sample_autoregressive_fast 已在内部做过 unnormalize
         pred = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
@@ -208,7 +248,7 @@ if __name__ == "__main__":
         dtw_val = masked_dtw(pred, gt, mask_bt)
         print(f"DTW: {dtw_val:.4f}")
 
-    # 加载 GT
+    # 加载原始参考 pose（大坐标系）
     print("\n" + "="*70)
     print("加载参考 pose")
     print("="*70)
@@ -223,31 +263,34 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
 
     header = ref_pose.header
-    n_header_joints = ref_pose.body.data.shape[2] 
-    print(f"\nheader joints: {n_header_joints}")
-    print(f"pred joints:   {pred.shape[-2]}")
 
+    # 保存 GT（原始参考）
     out_gt = os.path.join(out_dir, "gt_reference.pose")
     with open(out_gt, "wb") as f:
         ref_pose.write(f)
     print(f"\n✓ GT (参考) 保存: {out_gt}")
 
+    # 保存 PRED（完整流程，有 unshift_hands + 缩放）
     print("\n" + "="*70)
-    print("保存 PRED（完整流程，有 unshift_hands）")
+    print("保存 PRED（完整流程，有 unshift_hands + scale）")
     print("="*70)
 
-    pose_pred = tensor_to_pose_complete(pred, header, ref_pose, apply_unshift=True)
+    pose_pred = tensor_to_pose_complete(
+        pred, header, ref_pose, apply_unshift=True, match_scale_to_ref=True
+    )
     out_pred = os.path.join(out_dir, "pred_complete.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
     print(f"\n✓ PRED 保存: {out_pred}")
 
-    # 保存 PRED（不做 unshift_hands 的版本，用于 AB 测试）
+    # 保存 PRED（no_unshift 版本，同样做缩放）
     print("\n" + "="*70)
-    print("保存 PRED（no_unshift 版本）")
+    print("保存 PRED（no_unshift 版本，同样做 scale）")
     print("="*70)
 
-    pose_pred_no = tensor_to_pose_complete(pred, header, ref_pose, apply_unshift=False)
+    pose_pred_no = tensor_to_pose_complete(
+        pred, header, ref_pose, apply_unshift=False, match_scale_to_ref=True
+    )
     out_pred_no = os.path.join(out_dir, "pred_no_unshift.pose")
     with open(out_pred_no, "wb") as f:
         pose_pred_no.write(f)
@@ -271,17 +314,10 @@ if __name__ == "__main__":
     print(f"  2. PRED (unshift):     {out_pred}")
     print(f"  3. PRED (no_unshift):  {out_pred_no}")
 
-    print(f"\n数据流程:")
-    print(f"  训练时:")
-    print(f"    原始 pose → pre_process (shift_hands) → normalize → 训练")
-    print(f"  Inference:")
-    print(f"    模型输出 → unnormalize（已在 sample_autoregressive_fast 内部完成）"
-          f"→ (可选)unshift_hands → 保存")
-
     print(f"\n在 sign.mt 中测试:")
     print(f"  1. 打开 gt_reference.pose")
-    print(f"  2. 打开 pred_complete.pose (有 unshift)")
-    print(f"  3. 打开 pred_no_unshift.pose (无 unshift)")
+    print(f"  2. 打开 pred_complete.pose (有 unshift + scale)")
+    print(f"  3. 打开 pred_no_unshift.pose (无 unshift + scale)")
 
     if not HAS_UNSHIFT:
         print(f"\n⚠️  警告:")
