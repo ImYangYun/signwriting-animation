@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-最终版本 - 避免重复归一化
-
-关键修改：
-1. data_loader.py 返回原始数据（未归一化）
-2. LightningModule 使用全局统计量进行归一化
-3. 这样只归一化一次，避免数据被过度压缩
-"""
 import os
 import torch
 import numpy as np
@@ -78,15 +70,9 @@ if __name__ == "__main__":
         with_metadata=True,
         split="train",
     )
-    
-    # 🔧 关键：不设置 mean_std
-    # DataLoader 将返回原始数据（未归一化）
-    # 归一化在 LightningModule 中统一处理
-    # base_ds.mean_std = torch.load(stats_path)  # ❌ 不要设置！
 
-    # 使用合理的样本量
-    num_samples = min(2000, len(base_ds))  # 初步训练：2000 样本
-    max_epochs = 100
+    num_samples = min(200, len(base_ds))
+    max_epochs = 20
     
     print(f"[INFO] 训练配置:")
     print(f"  - 样本数: {num_samples} / {len(base_ds)}")
@@ -144,7 +130,7 @@ if __name__ == "__main__":
         num_dims=num_dims,
         stats_path=stats_path,
         lr=5e-5,
-        diffusion_steps=500,
+        diffusion_steps=100,
     )
 
     trainer = pl.Trainer(
