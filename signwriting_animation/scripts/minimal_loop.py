@@ -84,10 +84,9 @@ if __name__ == "__main__":
             self.sample = sample
         
         def __len__(self):
-            return 1000  # 假装有 1000 个样本
+            return 1
         
         def __getitem__(self, idx):
-            # 但实际上每次都返回同一个！
             return self.sample
     
     train_ds = FixedSampleDataset(sample_0)
@@ -111,7 +110,7 @@ if __name__ == "__main__":
         devices=1,
         enable_checkpointing=False,
         deterministic=False,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
     )
 
     num_joints = sample_0["data"].shape[-2]
@@ -123,8 +122,8 @@ if __name__ == "__main__":
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=1e-3,  # 提高学习率
-        diffusion_steps=200,  # 增加 steps
+        lr=1e-3,
+        diffusion_steps=50,  # 增加 steps
         beta_start=1e-4,
         beta_end=2e-2,
         pred_target="x0",
