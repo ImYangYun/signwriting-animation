@@ -173,7 +173,6 @@ if __name__ == "__main__":
     print("  ✅ 可视化时根据 ref_pose 方差 + 中心对 PRED 做 scale & translate")
     print("="*70 + "\n")
 
-    # Dataset：只取一个样本做 overfit
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -199,7 +198,7 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        max_epochs=100,       # 👉 想更强 overfit 可以改成 500 / 1000
+        max_epochs=1000,
         accelerator="gpu",
         devices=1,
         enable_checkpointing=False,
