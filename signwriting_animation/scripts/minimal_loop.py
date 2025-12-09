@@ -130,15 +130,28 @@ if __name__ == "__main__":
     print(f"  - Batch size: 8")
     print()
 
-    train_indices = list(range(num_samples))
-    train_ds = torch.utils.data.Subset(base_ds, train_indices)
+    #train_indices = list(range(num_samples))
+    #train_ds = torch.utils.data.Subset(base_ds, train_indices)
 
+    # Overfit 
+    train_ds = torch.utils.data.Subset(base_ds, [0])
     train_loader = DataLoader(
         train_ds,
-        batch_size=8,
-        shuffle=True,
+        batch_size=1,
+        shuffle=False,
         collate_fn=zero_pad_collator,
     )
+
+    trainer = pl.Trainer(
+        max_epochs=1000,   # overfit 需要很多epoch
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        enable_checkpointing=False,
+        deterministic=False,
+        log_every_n_steps=1,
+        overfit_batches=1,
+    )
+
 
     val_indices = list(range(num_samples, min(num_samples + 20, len(base_ds))))
     if len(val_indices) == 0:
@@ -196,8 +209,8 @@ if __name__ == "__main__":
         log_every_n_steps=5,
     )
 
-    print("\n[TRAIN] 跳过训练（使用已训练的模型）...")
-    # trainer.fit(model, train_loader, val_loader)
+    #print("\n[TRAIN] 跳过训练（使用已训练的模型）...")
+    trainer.fit(model, train_loader)
 
     # ============================================================
     # Load header
