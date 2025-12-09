@@ -153,16 +153,16 @@ if __name__ == "__main__":
     )
 
 
-    val_indices = list(range(num_samples, min(num_samples + 20, len(base_ds))))
-    if len(val_indices) == 0:
-        val_indices = list(range(max(0, num_samples - 20), num_samples))
-    val_ds = torch.utils.data.Subset(base_ds, val_indices)
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=8,
-        shuffle=False,
-        collate_fn=zero_pad_collator,
-    )
+    #val_indices = list(range(num_samples, min(num_samples + 20, len(base_ds))))
+    #if len(val_indices) == 0:
+        #val_indices = list(range(max(0, num_samples - 20), num_samples))
+    #val_ds = torch.utils.data.Subset(base_ds, val_indices)
+    #val_loader = DataLoader(
+        #val_ds,
+        #batch_size=8,
+        #shuffle=False,
+        #collate_fn=zero_pad_collator,
+    #)
 
     print("\n" + "="*70)
     print("验证 DataLoader 输出")
