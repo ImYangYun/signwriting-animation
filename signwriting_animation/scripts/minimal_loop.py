@@ -56,8 +56,7 @@ def tensor_to_pose_complete(t_btjc, header, ref_pose):
     print(f"    data shape: {pose_obj.body.data.shape}")
     print(f"    conf shape: {pose_obj.body.confidence.shape}")
     print(f"    data range: [{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]")
-    
-    # ✅ 关键：调用 unshift_hands
+
     if HAS_UNSHIFT:
         print(f"\n  调用 unshift_hands...")
         try:
@@ -155,24 +154,22 @@ if __name__ == "__main__":
 
         past = sanitize_btjc(cond["input_pose"][:1]).to(device)
         sign = cond["sign_image"][:1].float().to(device)
-        gt = sanitize_btjc(batch["data"][:1]).to(device)
+        gt = sanitize_btjc(batch["data"][:1]).to(device)  # raw, 和训练前一样的坐标系
 
         future_len = gt.size(1)
         
         print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
         
-        pred_norm = model.sample_autoregressive_fast(
+        # ⬇️ 这里 sample_autoregressive_fast 已经内部做过 unnormalize，不要再二次 unnormalize
+        pred = model.sample_autoregressive_fast(
             past_btjc=past,
             sign_img=sign,
             future_len=future_len,
             chunk=20,
         )
 
-        # ✅ LightningModule 的 unnormalize（只做数值反归一化）
-        pred = model.unnormalize(pred_norm)
-
-        print(f"\nGT (训练时):   [{gt.min():.4f}, {gt.max():.4f}]")
-        print(f"PRED (unnorm): [{pred.min():.4f}, {pred.max():.4f}]")
+        print(f"\nGT (raw):   [{gt.min():.4f}, {gt.max():.4f}]")
+        print(f"PRED (raw): [{pred.min():.4f}, {pred.max():.4f}]")
 
         mask_bt = torch.ones(1, future_len, device=device)
         dtw_val = masked_dtw(pred, gt, mask_bt)
@@ -223,7 +220,7 @@ if __name__ == "__main__":
     print(f"  训练时:")
     print(f"    原始 pose → pre_process (shift_hands) → normalize → 训练")
     print(f"  Inference:")
-    print(f"    模型输出 → unnormalize → unshift_hands → 保存")
+    print(f"    模型输出 → unnormalize（已在 sample_autoregressive_fast 内部完成）→ unshift_hands → 保存")
     
     print(f"\n在 sign.mt 中测试:")
     print(f"  1. 打开 gt_reference.pose - 应该能显示")

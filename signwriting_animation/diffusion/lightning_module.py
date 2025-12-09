@@ -7,15 +7,6 @@ from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeas
 from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 
-try:
-    from pose_anonymization.data.normalization import unshift_hands
-    HAS_UNSHIFT = True
-    print("[✓] Successfully imported unshift_hands from pose_anonymization")
-except ImportError as e:
-    print(f"[!] Warning: Could not import unshift_hands: {e}")
-    print("[!] PRED poses will have incorrect hand positions!")
-    HAS_UNSHIFT = False
-
 
 def sanitize_btjc(x):
     if hasattr(x, "zero_filled"):
@@ -27,7 +18,7 @@ def sanitize_btjc(x):
     if x.dim() != 4:
         raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
     if x.shape[-1] != 3 and x.shape[-2] == 3:
-        x = x.permute(0,1,3,2)
+        x = x.permute(0, 1, 3, 2)
     if x.shape[-1] != 3:
         raise ValueError(f"sanitize_btjc: last dim must be C=3, got {x.shape}")
     return x.contiguous().float()
@@ -274,7 +265,7 @@ class LitMinimal(pl.LightningModule):
             elif mask_bt.dim() == 2:
                 mask_use = mask_bt.float()
             else:
-                mask_use = (mask_bt.sum((2,3)) > 0).float()
+                mask_use = (mask_bt.sum((2, 3)) > 0).float()
             pred_btjc_u = self.unnormalize(pred_btjc)
             gt_btjc_u   = self.unnormalize(gt[:, :Tmin])
             dtw_val = masked_dtw(pred_btjc_u, gt_btjc_u, mask_use[:, :Tmin])
