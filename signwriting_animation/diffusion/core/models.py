@@ -18,46 +18,10 @@ class SignWritingToPoseDiffusion(nn.Module):
                  activation: str = "gelu",
                  arch: str = "trans_enc",
                  cond_mask_prob: float = 0):
-        """
-        Generates pose sequences conditioned on SignWriting images and past motion using a diffusion model.
-
-        Args:
-            num_keypoints (int):
-                Number of keypoints in the pose representation.
-
-            num_dims_per_keypoint (int):
-                Number of spatial dimensions per keypoint (e.g., 2 for 2D, 3 for 3D).
-
-            embedding_arch (str):
-                Architecture used for extracting image embeddings (e.g., CLIP variants).
-
-            num_latent_dims (int):
-                Dimensionality of the latent representation used by the model.
-
-            ff_size (int):
-                Size of the feed-forward network in the Transformer blocks.
-
-            num_layers (int):
-                Number of Transformer encoder/decoder layers.
-
-            num_heads (int):
-                Number of attention heads in each multi-head attention block.
-
-            dropout (float):
-                Dropout rate applied during training.
-
-            activation (str):
-                Activation function used in the Transformer (e.g., "gelu", "relu").
-
-            arch (str):
-                Architecture type used in the diffusion model. Options: "trans_enc", "trans_dec", or "gru".
-
-            cond_mask_prob (float):
-                Probability of masking conditional inputs for classifier-free guidance (CFG).
-        """
         super().__init__()
         self.verbose = False
         self.cond_mask_prob = cond_mask_prob
+        self._forward_count = 0  # 计数器
 
         # local conditions
         input_feats = num_keypoints * num_dims_per_keypoint
@@ -77,12 +41,12 @@ class SignWritingToPoseDiffusion(nn.Module):
                                               dropout=dropout,
                                               activation=activation)
 
-        # --- NEW: cross-attention to fuse past motion ---
+        # cross-attention to fuse past motion
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=num_latent_dims,
             num_heads=4,
             dropout=0.1,
-            batch_first=False  # because we use [T, B, D]
+            batch_first=False
         )
         self.cross_ln = nn.LayerNorm(num_latent_dims)
 
@@ -102,67 +66,36 @@ class SignWritingToPoseDiffusion(nn.Module):
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
         """
-        Performs classifier-free guidance by running a forward pass of the diffusion model in either
-        conditional or unconditional mode.
-
-        Args:
-            x (Tensor):
-                The noisy input tensor at the current diffusion step, denoted as x_t in the CAMDM paper.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames]   # [B, J, C, T]
-
-            timesteps (Tensor):
-                Diffusion timesteps for each sample in the batch.
-                Shape: [batch_size], dtype: int.
-
-            past_motion (Tensor):
-                Tensor containing motion history information.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_past_frames].
-
-            signwriting_im_batch (Tensor):
-                Batch of rendered SignWriting images.
-                Shape: [batch_size, 3, 224, 224].
-
-        Returns:
-            Tensor:
-                The predicted denoised motion at the current timestep.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
+        Forward pass with selective debug output.
+        Only prints on first call and every 100th call.
         """
-        
-
-        print(f"\n[FORWARD DEBUG - START]")
-        print(f"  x.shape: {x.shape}")
-        print(f"  past_motion.shape (input): {past_motion.shape}")  # 应该是 [B, J, C, T_past]
-        print(f"  timesteps: {timesteps}")
-        
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
         
-        print(f"  Parsed: B={batch_size}, J={num_keypoints}, C={num_dims_per_keypoint}, T={num_frames}")
-        print(f"  past_motion.shape[1]: {past_motion.shape[1]}")
-
-
+        # 🎯 只在第一次和每 100 次输出
+        debug_this_call = (self._forward_count == 0) or (self._forward_count % 100 == 0)
+        
+        if debug_this_call:
+            print(f"\n[FORWARD #{self._forward_count}]")
+            print(f"  x: {x.shape}")
+            print(f"  past_motion: {past_motion.shape}")
+        
+        # Format check
         if past_motion.dim() == 4:
             if past_motion.shape[1] == num_keypoints and past_motion.shape[2] == num_dims_per_keypoint:
-                print(f"  ✓ past_motion format correct: [B={past_motion.shape[0]}, J={past_motion.shape[1]}, C={past_motion.shape[2]}, T_past={past_motion.shape[3]}]")
+                if debug_this_call:
+                    print(f"  ✓ past_motion format correct")
             elif past_motion.shape[2] == num_keypoints and past_motion.shape[3] == num_dims_per_keypoint:
-                print(f"  ⚠️ past_motion format wrong: [B, T_past, J, C], permuting to [B, J, C, T_past]")
+                if debug_this_call:
+                    print(f"  ⚠️ permuting past_motion")
                 past_motion = past_motion.permute(0, 2, 3, 1).contiguous()
-                print(f"  past_motion.shape (after permute): {past_motion.shape}")
             else:
-                raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}, expected [B, J={num_keypoints}, C={num_dims_per_keypoint}, T_past]")
-        else:
-            raise ValueError(f"past_motion should be 4D, got {past_motion.dim()}D: {past_motion.shape}")
+                raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
-        time_emb = self.embed_timestep(timesteps)  # [1, batch_size, num_latent_dims]
-        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, batch_size, num_latent_dims]
+        time_emb = self.embed_timestep(timesteps)
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)
         
-        print(f"  time_emb.shape: {time_emb.shape}")
-        print(f"  signwriting_emb.shape: {signwriting_emb.shape}")
-        
-        past_motion_emb = self.past_motion_process(past_motion)  # [past_frames, batch_size, num_latent_dims]
-        future_motion_emb = self.future_motion_process(x)  # [future_frames, batch_size, num_latent_dims]
-
-        print(f"  past_motion_emb.shape: {past_motion_emb.shape}")
-        print(f"  future_motion_emb.shape: {future_motion_emb.shape}")
+        past_motion_emb = self.past_motion_process(past_motion)
+        future_motion_emb = self.future_motion_process(x)
 
         Tf = future_motion_emb.size(0)
         B  = future_motion_emb.size(1)
@@ -172,15 +105,11 @@ class SignWritingToPoseDiffusion(nn.Module):
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
-        Tf = future_motion_emb.shape[0]
-
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
         xseq = future_motion_emb + 0.3 * time_cond + 0.3 * sign_cond
         xseq = self.sequence_pos_encoder(xseq)
-        
-        print(f"  xseq.shape (before cross-attn): {xseq.shape}")
         
         attn_out, _ = self.cross_attn(
             query=future_motion_emb,
@@ -189,55 +118,22 @@ class SignWritingToPoseDiffusion(nn.Module):
         )
 
         future_motion_emb = self.cross_ln(future_motion_emb + attn_out)
-
         xseq = xseq + future_motion_emb
 
-        print(f"  xseq.shape (before encoder): {xseq.shape}")
-        
         output = self.seqEncoder(xseq)[-num_frames:]
-        
-        print(f"  output (after encoder slice).shape: {output.shape}")
-        
         output = self.pose_projection(output)
-        
-        print(f"  output (after projection).shape: {output.shape}")
-        
         result = output.permute(1, 2, 3, 0).contiguous()
         
-        print(f"  result (after permute).shape: {result.shape}")
-        print(f"  result range: [{result.min():.4f}, {result.max():.4f}]")
-        print(f"[FORWARD DEBUG - END]\n")
+        if debug_this_call:
+            print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
         
+        self._forward_count += 1
         return result
 
     def interface(self,
                   x: torch.Tensor,
                   timesteps: torch.Tensor,
                   y: dict):
-        """
-        Performs classifier-free guidance by running a forward pass of the diffusion model
-        in either conditional or unconditional mode. Extracts conditioning inputs from `y` and
-        applies random masking to simulate unconditional sampling.
-
-        Args:
-            x (Tensor):
-                The noisy input tensor at the current diffusion step, denoted as x_t in the CAMDM paper.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
-
-            timesteps (Tensor):
-                Diffusion timesteps for each sample in the batch.
-                Shape: [batch_size], dtype: int.
-
-            y (dict):
-                Dictionary of conditioning inputs. Must contain:
-                    - 'sign_image': Tensor of shape [batch_size, 3, 224, 224]
-                    - 'input_pose': Tensor of shape [batch_size, num_keypoints, num_dims_per_keypoint, num_past_frames]
-
-        Returns:
-            Tensor:
-                The predicted denoised motion at the current timestep.
-                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
-        """
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
 
         signwriting_image = y['sign_image']
@@ -267,13 +163,7 @@ class ResidualBlock(nn.Module):
 
 
 class OutputProcessMLP(nn.Module):
-    """
-    Strong version replacing weak fluent-pose MLP:
-    - Wider hidden dims (1024)
-    - Residual layers (6 blocks)
-    - GELU activation
-    - Much more stable for 178*3 outputs
-    """
+    """Strong MLP with residual blocks."""
     def __init__(self,
                  num_latent_dims: int,
                  num_keypoints: int,
@@ -313,7 +203,6 @@ class OutputProcessMLP(nn.Module):
         return y.reshape(T, B, self.num_keypoints, self.num_dims_per_keypoint)
 
 
-
 class EmbedSignWriting(nn.Module):
     def __init__(self, num_latent_dims: int, embedding_arch: str = 'openai/clip-vit-base-patch32'):
         super().__init__()
@@ -324,13 +213,6 @@ class EmbedSignWriting(nn.Module):
             self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
 
     def forward(self, image_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            image_batch: [batch_size, 3, 224, 224]
-        Returns:
-            embeddings_batch: [1, batch_size, num_latent_dims]
-        """
-        # image_batch should be in the format [B, 3, H, W], where H=W=224.
         embeddings_batch = self.model.get_image_features(pixel_values=image_batch)
 
         if self.proj is not None:

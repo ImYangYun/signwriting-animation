@@ -9,56 +9,38 @@ from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusi
 
 
 def sanitize_btjc(x):
-    # convert dense
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     if hasattr(x, "tensor"):
         x = x.tensor
-
     if x.dim() == 5:
         x = x[:, :, 0]
-
     if x.dim() != 4:
         raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
-
-    B, T, A, B2 = x.shape
-
-    # If last dim is not 3 but second-last is 3, swap J and C
     if x.shape[-1] != 3 and x.shape[-2] == 3:
-        x = x.permute(0,1,3,2)   # [B,T,C,J] → [B,T,J,C]
-
+        x = x.permute(0,1,3,2)
     if x.shape[-1] != 3:
         raise ValueError(f"sanitize_btjc: last dim must be C=3, got {x.shape}")
-
     return x.contiguous().float()
 
 
 def masked_mse(pred_btjc, tgt_btjc, mask_bt):
-    """
-    Stable masked MSE (trim to min length, avoid denominator errors).
-    """
     pred = sanitize_btjc(pred_btjc)
     tgt  = sanitize_btjc(tgt_btjc)
-
     t_max = min(pred.size(1), tgt.size(1), mask_bt.size(1))
     pred = pred[:, :t_max]
     tgt  = tgt[:,  :t_max]
-    m4 = mask_bt[:, :t_max].float()[:, :, None, None]   # [B,T,1,1]
+    m4 = mask_bt[:, :t_max].float()[:, :, None, None]
     diff2 = (pred - tgt) ** 2
-
     num = (diff2 * m4).sum()
     den = (m4.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
     return num / den
 
 
 def _btjc_to_tjc_list(x_btjc, mask_bt):
-    """
-    Convert batched sequence [B,T,J,C] into list of valid-length [T,J,C].
-    """
     x_btjc = sanitize_btjc(x_btjc)
     batch_size, seq_len, _, _ = x_btjc.shape
     mask_bt = (mask_bt > 0.5).float()
-
     seqs = []
     for b in range(batch_size):
         t = int(mask_bt[b].sum().item())
@@ -69,38 +51,25 @@ def _btjc_to_tjc_list(x_btjc, mask_bt):
 
 @torch.no_grad()
 def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
-    """
-    Stable DTW using trimmed sequences.
-    """
     preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
     tgts  = _btjc_to_tjc_list(tgt_btjc,  mask_bt)
     dtw_metric = PE_DTW()
-
     vals = []
     for p, g in zip(preds, tgts):
         if p.size(0) < 2 or g.size(0) < 2:
             continue
-
-        pv = p.detach().cpu().numpy().astype("float32")   # (T,J,C)
-        gv = g.detach().cpu().numpy().astype("float32")   # (T,J,C)
-
-        pv = pv[:, None, :, :]   # → (T,1,J,C)
+        pv = p.detach().cpu().numpy().astype("float32")
+        gv = g.detach().cpu().numpy().astype("float32")
+        pv = pv[:, None, :, :]
         gv = gv[:, None, :, :]
-
         vals.append(float(dtw_metric.get_distance(pv, gv)))
-
     if not vals:
         return torch.tensor(0.0, device=pred_btjc.device)
-
     return torch.tensor(vals, device=pred_btjc.device).mean()
 
 
-#  --------------------- LitMinimal Model ---------------------
-
 class LitMinimal(pl.LightningModule):
-    """
-    Final Unified Version with DEBUG
-    """
+    """Optimized version with selective debug output."""
 
     def __init__(
         self,
@@ -119,34 +88,29 @@ class LitMinimal(pl.LightningModule):
 
         self.mean_pose = None
         self.std_pose = None
+        self._step_count = 0
 
-        # Load global mean/std
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std  = stats["std"].float().view(1, 1, -1, 3)
 
-        # mean_pose
         if hasattr(self, "mean_pose"):
             delattr(self, "mean_pose")
         if "mean_pose" in self._buffers:
             del self._buffers["mean_pose"]
         self.register_buffer("mean_pose", mean.clone())
 
-        # std_pose
         if hasattr(self, "std_pose"):
             delattr(self, "std_pose")
         if "std_pose" in self._buffers:
             del self._buffers["std_pose"]
         self.register_buffer("std_pose", std.clone())
 
-        # Load model
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
         )
-        print("[LitMinimal] CAMDM model loaded ✔")
 
-        # Diffusion setup
         self.pred_target = pred_target.lower()
         model_mean_type = ModelMeanType.EPSILON if self.pred_target == "eps" else ModelMeanType.START_X
 
@@ -161,7 +125,6 @@ class LitMinimal(pl.LightningModule):
 
         self.lr = lr
         self.guidance_scale = float(guidance_scale)
-        print(f"[LitMinimal] diffusion ready (target={self.pred_target}, T={diffusion_steps})")
 
         self.train_logs = {
             "loss": [],
@@ -170,14 +133,12 @@ class LitMinimal(pl.LightningModule):
             "acc": []
         }
 
-    # Normalization
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
 
     def unnormalize(self, x):
         return x * self.std_pose + self.mean_pose
 
-    # Format: [B,T,J,C] ↔ [B,J,C,T]
     @staticmethod
     def btjc_to_bjct(x):
         return x.permute(0, 2, 3, 1).contiguous()
@@ -187,84 +148,44 @@ class LitMinimal(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def _diffuse_once(self, x0_btjc, t_long, cond):
-        """
-        Unified diffusion step with DEBUG
-        """
-        print(f"\n[_DIFFUSE_ONCE DEBUG - START]")
-        print(f"  x0_btjc.shape: {x0_btjc.shape}")  # [B, T, J, C]
-        
         x0_bjct = self.btjc_to_bjct(x0_btjc)
-        print(f"  x0_bjct.shape (after permute): {x0_bjct.shape}")  # [B, J, C, T]
-
         noise = torch.randn_like(x0_bjct)
         x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
-        
-        print(f"  noise.shape: {noise.shape}")
-        print(f"  x_t.shape: {x_t.shape}")
-
         t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
-
         past_bjct = self.btjc_to_bjct(cond["input_pose"])
-        print(f"  past_bjct.shape (before forward): {past_bjct.shape}")  # [B, J, C, T_past]
-
-        pred_bjct = self.model.forward(
-            x_t,
-            t_scaled,
-            past_bjct,
-            cond["sign_image"],
-        )
-
-        print(f"  pred_bjct.shape (after forward): {pred_bjct.shape}")  # should be [B, J, C, T]
-
+        pred_bjct = self.model.forward(x_t, t_scaled, past_bjct, cond["sign_image"])
         target = noise if self.pred_target == "eps" else x0_bjct
-        
-        print(f"  target.shape: {target.shape}")
-        print(f"  pred_target mode: {self.pred_target}")
-        print(f"  Shapes match: {pred_bjct.shape == target.shape}")
-        print(f"[_DIFFUSE_ONCE DEBUG - END]\n")
-
         return pred_bjct, target
 
-    # Training Step
     def training_step(self, batch, batch_idx):
-        print(f"\n{'='*70}")
-        print(f"TRAINING STEP {batch_idx}")
-        print(f"{'='*70}")
+        # 🎯 只在特定 step 输出
+        debug_this_step = (self._step_count == 0) or (self._step_count % 100 == 0) or (self._step_count % 1000 == 0)
+        
+        if debug_this_step:
+            print(f"\n{'='*70}")
+            print(f"TRAINING STEP {self._step_count}")
+            print(f"{'='*70}")
         
         cond_raw  = batch["conditions"]
         gt_btjc   = sanitize_btjc(batch["data"])
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img  = cond_raw["sign_image"].float()
 
-        print(f"[TRAINING_STEP] Raw data:")
-        print(f"  gt_btjc.shape: {gt_btjc.shape}")
-        print(f"  past_btjc.shape: {past_btjc.shape}")
-        print(f"  sign_img.shape: {sign_img.shape}")
+        if debug_this_step:
+            print(f"  gt: {gt_btjc.shape}, range=[{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
+            print(f"  past: {past_btjc.shape}")
 
         gt   = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
-
-        print(f"[TRAINING_STEP] After normalize:")
-        print(f"  gt range: [{gt.min():.4f}, {gt.max():.4f}]")
-        print(f"  past range: [{past.min():.4f}, {past.max():.4f}]")
-
         cond = {"input_pose": past, "sign_image": sign_img}
 
         B = gt.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
-
-        print(f"[TRAINING_STEP] After _diffuse_once:")
-        print(f"  pred_bjct range: [{pred_bjct.min():.4f}, {pred_bjct.max():.4f}]")
-        print(f"  target_bjct range: [{target_bjct.min():.4f}, {target_bjct.max():.4f}]")
-
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
-        
-        print(f"[TRAINING_STEP] loss_main: {loss_main.item():.6f}")
 
         pred_btjc = self.bjct_to_btjc(pred_bjct)
-
         gt_raw   = self.unnormalize(gt)
         pred_raw = self.unnormalize(pred_btjc)
 
@@ -275,7 +196,6 @@ class LitMinimal(pl.LightningModule):
             v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
             v_gt   = gt_raw[:, 1:]   - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.l1_loss(v_pred, v_gt)
-
             if v_pred.size(1) > 1:
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
                 a_gt   = v_gt[:, 1:]   - v_gt[:, :-1]
@@ -283,12 +203,12 @@ class LitMinimal(pl.LightningModule):
 
         loss = loss_main + 0.5 * loss_vel + 0.25 * loss_acc
 
-        print(f"[TRAINING_STEP] Final losses:")
-        print(f"  loss_main: {loss_main.item():.6f}")
-        print(f"  loss_vel: {loss_vel.item():.6f}")
-        print(f"  loss_acc: {loss_acc.item():.6f}")
-        print(f"  TOTAL loss: {loss.item():.6f}")
-        print(f"{'='*70}\n")
+        if debug_this_step:
+            print(f"  loss_main: {loss_main.item():.6f}")
+            print(f"  loss_vel: {loss_vel.item():.6f}")
+            print(f"  loss_acc: {loss_acc.item():.6f}")
+            print(f"  TOTAL: {loss.item():.6f}")
+            print(f"{'='*70}\n")
 
         self.log_dict({
             "train/loss": loss,
@@ -301,7 +221,8 @@ class LitMinimal(pl.LightningModule):
         self.train_logs["mse"].append(loss_main.item())
         self.train_logs["vel"].append(loss_vel.item())
         self.train_logs["acc"].append(loss_acc.item())
-
+        
+        self._step_count += 1
         return loss
 
     @torch.no_grad()
@@ -314,22 +235,17 @@ class LitMinimal(pl.LightningModule):
 
         gt   = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
-
         cond = {"input_pose": past, "sign_image": sign_img}
 
         B = gt.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
         pred_bjct, _ = self._diffuse_once(gt, t, cond)
-
         gt_bjct = self.btjc_to_bjct(gt)
 
         Tpred = pred_bjct.size(-1)
         Tgt   = gt_bjct.size(-1)
         Tmin  = min(Tpred, Tgt)
-
-        if Tpred != Tgt:
-            print(f"[VAL ALIGN] pred T={Tpred}, gt T={Tgt} → using Tmin={Tmin}")
 
         pred_bjct = pred_bjct[..., :Tmin]
         gt_bjct   = gt_bjct[..., :Tmin]
@@ -339,17 +255,14 @@ class LitMinimal(pl.LightningModule):
 
         if self.pred_target == "x0":
             pred_btjc = self.bjct_to_btjc(pred_bjct)
-
             if mask_bt is None:
                 mask_use = torch.ones(gt.shape[:2], device=gt.device)
             elif mask_bt.dim() == 2:
                 mask_use = mask_bt.float()
             else:
                 mask_use = (mask_bt.sum((2,3)) > 0).float()
-
             pred_btjc_u = self.unnormalize(pred_btjc)
             gt_btjc_u   = self.unnormalize(gt[:, :Tmin])
-
             dtw_val = masked_dtw(pred_btjc_u, gt_btjc_u, mask_use[:, :Tmin])
             self.log("val/dtw", dtw_val, prog_bar=True)
 
@@ -359,9 +272,6 @@ class LitMinimal(pl.LightningModule):
     def sample_autoregressive_fast(
         self, past_btjc, sign_img, future_len=20, chunk=1, guidance_scale=None
     ):
-        """
-        Unified autoregressive sampling
-        """
         self.eval()
         device = self.device
 
@@ -387,15 +297,12 @@ class LitMinimal(pl.LightningModule):
         remain = future_len
         while remain > 0:
             n = min(chunk, remain)
-
             cur_hist_norm = self.normalize(cur_hist)
             cond = {
                 "input_pose": self.btjc_to_bjct(cur_hist_norm),
                 "sign_image": sign,
             }
-
             shape = (B, J, C, n)
-
             x_bjct = self.diffusion.p_sample_loop(
                 wrapped,
                 shape=shape,
@@ -403,17 +310,12 @@ class LitMinimal(pl.LightningModule):
                 clip_denoised=False,
                 progress=False
             )
-
             x_btjc_norm = self.bjct_to_btjc(x_bjct)
-
             x_btjc_raw = self.unnormalize(x_btjc_norm)
-
             frames_out.append(x_btjc_raw)
-
             cur_hist = torch.cat([cur_hist, x_btjc_raw], dim=1)
             if cur_hist.size(1) > Tp:
                 cur_hist = cur_hist[:, -Tp:]
-
             remain -= n
 
         return torch.cat(frames_out, dim=1)
@@ -421,12 +323,10 @@ class LitMinimal(pl.LightningModule):
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
         self.std_pose  = self.std_pose.to(self.device)
-        print(f"[on_train_start] stats moved to {self.device}")
 
     def on_predict_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
         self.std_pose  = self.std_pose.to(self.device)
-        print(f"[on_predict_start] stats moved to {self.device}")
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -443,19 +343,14 @@ class LitMinimal(pl.LightningModule):
         os.makedirs(out_dir, exist_ok=True)
 
         fig, ax = plt.subplots(2, 2, figsize=(10, 8))
-
         ax[0,0].plot(self.train_logs["loss"])
         ax[0,0].set_title("train/loss")
-
         ax[0,1].plot(self.train_logs["mse"])
         ax[0,1].set_title("train/mse")
-
         ax[1,0].plot(self.train_logs["vel"])
         ax[1,0].set_title("train/vel")
-
         ax[1,1].plot(self.train_logs["acc"])
         ax[1,1].set_title("train/acc")
-
         plt.tight_layout()
         out_path = f"{out_dir}/train_curve.png"
         plt.savefig(out_path)
