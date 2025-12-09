@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-完整版：
-1. 检查归一化统计量
-2. 训练
-3. Inference
-4. 修复 confidence
-5. 保存文件
-"""
 import os
 import torch
 import numpy as np
@@ -119,7 +111,6 @@ def tensor_to_pose(t_btjc, header):
     arr = t_np[:, None, :, :]
     
     # conf: [T, 1, J, 1]
-    # 零点的 confidence = 0，非零点 = 1
     conf = np.ones((arr.shape[0], 1, arr.shape[2], 1), dtype=np.float32)
     zero_mask_expanded = zero_mask[:, None, :, None]
     conf[zero_mask_expanded] = 0.0
@@ -133,18 +124,58 @@ def tensor_to_pose(t_btjc, header):
     return Pose(header=header, body=body)
 
 
+def analyze_pose(pose_obj, name):
+    """分析 pose 对象"""
+    print(f"\n{'='*70}")
+    print(f"分析: {name}")
+    print('='*70)
+    
+    print(f"\n[Header]")
+    print(f"  components: {len(pose_obj.header.components)}")
+    print(f"  dimensions: {pose_obj.header.dimensions}")
+    
+    print(f"\n[Body]")
+    print(f"  fps: {pose_obj.body.fps}")
+    print(f"  data shape: {pose_obj.body.data.shape}")
+    print(f"  confidence shape: {pose_obj.body.confidence.shape}")
+    
+    data = pose_obj.body.data
+    conf = pose_obj.body.confidence
+    
+    print(f"\n[Data 范围]")
+    print(f"  data: [{data.min():.4f}, {data.max():.4f}]")
+    non_zero_data = data[data != 0]
+    if len(non_zero_data) > 0:
+        print(f"  非零数据: [{non_zero_data.min():.4f}, {non_zero_data.max():.4f}]")
+    
+    print(f"\n[Confidence 分布]")
+    print(f"  范围: [{conf.min():.4f}, {conf.max():.4f}]")
+    print(f"  =0 的点: {(conf == 0).sum()} / {conf.size}")
+    print(f"  =1 的点: {(conf == 1).sum()} / {conf.size}")
+    print(f"  (0,1) 的点: {((conf > 0) & (conf < 1)).sum()} / {conf.size}")
+    
+    # 唯一值
+    unique_conf = np.unique(conf)
+    print(f"  唯一 confidence 值: {unique_conf[:20].tolist()}")
+    
+    print(f"\n[零点分布]")
+    zero_mask = (data == 0).all(axis=-1)  # [T, P, J]
+    zero_per_frame = zero_mask.sum(axis=(1, 2))
+    print(f"  每帧零点数: min={zero_per_frame.min()}, max={zero_per_frame.max()}, mean={zero_per_frame.mean():.1f}")
+
+
 if __name__ == "__main__":
     pl.seed_everything(42)
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_178_complete"
+    out_dir = "logs/minimal_178_ultimate"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "="*70)
-    print("完整诊断流程")
+    print("终极完整版诊断流程")
     print("="*70 + "\n")
 
     # 1. 检查归一化
@@ -189,7 +220,6 @@ if __name__ == "__main__":
     print("  max_epochs: 100")
     print("  lr: 1e-3")
     print("  diffusion_steps: 50")
-    print("  预计时间: 3-5 分钟")
     print("="*70 + "\n")
 
     trainer = pl.Trainer(
@@ -300,26 +330,73 @@ if __name__ == "__main__":
         gt_pose_obj.write(f)
     print(f"  {out_gt}")
 
-    # PRED
-    print("\n[保存 PRED - 修复 confidence]")
+    # PRED (原始 confidence)
+    print("\n[保存 PRED - 自动 confidence]")
     pose_pred = tensor_to_pose(pred, header)
     
     if pose_pred is None:
         print("  ✗ PRED 包含 NaN/Inf，无法保存")
     else:
-        out_pred = os.path.join(out_dir, "pred_final.pose")
+        out_pred = os.path.join(out_dir, "pred_auto_conf.pose")
         with open(out_pred, "wb") as f:
             pose_pred.write(f)
         print(f"  {out_pred}")
 
+    # 7. 对比分析
+    print("\n" + "="*70)
+    print("7. 对比 GT 和 PRED")
+    print("="*70)
+    
+    analyze_pose(gt_pose_obj, "GT")
+    
+    if pose_pred is not None:
+        analyze_pose(pose_pred, "PRED (自动 confidence)")
+
+    # 8. 生成用 GT confidence 的 PRED
+    if pose_pred is not None:
+        print("\n" + "="*70)
+        print("8. 生成用 GT confidence 的 PRED")
+        print("="*70)
+        
+        # 用 GT 的前 20 帧 confidence
+        gt_conf_20frames = gt_pose_obj.body.confidence[:20].copy()
+        
+        print(f"\n[GT confidence (前20帧)]")
+        print(f"  shape: {gt_conf_20frames.shape}")
+        print(f"  range: [{gt_conf_20frames.min():.4f}, {gt_conf_20frames.max():.4f}]")
+        print(f"  唯一值: {np.unique(gt_conf_20frames)[:10].tolist()}")
+        
+        new_body = NumPyPoseBody(
+            fps=25,
+            data=pose_pred.body.data,
+            confidence=gt_conf_20frames
+        )
+        
+        pred_with_gt_conf = Pose(header=header, body=new_body)
+        
+        out_pred_gt_conf = os.path.join(out_dir, "pred_with_gt_conf.pose")
+        with open(out_pred_gt_conf, "wb") as f:
+            pred_with_gt_conf.write(f)
+        
+        print(f"\n✓ 保存: {out_pred_gt_conf}")
+        
+        analyze_pose(pred_with_gt_conf, "PRED (GT confidence)")
+
+    # 9. 总结
     print("\n" + "="*70)
     print("✓ 完成！")
     print("="*70)
     
+    print(f"\n生成的文件:")
+    print(f"  1. GT:                    {out_gt}")
     if pose_pred is not None:
-        print(f"\n请在 sign.mt 中打开:")
-        print(f"  GT:   {out_gt}")
-        print(f"  PRED: {out_pred}")
-        print(f"\n如果 GT 能显示但 PRED 不能，对比两个文件:")
-        print(f"  ls -lh {out_gt}")
-        print(f"  ls -lh {out_pred}")
+        print(f"  2. PRED (自动 conf):      {out_pred}")
+        print(f"  3. PRED (GT conf):        {out_pred_gt_conf}")
+    
+    print(f"\n测试步骤:")
+    print(f"  1. 在 sign.mt 中打开 GT - 应该能正常显示")
+    print(f"  2. 打开 pred_auto_conf.pose - 如果不能显示，看看是否是 confidence 问题")
+    print(f"  3. 打开 pred_with_gt_conf.pose - 如果这个能显示，说明问题就是 confidence")
+    print(f"\n关键对比:")
+    print(f"  - GT 和 PRED (自动) 的 confidence 分布")
+    print(f"  - GT 的 confidence 可能不是简单的 0/1")
