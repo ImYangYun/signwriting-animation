@@ -20,7 +20,6 @@ except ImportError:
 
 
 def diagnose_model(model, past_norm, sign_img, device):
-    """诊断模型对输入的敏感度"""
     print("\n" + "=" * 70)
     print("诊断：模型对输入的敏感度")
     print("=" * 70)
@@ -28,7 +27,6 @@ def diagnose_model(model, past_norm, sign_img, device):
     model.eval()
     
     with torch.no_grad():
-        # 测试1：相同输入
         pred1 = model._predict_frames(past_norm, sign_img, 5)
         pred2 = model._predict_frames(past_norm, sign_img, 5)
         diff = (pred1 - pred2).abs().max().item()
@@ -79,21 +77,17 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max
     if fix_abnormal_joints:
         T, J, C = t_np.shape
         
-        # 右手手指关节 (159-177)
         hand_joints = list(range(153, min(178, J)))
         
         for j in hand_joints:
-            # 计算该关节的运动范围
             pred_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
             
             if gt_np is not None:
-                # 使用 GT 的范围作为参考
                 gt_range = gt_np[:, j].max(axis=0) - gt_np[:, j].min(axis=0)
                 gt_mean = gt_np[:, j].mean(axis=0)
                 
                 for c in range(C):
-                    if pred_range[c] > gt_range[c] * 2.0:  # 超过 GT 范围的 2 倍
-                        # 将该关节 clamp 到 GT 范围
+                    if pred_range[c] > gt_range[c] * 2.0:
                         max_dev = gt_range[c] * 1.5
                         t_np[:, j, c] = np.clip(t_np[:, j, c], 
                                                 gt_mean[c] - max_dev, 
@@ -214,7 +208,7 @@ if __name__ == "__main__":
         vel_weight=1.0,
         acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=0.5,  # 降低手指约束权重
+        hand_reg_weight=0.0,  # 去掉手指约束，让模型自由学习
     )
 
     # 训练前诊断
@@ -343,7 +337,6 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"✓ GT: {out_gt}")
     
-    # 传入 gt_raw 来约束异常关节
     pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
