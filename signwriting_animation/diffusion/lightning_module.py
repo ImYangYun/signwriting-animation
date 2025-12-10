@@ -130,7 +130,8 @@ class LitMinimal(pl.LightningModule):
 
         self.lr = lr
         self.guidance_scale = float(guidance_scale)
-
+        self.w_vel = 10.0
+        self.w_acc = 5.0
         self.train_logs = {
             "loss": [],
             "mse": [],
@@ -163,23 +164,27 @@ class LitMinimal(pl.LightningModule):
         return pred_bjct, target
 
     def training_step(self, batch, batch_idx):
-        # 🎯 只在特定 step 输出
-        debug_this_step = (self._step_count == 0) or (self._step_count % 100 == 0) or (self._step_count % 1000 == 0)
-        
+        debug_this_step = (
+            self._step_count == 0
+            or self._step_count % 100 == 0
+            or self._step_count % 1000 == 0
+        )
+
         if debug_this_step:
             print(f"\n{'='*70}")
             print(f"TRAINING STEP {self._step_count}")
             print(f"{'='*70}")
-        
+
         cond_raw  = batch["conditions"]
         gt_btjc   = sanitize_btjc(batch["data"])
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img  = cond_raw["sign_image"].float()
 
         if debug_this_step:
-            print(f"  gt: {gt_btjc.shape}, range=[{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
-            print(f"  past: {past_btjc.shape}")
+            print(f"gt: {gt_btjc.shape}, range=[{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
+            print(f"past: {past_btjc.shape}")
 
+        # --- normalize ---
         gt   = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
         cond = {"input_pose": past, "sign_image": sign_img}
@@ -187,6 +192,7 @@ class LitMinimal(pl.LightningModule):
         B = gt.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
+        # --- diffusion training step ---
         pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
@@ -206,36 +212,33 @@ class LitMinimal(pl.LightningModule):
                 a_gt   = v_gt[:, 1:]   - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.l1_loss(a_pred, a_gt)
 
-        motion_w = 10.0
-        acc_w    = 5.0
-        loss = loss_main + motion_w * loss_vel + acc_w * loss_acc
+        loss = loss_main + self.w_vel * loss_vel + self.w_acc * loss_acc
 
         if debug_this_step:
-            if gt_raw.size(1) > 1:
-                d_pred = (pred_raw[:, 1:] - pred_raw[:, :-1]).abs().mean().item()
-                d_gt   = (gt_raw[:, 1:]   - gt_raw[:, :-1]).abs().mean().item()
-            else:
-                d_pred, d_gt = 0.0, 0.0
-
-            print(f"  loss_main: {loss_main.item():.6f}")
-            print(f"  loss_vel:  {loss_vel.item():.6f} (w={motion_w})")
-            print(f"  loss_acc:  {loss_acc.item():.6f} (w={acc_w})")
-            print(f"  TOTAL:     {loss.item():.6f}")
-            print(f"  mean |Δ pred|: {d_pred:.6f}, mean |Δ gt|: {d_gt:.6f}")
+            mean_d_pred = v_pred.abs().mean().item() if pred_raw.size(1) > 1 else 0.0
+            mean_d_gt   = v_gt.abs().mean().item()   if gt_raw.size(1) > 1 else 0.0
+            print(f"loss_main: {loss_main.item():.6f}")
+            print(f"loss_vel: {loss_vel.item():.6f} (w={self.w_vel})")
+            print(f"loss_acc: {loss_acc.item():.6f} (w={self.w_acc})")
+            print(f"TOTAL: {loss.item():.6f}")
+            print(f"mean |Δ pred|: {mean_d_pred:.6f}, mean |Δ gt|: {mean_d_gt:.6f}")
             print(f"{'='*70}\n")
 
-        self.log_dict({
-            "train/loss": loss,
-            "train/mse": loss_main,
-            "train/vel": loss_vel,
-            "train/acc": loss_acc,
-        }, prog_bar=True)
+        self.log_dict(
+            {
+                "train/loss": loss,
+                "train/mse": loss_main,
+                "train/vel": loss_vel,
+                "train/acc": loss_acc,
+            },
+            prog_bar=True,
+        )
 
         self.train_logs["loss"].append(loss.item())
         self.train_logs["mse"].append(loss_main.item())
         self.train_logs["vel"].append(loss_vel.item())
         self.train_logs["acc"].append(loss_acc.item())
-        
+
         self._step_count += 1
         return loss
 

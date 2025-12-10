@@ -173,12 +173,11 @@ def tensor_to_pose_complete(
 
 
 def mean_frame_disp(x_btjc: torch.Tensor) -> float:
-    """x: [B,T,J,C]"""
-    if x_btjc.size(1) < 2:
+    x = sanitize_btjc(x_btjc)
+    if x.size(1) < 2:
         return 0.0
-    diff = x_btjc[:, 1:] - x_btjc[:, :-1]          # [B,T-1,J,C]
-    disp = diff.pow(2).sum(dim=-1).sqrt()         # [B,T-1,J]
-    return disp.mean().item()
+    v = x[:, 1:] - x[:, :-1]
+    return v.abs().mean().item()
 
 
 if __name__ == "__main__":
