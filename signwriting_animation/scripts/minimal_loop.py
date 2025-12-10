@@ -263,46 +263,53 @@ if __name__ == "__main__":
         batch = next(iter(train_loader))
         cond = batch["conditions"]
 
-        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign = cond["sign_image"][:1].float().to(device)
-        gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-
-        gt_mean_pose = gt_raw.mean(dim=1, keepdim=True)          # [1,1,178,3]
-        baseline = gt_mean_pose.repeat(1, gt_raw.size(1), 1, 1)  # [1,20,178,3]
-        mse_baseline = torch.mean((baseline - gt_raw) ** 2).item()
-        print(f"Baseline (static mean-pose) MSE: {mse_baseline:.4f}")
+        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)  # [1,40,178,3]
+        sign     = cond["sign_image"][:1].float().to(device)
+        gt_raw   = sanitize_btjc(batch["data"][:1]).to(device)       # [1,20,178,3]
 
         future_len = gt_raw.size(1)
 
+        gt_mean_pose = gt_raw.mean(dim=1, keepdim=True)                 # [1,1,178,3]
+        baseline     = gt_mean_pose.repeat(1, gt_raw.size(1), 1, 1)     # [1,20,178,3]
+        mse_baseline = torch.mean((baseline - gt_raw) ** 2).item()
+        print(f"Baseline (static mean-pose) MSE: {mse_baseline:.4f}")
+
         print("\n[Teacher-forced prediction]")
-        gt_norm = model.normalize(gt_raw)
+
+        gt_norm   = model.normalize(gt_raw)
         past_norm = model.normalize(past_raw)
 
-        B, T, J, C = gt_norm.shape
-        t_long = torch.randint(
-            0, model.diffusion.num_timesteps, (B,), device=device
-        )
+        gt_center   = gt_norm.mean(dim=2, keepdim=True)     # [1,20,1,3]
+        past_center = past_norm.mean(dim=2, keepdim=True)   # [1,40,1,3]
 
-        x0_bjct = model.btjc_to_bjct(gt_norm)
-        noise = torch.randn_like(x0_bjct)
-        x_t = model.diffusion.q_sample(x0_bjct, t_long, noise=noise)
+        gt_motion   = gt_norm - gt_center                   # [1,20,178,3]
+        past_motion = past_norm - past_center               # [1,40,178,3]
+
+        B, T, J, C = gt_motion.shape
+        t_long = torch.randint(0, model.diffusion.num_timesteps, (B,), device=device)
+
+        x0_bjct = model.btjc_to_bjct(gt_motion)
+        noise   = torch.randn_like(x0_bjct)
+        x_t     = model.diffusion.q_sample(x0_bjct, t_long, noise=noise)
         t_scaled = getattr(model.diffusion, "_scale_timesteps")(t_long)
 
-        past_bjct = model.btjc_to_bjct(past_norm)
-        pred_bjct = model.model.forward(
-            x_t, t_scaled, past_bjct, sign
-        )
-        pred_teacher_norm = model.bjct_to_btjc(pred_bjct)
-        pred_teacher = model.unnormalize(pred_teacher_norm)
+        past_bjct = model.btjc_to_bjct(past_motion)
+        pred_bjct = model.model.forward(x_t, t_scaled, past_bjct, sign)
 
-        gt_disp = mean_frame_disp(gt_raw)
+        pred_motion_norm = model.bjct_to_btjc(pred_bjct)      # motion 形式
+        pred_norm        = pred_motion_norm + gt_center       # 还原绝对 normalized
+        pred_teacher     = model.unnormalize(pred_norm)       # → raw
+
+        gt_disp    = mean_frame_disp(gt_raw)
         teach_disp = mean_frame_disp(pred_teacher)
         print(f"GT   mean frame-to-frame displacement:   {gt_disp:.6f}")
         print(f"TEACH mean frame-to-frame displacement:  {teach_disp:.6f}")
 
+        mse_teacher = torch.mean((pred_teacher - gt_raw) ** 2).item()
+        print(f"Teacher-forced MSE: {mse_teacher:.4f}")
+
         print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
 
-        # sample_autoregressive_fast 已在内部做过 unnormalize
         pred_raw = model.sample_autoregressive_fast(
             past_btjc=past_raw,
             sign_img=sign,
@@ -318,10 +325,11 @@ if __name__ == "__main__":
         print(f"DTW: {dtw_val:.4f}")
 
         disp_pred = mean_frame_disp(pred_raw)
-        print(
-            f"mean frame-to-frame displacement (sampled): "
-            f"{disp_pred:.6f}"
-        )
+        print(f"mean frame-to-frame displacement (sampled): {disp_pred:.6f}")
+
+        mse_pred = torch.mean((pred_raw - gt_raw) ** 2).item()
+        print(f"Sampled prediction MSE: {mse_pred:.4f}")
+
 
     print("\n" + "=" * 70)
     print("加载参考 pose")

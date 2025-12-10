@@ -170,66 +170,87 @@ class LitMinimal(pl.LightningModule):
             or self._step_count % 1000 == 0
         )
 
-        if debug_this_step:
-            print(f"\n{'='*70}")
-            print(f"TRAINING STEP {self._step_count}")
-            print(f"{'='*70}")
-
         cond_raw  = batch["conditions"]
         gt_btjc   = sanitize_btjc(batch["data"])
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img  = cond_raw["sign_image"].float()
 
         if debug_this_step:
-            print(f"gt: {gt_btjc.shape}, range=[{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
+            print("\n" + "=" * 70)
+            print(f"TRAINING STEP {self._step_count}")
+            print("=" * 70)
+            print(f"gt:   {gt_btjc.shape}, range=[{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
             print(f"past: {past_btjc.shape}")
 
-        # --- normalize ---
-        gt   = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc)
-        cond = {"input_pose": past, "sign_image": sign_img}
+        # ---------- 归一化 ----------
+        gt_norm   = self.normalize(gt_btjc)
+        past_norm = self.normalize(past_btjc)
 
-        B = gt.size(0)
+        # ---------- 去中心化（只用于 loss）----------
+        # 以“所有关节的平均位置”为 skeleton 中心
+        gt_center   = gt_norm.mean(dim=2, keepdim=True)    # [B,T,1,3]
+        past_center = past_norm.mean(dim=2, keepdim=True)  # [B,T,1,3]
+
+        gt_motion   = gt_norm - gt_center                  # [B,T,J,3]
+        past_motion = past_norm - past_center              # [B,T,J,3]
+
+        cond = {
+            "input_pose": past_motion,
+            "sign_image":  sign_img,
+        }
+
+        B = gt_motion.size(0)
         t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
 
-        # --- diffusion training step ---
-        pred_bjct, target_bjct = self._diffuse_once(gt, t, cond)
+        # 将“去中心化后的 gt_motion”作为 x0 送进 diffusion
+        pred_bjct, target_bjct = self._diffuse_once(gt_motion, t, cond)
         loss_main = torch.nn.functional.mse_loss(pred_bjct, target_bjct)
 
-        pred_btjc = self.bjct_to_btjc(pred_bjct)
-        gt_raw   = self.unnormalize(gt)
-        pred_raw = self.unnormalize(pred_btjc)
+        # ---------- 还原到绝对坐标（用于 vel/acc） ----------
+        pred_motion_btjc = self.bjct_to_btjc(pred_bjct)    # 仍在 normalized 空间
 
+        # 用 GT 的中心还原绝对 normalized 坐标
+        gt_norm_abs   = gt_motion + gt_center              # == gt_norm
+        pred_norm_abs = pred_motion_btjc + gt_center       # [B,T,J,3]
+
+        gt_raw   = self.unnormalize(gt_norm_abs)
+        pred_raw = self.unnormalize(pred_norm_abs)
+
+        # ---------- 动态约束：速度 / 加速度 ----------
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
 
         if pred_raw.size(1) > 1:
             v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
-            v_gt   = gt_raw[:, 1:]   - gt_raw[:, :-1]
+            v_gt   = gt_raw[:,   1:] - gt_raw[:,   :-1]
             loss_vel = torch.nn.functional.l1_loss(v_pred, v_gt)
+
             if v_pred.size(1) > 1:
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
-                a_gt   = v_gt[:, 1:]   - v_gt[:, :-1]
+                a_gt   = v_gt[:,   1:] - v_gt[:,   :-1]
                 loss_acc = torch.nn.functional.l1_loss(a_pred, a_gt)
 
-        loss = loss_main + self.w_vel * loss_vel + self.w_acc * loss_acc
+        # 你之前用的大权重，这里保留
+        w_vel = 50.0
+        w_acc = 20.0
+        loss = loss_main + w_vel * loss_vel + w_acc * loss_acc
 
         if debug_this_step:
-            mean_d_pred = v_pred.abs().mean().item() if pred_raw.size(1) > 1 else 0.0
-            mean_d_gt   = v_gt.abs().mean().item()   if gt_raw.size(1) > 1 else 0.0
+            mean_abs_pred = pred_raw.abs().mean().item()
+            mean_abs_gt   = gt_raw.abs().mean().item()
             print(f"loss_main: {loss_main.item():.6f}")
-            print(f"loss_vel: {loss_vel.item():.6f} (w={self.w_vel})")
-            print(f"loss_acc: {loss_acc.item():.6f} (w={self.w_acc})")
-            print(f"TOTAL: {loss.item():.6f}")
-            print(f"mean |Δ pred|: {mean_d_pred:.6f}, mean |Δ gt|: {mean_d_gt:.6f}")
-            print(f"{'='*70}\n")
+            print(f"loss_vel:  {loss_vel.item():.6f} (w={w_vel})")
+            print(f"loss_acc:  {loss_acc.item():.6f} (w={w_acc})")
+            print(f"TOTAL:     {loss.item():.6f}")
+            print(f"mean |Δ pred|: {mean_abs_pred:.6f}, mean |Δ gt|: {mean_abs_gt:.6f}")
+            print("=" * 70)
 
         self.log_dict(
             {
                 "train/loss": loss,
-                "train/mse": loss_main,
-                "train/vel": loss_vel,
-                "train/acc": loss_acc,
+                "train/mse":  loss_main,
+                "train/vel":  loss_vel,
+                "train/acc":  loss_acc,
             },
             prog_bar=True,
         )
@@ -298,7 +319,7 @@ class LitMinimal(pl.LightningModule):
         past_raw = past_btjc.to(device)
         B, Tp, J, C = past_raw.shape
 
-        cur_hist = past_raw.clone()
+        cur_hist_raw = past_raw.clone()
         frames_out = []
         sign = sign_img.to(device)
 
@@ -314,9 +335,14 @@ class LitMinimal(pl.LightningModule):
         remain = future_len
         while remain > 0:
             n = min(chunk, remain)
-            cur_hist_norm = self.normalize(cur_hist)
+
+            cur_norm = self.normalize(cur_hist_raw)              # [B,Tp,J,C]
+
+            cur_center = cur_norm.mean(dim=2, keepdim=True)      # [B,Tp,1,3]
+            cur_motion = cur_norm - cur_center                   # [B,Tp,J,3]
+
             cond = {
-                "input_pose": self.btjc_to_bjct(cur_hist_norm),
+                "input_pose": self.btjc_to_bjct(cur_motion),     # motion 形式
                 "sign_image": sign,
             }
             shape = (B, J, C, n)
@@ -325,14 +351,20 @@ class LitMinimal(pl.LightningModule):
                 shape=shape,
                 model_kwargs={"y": cond},
                 clip_denoised=False,
-                progress=False
+                progress=False,
             )
-            x_btjc_norm = self.bjct_to_btjc(x_bjct)
-            x_btjc_raw = self.unnormalize(x_btjc_norm)
-            frames_out.append(x_btjc_raw)
-            cur_hist = torch.cat([cur_hist, x_btjc_raw], dim=1)
-            if cur_hist.size(1) > Tp:
-                cur_hist = cur_hist[:, -Tp:]
+            x_motion_btjc_norm = self.bjct_to_btjc(x_bjct)       # [B,n,J,3]
+
+            base_center = cur_center[:, -1:, :, :].repeat(1, n, 1, 1)  # [B,n,1,3]
+            x_abs_norm  = x_motion_btjc_norm + base_center             # [B,n,J,3]
+
+            x_abs_raw = self.unnormalize(x_abs_norm)                   # [B,n,J,3]
+            frames_out.append(x_abs_raw)
+
+            cur_hist_raw = torch.cat([cur_hist_raw, x_abs_raw], dim=1)
+            if cur_hist_raw.size(1) > Tp:
+                cur_hist_raw = cur_hist_raw[:, -Tp:]
+
             remain -= n
 
         return torch.cat(frames_out, dim=1)
