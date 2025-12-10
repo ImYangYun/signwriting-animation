@@ -130,8 +130,8 @@ class LitMinimal(pl.LightningModule):
 
         self.lr = lr
         self.guidance_scale = float(guidance_scale)
-        self.w_vel = 10.0
-        self.w_acc = 5.0
+        self.w_vel = 50.0
+        self.w_acc = 20.0
         self.train_logs = {
             "loss": [],
             "mse": [],

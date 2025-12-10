@@ -267,6 +267,11 @@ if __name__ == "__main__":
         sign = cond["sign_image"][:1].float().to(device)
         gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
 
+        gt_mean_pose = gt_raw.mean(dim=1, keepdim=True)          # [1,1,178,3]
+        baseline = gt_mean_pose.repeat(1, gt_raw.size(1), 1, 1)  # [1,20,178,3]
+        mse_baseline = torch.mean((baseline - gt_raw) ** 2).item()
+        print(f"Baseline (static mean-pose) MSE: {mse_baseline:.4f}")
+
         future_len = gt_raw.size(1)
 
         print("\n[Teacher-forced prediction]")
