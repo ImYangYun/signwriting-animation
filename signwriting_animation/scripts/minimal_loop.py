@@ -11,8 +11,15 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitMinimal, sanitize_btjc, masked_dtw
+from signwriting_animation.diffusion.lightning_module import (
+    LitMinimal,
+    sanitize_btjc,
+    masked_dtw,
+)
 
+# ---------------------------------------------
+# 尝试导入 unshift_hands（可视化时用）
+# ---------------------------------------------
 try:
     from pose_anonymization.data.normalization import unshift_hands
     HAS_UNSHIFT = True
@@ -23,6 +30,9 @@ except ImportError as e:
     HAS_UNSHIFT = False
 
 
+# ---------------------------------------------------------
+# 工具：读回 .pose，简单检查分布
+# ---------------------------------------------------------
 def inspect_pose(path: str, name: str):
     """
     读回 .pose 文件，打印:
@@ -103,6 +113,7 @@ def tensor_to_pose_complete(
         f"[{pose_obj.body.data.min():.4f}, {pose_obj.body.data.max():.4f}]"
     )
 
+    # 1) 手部反平移
     if apply_unshift and HAS_UNSHIFT:
         print("\n  调用 unshift_hands...")
         try:
@@ -119,7 +130,7 @@ def tensor_to_pose_complete(
     else:
         print("\n  ⚠️  本次不调用 unshift_hands，仅写入 raw 坐标")
 
-    # 2️⃣ 根据 ref_pose 方差整体缩放
+    # 2) 根据 ref_pose 方差整体缩放
     T_pred = pose_obj.body.data.shape[0]
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)   # [T,J,C]
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)  # [T,J,C]
@@ -151,11 +162,12 @@ def tensor_to_pose_complete(
             print(f"  [scale] 计算缩放系数失败，跳过缩放: {e}")
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
 
+    # 3) 平移对齐中心
     if align_center_to_ref:
         try:
             ref_center = ref_arr.reshape(-1, 3).mean(axis=0)   # [3]
             pred_center = pred_arr.reshape(-1, 3).mean(axis=0) # [3]
-            delta = ref_center - pred_center                  # [3]
+            delta = ref_center - pred_center                   # [3]
             print(
                 f"\n  [translate] ref_center={ref_center}, "
                 f"pred_center={pred_center}"
@@ -172,6 +184,9 @@ def tensor_to_pose_complete(
     return pose_obj
 
 
+# ---------------------------------------------------------
+# 简单的“平均位移”度量：看帧间是否有运动
+# ---------------------------------------------------------
 def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     x = sanitize_btjc(x_btjc)
     if x.size(1) < 2:
@@ -180,6 +195,9 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     return v.abs().mean().item()
 
 
+# =========================================================
+#                    MAIN
+# =========================================================
 if __name__ == "__main__":
     pl.seed_everything(42)
 
@@ -191,9 +209,10 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("完全对齐版本 + 可视化缩放 & 平移修正")
+    print("完全对齐版本 + 可视化缩放 & 平移修正（DIRECT 训练）")
     print("=" * 70)
     print("✅ LightningModule.unnormalize: 只做数值反归一化")
+    print("✅ train_mode='direct'：直接预测 future pose")
     print("✅ tensor_to_pose: 调用 unshift_hands (若可用)")
     print("✅ 可视化时根据 ref_pose 方差 + 中心对 PRED 做 scale & translate")
     print("=" * 70 + "\n")
@@ -226,6 +245,7 @@ if __name__ == "__main__":
         collate_fn=zero_pad_collator,
     )
 
+    # ---------------- Lightning Trainer ----------------
     trainer = pl.Trainer(
         max_epochs=1000,
         accelerator="gpu",
@@ -237,6 +257,7 @@ if __name__ == "__main__":
     num_joints = sample_0["data"].shape[-2]
     num_dims = sample_0["data"].shape[-1]
 
+    # 关键：train_mode="direct"
     model = LitMinimal(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -246,13 +267,19 @@ if __name__ == "__main__":
         beta_start=1e-4,
         beta_end=2e-2,
         pred_target="x0",
+        train_mode="direct",
+        vel_weight=0.5,
+        acc_weight=0.25,
     )
 
     print("\n[训练中...]")
     trainer.fit(model, train_loader)
 
+    # =================================================
+    # INFERENCE: baseline vs direct prediction
+    # =================================================
     print("\n" + "=" * 70)
-    print("INFERENCE")
+    print("INFERENCE (direct mode)")
     print("=" * 70)
 
     model.eval()
@@ -269,68 +296,33 @@ if __name__ == "__main__":
 
         future_len = gt_raw.size(1)
 
+        # 1) Baseline: 静态平均骨架
         gt_mean_pose = gt_raw.mean(dim=1, keepdim=True)                 # [1,1,178,3]
-        baseline     = gt_mean_pose.repeat(1, gt_raw.size(1), 1, 1)     # [1,20,178,3]
+        baseline     = gt_mean_pose.repeat(1, future_len, 1, 1)         # [1,20,178,3]
         mse_baseline = torch.mean((baseline - gt_raw) ** 2).item()
+        disp_base    = mean_frame_disp(baseline)
         print(f"Baseline (static mean-pose) MSE: {mse_baseline:.4f}")
+        print(f"Baseline mean frame-to-frame displacement: {disp_base:.6f}")
 
-        print("\n[Teacher-forced prediction]")
+        # 2) Direct 预测
+        pred_raw = model.predict_direct(past_raw, sign, future_len=future_len)
 
-        gt_norm   = model.normalize(gt_raw)
-        past_norm = model.normalize(past_raw)
+        mse_pred  = torch.mean((pred_raw - gt_raw) ** 2).item()
+        disp_pred = mean_frame_disp(pred_raw)
+        print(f"Direct prediction MSE: {mse_pred:.4f}")
+        print(f"Direct mean frame-to-frame displacement: {disp_pred:.6f}")
 
-        gt_center   = gt_norm.mean(dim=2, keepdim=True)     # [1,20,1,3]
-        past_center = past_norm.mean(dim=2, keepdim=True)   # [1,40,1,3]
-
-        gt_motion   = gt_norm - gt_center                   # [1,20,178,3]
-        past_motion = past_norm - past_center               # [1,40,178,3]
-
-        B, T, J, C = gt_motion.shape
-        t_long = torch.randint(0, model.diffusion.num_timesteps, (B,), device=device)
-
-        x0_bjct = model.btjc_to_bjct(gt_motion)
-        noise   = torch.randn_like(x0_bjct)
-        x_t     = model.diffusion.q_sample(x0_bjct, t_long, noise=noise)
-        t_scaled = getattr(model.diffusion, "_scale_timesteps")(t_long)
-
-        past_bjct = model.btjc_to_bjct(past_motion)
-        pred_bjct = model.model.forward(x_t, t_scaled, past_bjct, sign)
-
-        pred_motion_norm = model.bjct_to_btjc(pred_bjct)      # motion 形式
-        pred_norm        = pred_motion_norm + gt_center       # 还原绝对 normalized
-        pred_teacher     = model.unnormalize(pred_norm)       # → raw
-
-        gt_disp    = mean_frame_disp(gt_raw)
-        teach_disp = mean_frame_disp(pred_teacher)
-        print(f"GT   mean frame-to-frame displacement:   {gt_disp:.6f}")
-        print(f"TEACH mean frame-to-frame displacement:  {teach_disp:.6f}")
-
-        mse_teacher = torch.mean((pred_teacher - gt_raw) ** 2).item()
-        print(f"Teacher-forced MSE: {mse_teacher:.4f}")
-
-        print(f"\n[采样] diffusion_steps=50, future_len={future_len}")
-
-        pred_raw = model.sample_autoregressive_fast(
-            past_btjc=past_raw,
-            sign_img=sign,
-            future_len=future_len,
-            chunk=20,
-        )
+        # 可选：DTW
+        mask_bt = torch.ones(1, future_len, device=device)
+        dtw_val = masked_dtw(pred_raw, gt_raw, mask_bt)
+        print(f"Direct prediction DTW: {dtw_val:.4f}")
 
         print(f"\nGT (raw):   [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
         print(f"PRED (raw): [{pred_raw.min():.4f}, {pred_raw.max():.4f}]")
 
-        mask_bt = torch.ones(1, future_len, device=device)
-        dtw_val = masked_dtw(pred_raw, gt_raw, mask_bt)
-        print(f"DTW: {dtw_val:.4f}")
-
-        disp_pred = mean_frame_disp(pred_raw)
-        print(f"mean frame-to-frame displacement (sampled): {disp_pred:.6f}")
-
-        mse_pred = torch.mean((pred_raw - gt_raw) ** 2).item()
-        print(f"Sampled prediction MSE: {mse_pred:.4f}")
-
-
+    # =================================================
+    # 保存到 .pose 做可视化
+    # =================================================
     print("\n" + "=" * 70)
     print("加载参考 pose")
     print("=" * 70)
@@ -372,6 +364,7 @@ if __name__ == "__main__":
         pose_pred.write(f)
     print(f"\n✓ PRED 保存: {out_pred}")
 
+    # 回读检查
     print("\n" + "=" * 70)
     print("DEBUG: 读回 .pose 文件检查分布")
     print("=" * 70)
