@@ -69,15 +69,11 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, 
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
-    # 修复异常关节：将异常手指关节 clamp 到合理范围
     if fix_abnormal_joints:
         T, J, C = t_np.shape
-        
-        # 计算每个关节相对于整体中心的距离
+
         center = t_np.mean(axis=(0, 1), keepdims=True)  # [1, 1, C]
         
-        # 右手关节索引 (通常是 132-152 或类似范围，需要根据你的骨架定义)
-        # 从日志看异常的是 159-168，这些是右手手指
         right_hand_joints = list(range(153, 174))  # 右手 21 个关节
         
         for j in right_hand_joints:
@@ -200,7 +196,7 @@ if __name__ == "__main__":
         vel_weight=1.0,
         acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=2.0,  # 对手指加强约束
+        hand_reg_weight=0.5,  # 降低手指约束权重
     )
 
     # 训练前诊断

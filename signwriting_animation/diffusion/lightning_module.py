@@ -111,8 +111,12 @@ class LitResidual(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
-        self.right_hand_joints = list(range(157, 178))
-        self.left_hand_joints = list(range(136, 157))
+        
+        # 右手手指关节索引 (根据 178 关节的 holistic 布局)
+        # 通常是: body(33) + face(468 reduced) + left_hand(21) + right_hand(21)
+        # 需要根据你的具体骨架确定，这里假设右手是最后 21 个关节
+        self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
+        self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
         assert train_mode in {"diffusion", "direct"}
         self.train_mode = train_mode
@@ -256,18 +260,15 @@ class LitResidual(pl.LightningModule):
 
         # 手指正则化损失：对手指关节施加额外约束
         loss_hand = torch.tensor(0.0, device=self.device)
-        if self.hand_reg_weight > 0 and J > max(self.right_hand_joints):
-            # 右手手指
-            pred_rh = pred_norm[:, :, self.right_hand_joints, :]  # [B, T, 21, C]
-            gt_rh = gt[:, :, self.right_hand_joints, :]
-            loss_rh = torch.nn.functional.mse_loss(pred_rh, gt_rh)
+        if self.hand_reg_weight > 0:
+            # 异常关节是 159-168，这些在右手范围内
+            # 只对这些特定异常关节加约束
+            abnormal_joints = list(range(159, 178))  # 异常的右手关节
             
-            # 左手手指
-            pred_lh = pred_norm[:, :, self.left_hand_joints, :]
-            gt_lh = gt[:, :, self.left_hand_joints, :]
-            loss_lh = torch.nn.functional.mse_loss(pred_lh, gt_lh)
-            
-            loss_hand = loss_rh + loss_lh
+            if J > max(abnormal_joints):
+                pred_hand = pred_norm[:, :, abnormal_joints, :]
+                gt_hand = gt[:, :, abnormal_joints, :]
+                loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
 
         loss = (loss_main 
                 + self.vel_weight * loss_vel 

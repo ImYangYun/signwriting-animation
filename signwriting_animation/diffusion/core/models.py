@@ -1,14 +1,3 @@
-"""
-修改版 SignWritingToPoseDiffusion
-
-问题：原模型在训练中学会忽略 past_motion，只用 sign_image 输出静态姿势
-
-解决方案：
-1. 强制 past 依赖：输出 = past[-1] + delta（残差预测）
-2. 增强 cross-attention 权重
-3. 添加 past 的显式特征融合
-"""
-
 import torch
 import torch.nn as nn
 from transformers import CLIPModel
@@ -48,13 +37,17 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         self.residual_scale = residual_scale
 
         input_feats = num_keypoints * num_dims_per_keypoint
+        
+        # Motion processors
         self.future_motion_process = MotionProcess(input_feats, num_latent_dims)
         self.past_motion_process = MotionProcess(input_feats, num_latent_dims)
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
 
+        # Global conditions
         self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
         self.embed_timestep = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
 
+        # Sequence encoder
         self.seqEncoder = seq_encoder_factory(
             arch=arch,
             latent_dim=num_latent_dims,
@@ -65,6 +58,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             activation=activation
         )
 
+        # 改进1：更强的 cross-attention（多层）
         self.cross_attn_layers = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=num_latent_dims,
@@ -79,6 +73,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             for _ in range(3)
         ])
 
+        # 改进2：past_last 的显式编码
         self.past_last_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
             nn.LayerNorm(num_latent_dims),
@@ -91,6 +86,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             num_latent_dims, num_keypoints, num_dims_per_keypoint
         )
 
+        # Time projection for future frames
         self.future_time_proj = nn.Sequential(
             nn.Linear(1, num_latent_dims),
             nn.SiLU(),
@@ -103,6 +99,9 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 timesteps: torch.Tensor,
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
+        """
+        残差预测模式：output = past_last + scale * delta
+        """
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
         
         debug = (self._forward_count == 0) or (self._forward_count % 100 == 0)
@@ -121,12 +120,14 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             else:
                 raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
+        # 获取 past 的最后一帧 [B, J, C]
         past_last = past_motion[..., -1]  # [B, J, C]
         past_last_flat = past_last.reshape(batch_size, -1)  # [B, J*C]
         
         if debug:
             print(f"  past_last: {past_last.shape}, mean={past_last.mean().item():.4f}")
 
+        # Embeddings
         time_emb = self.embed_timestep(timesteps)
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)
         past_last_emb = self.past_last_encoder(past_last_flat)  # [B, D]
@@ -144,17 +145,21 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
+        # 改进：past_last_emb 加到每一帧
         past_last_emb_expanded = past_last_emb.unsqueeze(0).expand(Tf, -1, -1)  # [Tf, B, D]
 
+        # Condition fusion
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
+        # 融合所有条件 + past_last
         xseq = (future_motion_emb 
                 + 0.3 * time_cond 
                 + 0.3 * sign_cond 
-                + 0.5 * past_last_emb_expanded)
+                + 0.5 * past_last_emb_expanded)  # 强化 past_last 的影响
         xseq = self.sequence_pos_encoder(xseq)
 
+        # 多层 cross-attention with past
         for cross_attn, cross_ln in zip(self.cross_attn_layers, self.cross_lns):
             attn_out, _ = cross_attn(
                 query=xseq,
@@ -170,13 +175,18 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         delta = self.pose_projection(output)  # [T, B, J, C]
         delta = delta.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
-        # 关键改进：残差预测
-        # output = past_last + scale * delta
         past_last_expanded = past_last.unsqueeze(-1).expand(-1, -1, -1, num_frames)  # [B, J, C, T]
-        result = past_last_expanded + self.residual_scale * delta
+        
+        time_offset = torch.linspace(0, 1, steps=num_frames, device=delta.device)  # [T]
+        time_offset = time_offset.view(1, 1, 1, num_frames)  # [1, 1, 1, T]
+        
+        scaled_delta = self.residual_scale * delta * (1.0 + time_offset)
+        
+        result = past_last_expanded + scaled_delta
 
         if debug:
             print(f"  delta range: [{delta.min():.4f}, {delta.max():.4f}]")
+            print(f"  scaled_delta range: [{scaled_delta.min():.4f}, {scaled_delta.max():.4f}]")
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
 
         self._forward_count += 1
