@@ -56,11 +56,11 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0):
+def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
     """
     转换 tensor 到 pose 格式
     
-    恢复原来的 variance 缩放方法
+    新增：fix_abnormal_joints - 修复异常的手指关节
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -68,6 +68,35 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0):
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
+    
+    # 修复异常关节：将异常手指关节 clamp 到合理范围
+    if fix_abnormal_joints:
+        T, J, C = t_np.shape
+        
+        # 计算每个关节相对于整体中心的距离
+        center = t_np.mean(axis=(0, 1), keepdims=True)  # [1, 1, C]
+        
+        # 右手关节索引 (通常是 132-152 或类似范围，需要根据你的骨架定义)
+        # 从日志看异常的是 159-168，这些是右手手指
+        right_hand_joints = list(range(153, 174))  # 右手 21 个关节
+        
+        for j in right_hand_joints:
+            if j < J:
+                # 计算该关节在所有帧的运动范围
+                joint_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
+                
+                # 如果范围太大（超过整体范围的一定比例），进行修复
+                overall_range = t_np.max(axis=(0,1)) - t_np.min(axis=(0,1))
+                
+                for c in range(C):
+                    if joint_range[c] > overall_range[c] * 0.5:  # 单个关节运动超过整体的50%
+                        # 将该关节的值 clamp 到合理范围
+                        joint_mean = t_np[:, j, c].mean()
+                        max_dev = overall_range[c] * 0.2  # 最大允许偏离
+                        t_np[:, j, c] = np.clip(t_np[:, j, c], joint_mean - max_dev, joint_mean + max_dev)
+        
+        print(f"  ✓ 异常关节修复完成")
+    
     arr = t_np[:, None, :, :]
     conf = ref_pose.body.confidence[:len(t_np)].copy()
     fps = ref_pose.body.fps
@@ -168,9 +197,10 @@ if __name__ == "__main__":
         stats_path=stats_path,
         lr=1e-3,
         train_mode="direct",
-        vel_weight=1.0,  # 增加速度损失权重
+        vel_weight=1.0,
         acc_weight=0.5,
-        residual_scale=0.1,  # delta 的缩放
+        residual_scale=0.1,
+        hand_reg_weight=2.0,  # 对手指加强约束
     )
 
     # 训练前诊断

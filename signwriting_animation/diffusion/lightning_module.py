@@ -87,6 +87,8 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
 class LitResidual(pl.LightningModule):
     """
     使用残差预测模型的 Lightning Module
+    
+    新增：hand_reg_weight - 对手指关节的额外正则化
     """
 
     def __init__(
@@ -104,9 +106,13 @@ class LitResidual(pl.LightningModule):
         vel_weight: float = 1.0,  # 增加速度权重
         acc_weight: float = 0.5,
         residual_scale: float = 0.1,  # 残差缩放
+        hand_reg_weight: float = 1.0,  # 手指正则化权重
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.hand_reg_weight = hand_reg_weight
+        self.right_hand_joints = list(range(157, 178))
+        self.left_hand_joints = list(range(136, 157))
 
         assert train_mode in {"diffusion", "direct"}
         self.train_mode = train_mode
@@ -248,13 +254,32 @@ class LitResidual(pl.LightningModule):
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
 
-        loss = loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
+        # 手指正则化损失：对手指关节施加额外约束
+        loss_hand = torch.tensor(0.0, device=self.device)
+        if self.hand_reg_weight > 0 and J > max(self.right_hand_joints):
+            # 右手手指
+            pred_rh = pred_norm[:, :, self.right_hand_joints, :]  # [B, T, 21, C]
+            gt_rh = gt[:, :, self.right_hand_joints, :]
+            loss_rh = torch.nn.functional.mse_loss(pred_rh, gt_rh)
+            
+            # 左手手指
+            pred_lh = pred_norm[:, :, self.left_hand_joints, :]
+            gt_lh = gt[:, :, self.left_hand_joints, :]
+            loss_lh = torch.nn.functional.mse_loss(pred_lh, gt_lh)
+            
+            loss_hand = loss_rh + loss_lh
+
+        loss = (loss_main 
+                + self.vel_weight * loss_vel 
+                + self.acc_weight * loss_acc
+                + self.hand_reg_weight * loss_hand)
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
             disp_gt = mean_frame_disp(gt_raw)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
+            print(f"loss_hand: {loss_hand.item():.6f} (w={self.hand_reg_weight})")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70)
@@ -264,6 +289,7 @@ class LitResidual(pl.LightningModule):
             "train/mse": loss_main,
             "train/vel": loss_vel,
             "train/acc": loss_acc,
+            "train/hand": loss_hand,
         }, prog_bar=True)
 
         self.train_logs["loss"].append(loss.item())
