@@ -105,13 +105,13 @@ class LitResidual(pl.LightningModule):
         train_mode: str = "direct",
         vel_weight: float = 1.0,  # 增加速度权重
         acc_weight: float = 0.5,
-        residual_scale: float = 0.1,  # 残差缩放
-        hand_reg_weight: float = 1.0,  # 手指正则化权重
+        residual_scale: float = 0.1,
+        hand_reg_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
-        
+
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
@@ -260,9 +260,10 @@ class LitResidual(pl.LightningModule):
             mag_pred = v_pred.abs().mean()
             mag_gt = v_gt.abs().mean()
             
-            # 如果预测运动 < GT 运动的 50%，则施加惩罚
-            motion_deficit = torch.relu(mag_gt * 0.5 - mag_pred)
-            loss_motion = motion_deficit * 10.0  # 强惩罚
+            # 如果预测运动 < GT 运动的 80%，则施加惩罚
+            # 权重要足够大，让模型不敢输出静态
+            motion_deficit = torch.relu(mag_gt * 0.8 - mag_pred)
+            loss_motion = motion_deficit * 100.0  # 非常强的惩罚
         else:
             loss_motion = torch.tensor(0.0, device=self.device)
 
