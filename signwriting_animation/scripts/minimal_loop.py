@@ -12,7 +12,6 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, masked_dtw, mean_frame_disp
-
 try:
     from pose_anonymization.data.normalization import unshift_hands
     HAS_UNSHIFT = True
@@ -57,13 +56,11 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=10.0):
+def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0):
     """
     转换 tensor 到 pose 格式
     
-    改进：
-    1. 限制最大缩放系数，避免异常放大
-    2. 使用 percentile 而不是 variance 来计算缩放
+    恢复原来的 variance 缩放方法
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -81,35 +78,39 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=10.0):
     if HAS_UNSHIFT:
         try:
             unshift_hands(pose_obj)
-        except:
-            pass
+            print("  ✓ unshift 成功")
+        except Exception as e:
+            print(f"  ✗ unshift 失败: {e}")
     
     T_pred = pose_obj.body.data.shape[0]
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
     if apply_scale:
-        # 使用 IQR (四分位距) 来计算缩放，更稳健
-        def _iqr_scale(a):
-            flat = a.reshape(-1)
-            q75, q25 = np.percentile(flat, [75, 25])
-            return q75 - q25
+        # 使用原来的 variance 方法
+        def _var(a):
+            center = a.mean(axis=1, keepdims=True)
+            return float(((a - center) ** 2).mean())
         
-        iqr_ref = _iqr_scale(ref_arr)
-        iqr_pred = _iqr_scale(pred_arr)
+        var_ref = _var(ref_arr)
+        var_pred = _var(pred_arr)
         
-        if iqr_pred > 1e-6:
-            scale = iqr_ref / iqr_pred
-            # 限制缩放范围
-            scale = np.clip(scale, 1.0 / max_scale, max_scale)
-            print(f"  [scale] IQR ref={iqr_ref:.2f}, pred={iqr_pred:.2f}, scale={scale:.2f}")
+        print(f"  [scale] var_ref={var_ref:.2f}, var_pred={var_pred:.6f}")
+        
+        if var_pred > 1e-8:
+            scale = np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6))
+            # 限制缩放范围，避免极端值
+            scale = np.clip(scale, 1.0, max_scale)
+            print(f"  [scale] apply scale={scale:.2f}")
             pose_obj.body.data *= scale
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
     # 平移对齐
     ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
     pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
-    pose_obj.body.data += (ref_c - pred_c)
+    delta = ref_c - pred_c
+    print(f"  [translate] delta={delta}")
+    pose_obj.body.data += delta
     
     print(f"  [final] range=[{pose_obj.body.data.min():.2f}, {pose_obj.body.data.max():.2f}]")
     
