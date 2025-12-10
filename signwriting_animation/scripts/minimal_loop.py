@@ -208,10 +208,10 @@ if __name__ == "__main__":
         vel_weight=1.0,
         acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=0.0,  # 去掉手指约束，让模型自由学习
+        hand_reg_weight=1.0,
     )
 
-    # 训练前诊断
+    # diagnose
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     

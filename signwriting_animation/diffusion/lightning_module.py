@@ -167,15 +167,9 @@ class LitResidual(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def _predict_frames(self, past_norm_btjc, sign_img, num_frames):
-        """
-        预测 num_frames 帧
-        
-        残差模型会自动使用 past 的最后一帧作为基准
-        """
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
 
-        # 创建 dummy x（模型会用残差覆盖）
         x_btjc = torch.zeros(B, num_frames, J, C, device=device, dtype=past_norm_btjc.dtype)
         x_bjct = self.btjc_to_bjct(x_btjc)
         
@@ -213,6 +207,38 @@ class LitResidual(pl.LightningModule):
             remaining -= n
         
         return torch.cat(predictions, dim=1)
+    
+    def hand_scale_regularizer(self, pred_norm, gt, scale_factor: float = 1.5):
+        """
+        pred_norm, gt: [B, T, J, C]，都是 normalized 空间。
+        """
+        device = pred_norm.device
+        B, T, J, C = pred_norm.shape
+        loss = torch.tensor(0.0, device=device)
+
+        for hand_joints in (self.left_hand_joints, self.right_hand_joints):
+            hand_joints = [j for j in hand_joints if j < J]
+            if len(hand_joints) < 2:
+                continue
+
+            wrist_idx = hand_joints[0]
+            finger_idx = hand_joints[1:]
+
+            # [B, T, C]
+            pred_wrist = pred_norm[:, :, wrist_idx, :]
+            gt_wrist   = gt[:, :, wrist_idx, :]
+
+            # [B, T, F, C]
+            pred_rel = pred_norm[:, :, finger_idx, :] - pred_wrist.unsqueeze(2)
+            gt_rel   = gt[:, :, finger_idx, :] - gt_wrist.unsqueeze(2)
+
+            pred_r = pred_rel.norm(dim=-1)
+            gt_r   = gt_rel.norm(dim=-1) + 1e-6
+            excess = torch.relu(pred_r - scale_factor * gt_r)
+            loss = loss + (excess ** 2).mean()
+
+        return loss
+
 
     def training_step(self, batch, batch_idx):
         debug = self._step_count == 0 or self._step_count % 100 == 0
@@ -275,11 +301,14 @@ class LitResidual(pl.LightningModule):
         # 手指正则化损失
         loss_hand = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            abnormal_joints = list(range(159, 178))
-            if J > max(abnormal_joints):
-                pred_hand = pred_norm[:, :, abnormal_joints, :]
-                gt_hand = gt[:, :, abnormal_joints, :]
-                loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
+            #abnormal_joints = list(range(159, 178))
+            #if J > max(abnormal_joints):
+                #pred_hand = pred_norm[:, :, abnormal_joints, :]
+                #gt_hand = gt[:, :, abnormal_joints, :]
+                #loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
+                # 手部尺度 regularizer：防止一只手整体放大
+            scale_reg = self.hand_scale_regularizer(pred_norm, gt, scale_factor=1.5)
+            loss_hand = self.hand_reg_weight * scale_reg
 
         loss = (loss_main 
                 + self.vel_weight * loss_vel 
