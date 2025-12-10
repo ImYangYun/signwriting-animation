@@ -11,12 +11,7 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import (
-    LitMinimalAutoregressive,
-    sanitize_btjc,
-    masked_dtw,
-    mean_frame_disp,
-)
+from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, masked_dtw, mean_frame_disp
 
 try:
     from pose_anonymization.data.normalization import unshift_hands
@@ -25,81 +20,44 @@ except ImportError:
     HAS_UNSHIFT = False
 
 
-def diagnose_model_sensitivity(model, past_norm, sign_img, device):
-    """
-    诊断：模型是否对输入敏感？
-    """
+def diagnose_model(model, past_norm, sign_img, device):
+    """诊断模型对输入的敏感度"""
     print("\n" + "=" * 70)
     print("诊断：模型对输入的敏感度")
     print("=" * 70)
     
     model.eval()
-    B, T, J, C = past_norm.shape
     
-    # 测试 1：相同输入，输出是否相同
     with torch.no_grad():
-        pred1 = model._predict_single_frame(past_norm, sign_img)
-        pred2 = model._predict_single_frame(past_norm, sign_img)
-        diff_same = (pred1 - pred2).abs().max().item()
-        print(f"1. 相同输入两次预测的差异: {diff_same:.8f}")
-        if diff_same > 1e-6:
-            print("   ⚠️ 有随机性！检查是否有 dropout")
-    
-    # 测试 2：不同 past，输出是否不同
-    with torch.no_grad():
-        past_shifted = past_norm.clone()
-        past_shifted[:, :, :, 0] += 0.1  # X 坐标 +0.1
+        # 测试1：相同输入
+        pred1 = model._predict_frames(past_norm, sign_img, 5)
+        pred2 = model._predict_frames(past_norm, sign_img, 5)
+        diff = (pred1 - pred2).abs().max().item()
+        print(f"1. 相同输入两次预测差异: {diff:.8f}")
         
-        pred_orig = model._predict_single_frame(past_norm, sign_img)
-        pred_shifted = model._predict_single_frame(past_shifted, sign_img)
-        diff_past = (pred_orig - pred_shifted).abs().mean().item()
-        print(f"2. 不同 past 的输出差异: {diff_past:.6f}")
-        if diff_past < 1e-6:
-            print("   ❌ 模型完全忽略了 past_motion！")
+        # 测试2：不同 past
+        past_shifted = past_norm.clone()
+        past_shifted[:, :, :, 0] += 0.1
+        pred_orig = model._predict_frames(past_norm, sign_img, 5)
+        pred_shifted = model._predict_frames(past_shifted, sign_img, 5)
+        diff = (pred_orig - pred_shifted).abs().mean().item()
+        print(f"2. 不同 past 的输出差异: {diff:.6f}")
+        if diff < 1e-6:
+            print("   ❌ 模型忽略了 past!")
         else:
             print("   ✓ 模型对 past 敏感")
-    
-    # 测试 3：滑动窗口后，输出是否变化
-    with torch.no_grad():
-        # 原始 past
-        pred_t0 = model._predict_single_frame(past_norm, sign_img)
         
-        # 滑动一帧：去掉 past[0]，加入 pred_t0
-        new_past = torch.cat([past_norm[:, 1:], pred_t0], dim=1)
-        pred_t1 = model._predict_single_frame(new_past, sign_img)
-        
-        diff_ar = (pred_t0 - pred_t1).abs().mean().item()
-        print(f"3. 自回归第 0 帧 vs 第 1 帧差异: {diff_ar:.6f}")
-        if diff_ar < 1e-6:
-            print("   ❌ 自回归预测相同！问题在于模型架构")
+        # 测试3：帧间差异
+        pred = model._predict_frames(past_norm, sign_img, 10)
+        disp = mean_frame_disp(pred)
+        print(f"3. 预测帧间 displacement: {disp:.6f}")
+        if disp < 1e-6:
+            print("   ❌ 预测是静态的!")
         else:
-            print("   ✓ 自回归产生不同输出")
-    
-    # 测试 4：检查 past 的哪部分被使用
-    with torch.no_grad():
-        # 只改变 past 的最后一帧
-        past_last_changed = past_norm.clone()
-        past_last_changed[:, -1] += 0.1
-        
-        pred_orig = model._predict_single_frame(past_norm, sign_img)
-        pred_last = model._predict_single_frame(past_last_changed, sign_img)
-        diff_last = (pred_orig - pred_last).abs().mean().item()
-        print(f"4. 只改 past 最后一帧的输出差异: {diff_last:.6f}")
-        
-        # 只改变 past 的第一帧
-        past_first_changed = past_norm.clone()
-        past_first_changed[:, 0] += 0.1
-        pred_first = model._predict_single_frame(past_first_changed, sign_img)
-        diff_first = (pred_orig - pred_first).abs().mean().item()
-        print(f"5. 只改 past 第一帧的输出差异: {diff_first:.6f}")
-        
-        if diff_last > diff_first * 10:
-            print("   ✓ 模型更关注最近的帧（符合预期）")
-        elif diff_last < diff_first:
-            print("   ⚠️ 模型更关注远处的帧（奇怪）")
+            print("   ✓ 预测有运动")
 
 
-def tensor_to_pose_complete(t_btjc, header, ref_pose):
+def tensor_to_pose(t_btjc, header, ref_pose):
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
@@ -148,13 +106,16 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_178_v2"
+    out_dir = "logs/minimal_residual"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("诊断 + 测试脚本 v2")
+    print("残差预测模型测试")
+    print("=" * 70)
+    print("核心思想: output = past_last + scale * delta")
+    print("模型被强制学习'变化量'而不是'绝对位置'")
     print("=" * 70)
 
     # Dataset
@@ -179,36 +140,24 @@ if __name__ == "__main__":
 
     train_ds = FixedSampleDataset(sample_0)
     train_loader = DataLoader(
-        train_ds,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=zero_pad_collator,
+        train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator,
     )
 
-    # Model
     num_joints = sample_0["data"].shape[-2]
     num_dims = sample_0["data"].shape[-1]
 
-    model = LitMinimalAutoregressive(
+    model = LitResidual(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-3,
-        diffusion_steps=50,
-        beta_start=1e-4,
-        beta_end=2e-2,
-        pred_target="x0",
         train_mode="direct",
-        vel_weight=0.5,
-        acc_weight=0.25,
-        motion_weight=0.1,
+        vel_weight=1.0,  # 增加速度损失权重
+        acc_weight=0.5,
+        residual_scale=0.1,  # delta 的缩放
     )
 
-    # === 训练前诊断 ===
-    print("\n" + "=" * 70)
-    print("训练前诊断（随机权重）")
-    print("=" * 70)
-    
+    # 训练前诊断
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
@@ -216,11 +165,12 @@ if __name__ == "__main__":
     cond = batch["conditions"]
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
-    
     past_norm = model.normalize(past_raw)
-    diagnose_model_sensitivity(model, past_norm, sign, device)
     
-    # === 训练 ===
+    print("\n训练前诊断:")
+    diagnose_model(model, past_norm, sign, device)
+
+    # 训练
     print("\n" + "=" * 70)
     print("开始训练")
     print("=" * 70)
@@ -234,12 +184,8 @@ if __name__ == "__main__":
     )
     
     trainer.fit(model, train_loader)
-    
-    # === 训练后诊断 ===
-    print("\n" + "=" * 70)
-    print("训练后诊断")
-    print("=" * 70)
-    
+
+    # 训练后诊断
     model = model.to(device)
     model.eval()
     
@@ -248,11 +194,12 @@ if __name__ == "__main__":
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-    
     past_norm = model.normalize(past_raw)
-    diagnose_model_sensitivity(model, past_norm, sign, device)
     
-    # === Inference ===
+    print("\n训练后诊断:")
+    diagnose_model(model, past_norm, sign, device)
+
+    # Inference
     print("\n" + "=" * 70)
     print("INFERENCE")
     print("=" * 70)
@@ -263,33 +210,36 @@ if __name__ == "__main__":
         # Baseline
         baseline = gt_raw.mean(dim=1, keepdim=True).repeat(1, future_len, 1, 1)
         mse_base = torch.mean((baseline - gt_raw) ** 2).item()
-        disp_base = mean_frame_disp(baseline)
-        print(f"Baseline MSE: {mse_base:.4f}, disp: {disp_base:.6f}")
+        print(f"Baseline MSE: {mse_base:.4f}")
         
-        # Prediction
-        pred_raw = model.predict_direct(past_raw, sign, future_len=future_len, debug=True)
+        # 非自回归预测
+        pred_raw_direct = model.predict_direct(past_raw, sign, future_len, use_autoregressive=False)
+        mse_direct = torch.mean((pred_raw_direct - gt_raw) ** 2).item()
+        disp_direct = mean_frame_disp(pred_raw_direct)
+        print(f"\nDirect (non-AR) MSE: {mse_direct:.4f}, disp: {disp_direct:.6f}")
         
-        mse_pred = torch.mean((pred_raw - gt_raw) ** 2).item()
-        disp_pred = mean_frame_disp(pred_raw)
+        # 自回归预测
+        pred_raw_ar = model.predict_direct(past_raw, sign, future_len, use_autoregressive=True)
+        mse_ar = torch.mean((pred_raw_ar - gt_raw) ** 2).item()
+        disp_ar = mean_frame_disp(pred_raw_ar)
+        print(f"Autoregressive MSE: {mse_ar:.4f}, disp: {disp_ar:.6f}")
+        
         disp_gt = mean_frame_disp(gt_raw)
-        
-        print(f"\nPrediction MSE: {mse_pred:.4f}")
-        print(f"Prediction displacement: {disp_pred:.6f}")
-        print(f"GT displacement: {disp_gt:.6f}")
-        
-        if disp_pred < 1e-6:
-            print("\n❌ 预测仍然是静态的！")
-        elif disp_pred < disp_gt * 0.1:
-            print("\n⚠️ 预测运动太小")
-        else:
-            print("\n✓ 预测有运动！")
+        print(f"GT disp: {disp_gt:.6f}")
         
         # DTW
         mask = torch.ones(1, future_len, device=device)
-        dtw = masked_dtw(pred_raw, gt_raw, mask)
-        print(f"DTW: {dtw:.4f}")
-    
-    # === 保存 .pose ===
+        dtw_val = masked_dtw(pred_raw_ar, gt_raw, mask)
+        print(f"DTW: {dtw_val:.4f}")
+        
+        if disp_ar < 1e-6:
+            print("\n❌ 预测仍然是静态的!")
+        elif disp_ar < disp_gt * 0.1:
+            print("\n⚠️ 预测运动太小")
+        else:
+            print("\n✓ 预测有运动!")
+
+    # 保存
     print("\n" + "=" * 70)
     print("保存文件")
     print("=" * 70)
@@ -310,10 +260,10 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"✓ GT: {out_gt}")
     
-    pose_pred = tensor_to_pose_complete(pred_raw, header, ref_pose)
+    pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
     print(f"✓ PRED: {out_pred}")
     
-    print("\n✓ 完成！")
+    print("\n✓ 完成!")
