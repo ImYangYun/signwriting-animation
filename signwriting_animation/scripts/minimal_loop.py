@@ -57,7 +57,14 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose):
+def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=10.0):
+    """
+    转换 tensor 到 pose 格式
+    
+    改进：
+    1. 限制最大缩放系数，避免异常放大
+    2. 使用 percentile 而不是 variance 来计算缩放
+    """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
@@ -77,26 +84,34 @@ def tensor_to_pose(t_btjc, header, ref_pose):
         except:
             pass
     
-    # Scale & translate
     T_pred = pose_obj.body.data.shape[0]
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
-    def _var(a):
-        c = a.mean(axis=1, keepdims=True)
-        return float(((a - c) ** 2).mean())
+    if apply_scale:
+        # 使用 IQR (四分位距) 来计算缩放，更稳健
+        def _iqr_scale(a):
+            flat = a.reshape(-1)
+            q75, q25 = np.percentile(flat, [75, 25])
+            return q75 - q25
+        
+        iqr_ref = _iqr_scale(ref_arr)
+        iqr_pred = _iqr_scale(pred_arr)
+        
+        if iqr_pred > 1e-6:
+            scale = iqr_ref / iqr_pred
+            # 限制缩放范围
+            scale = np.clip(scale, 1.0 / max_scale, max_scale)
+            print(f"  [scale] IQR ref={iqr_ref:.2f}, pred={iqr_pred:.2f}, scale={scale:.2f}")
+            pose_obj.body.data *= scale
+            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
-    var_ref = _var(ref_arr)
-    var_pred = _var(pred_arr)
-    
-    if var_pred > 1e-8:
-        scale = np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6))
-        pose_obj.body.data *= scale
-        pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    
+    # 平移对齐
     ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
     pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
     pose_obj.body.data += (ref_c - pred_c)
+    
+    print(f"  [final] range=[{pose_obj.body.data.min():.2f}, {pose_obj.body.data.max():.2f}]")
     
     return pose_obj
 
@@ -226,6 +241,29 @@ if __name__ == "__main__":
         
         disp_gt = mean_frame_disp(gt_raw)
         print(f"GT disp: {disp_gt:.6f}")
+        
+        # 详细诊断：检查每个关节的预测范围
+        print("\n--- 关节范围诊断 ---")
+        pred_np = pred_raw_ar[0].cpu().numpy()  # [T, J, C]
+        gt_np = gt_raw[0].cpu().numpy()
+        
+        # 计算每个关节的运动范围
+        pred_ranges = pred_np.max(axis=0) - pred_np.min(axis=0)  # [J, C]
+        gt_ranges = gt_np.max(axis=0) - gt_np.min(axis=0)
+        
+        # 找出异常关节（预测范围远大于 GT）
+        ratio = (pred_ranges.sum(axis=1) + 1e-6) / (gt_ranges.sum(axis=1) + 1e-6)
+        abnormal = np.where(ratio > 3.0)[0]  # 超过 3 倍的关节
+        
+        if len(abnormal) > 0:
+            print(f"⚠️ 发现 {len(abnormal)} 个异常关节 (预测范围 > 3x GT):")
+            for j in abnormal[:10]:
+                print(f"  Joint {j}: pred_range={pred_ranges[j].sum():.4f}, gt_range={gt_ranges[j].sum():.4f}, ratio={ratio[j]:.1f}x")
+        else:
+            print("✓ 所有关节范围正常")
+        
+        print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
+        print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
         
         # DTW
         mask = torch.ones(1, future_len, device=device)
