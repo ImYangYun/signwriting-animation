@@ -112,9 +112,6 @@ class LitResidual(pl.LightningModule):
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
         
-        # 右手手指关节索引 (根据 178 关节的 holistic 布局)
-        # 通常是: body(33) + face(468 reduced) + left_hand(21) + right_hand(21)
-        # 需要根据你的具体骨架确定，这里假设右手是最后 21 个关节
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
@@ -257,14 +254,22 @@ class LitResidual(pl.LightningModule):
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
+            
+            # 关键：motion magnitude loss
+            # 惩罚预测运动幅度小于 GT 运动幅度
+            mag_pred = v_pred.abs().mean()
+            mag_gt = v_gt.abs().mean()
+            
+            # 如果预测运动 < GT 运动的 50%，则施加惩罚
+            motion_deficit = torch.relu(mag_gt * 0.5 - mag_pred)
+            loss_motion = motion_deficit * 10.0  # 强惩罚
+        else:
+            loss_motion = torch.tensor(0.0, device=self.device)
 
-        # 手指正则化损失：对手指关节施加额外约束
+        # 手指正则化损失
         loss_hand = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            # 异常关节是 159-168，这些在右手范围内
-            # 只对这些特定异常关节加约束
-            abnormal_joints = list(range(159, 178))  # 异常的右手关节
-            
+            abnormal_joints = list(range(159, 178))
             if J > max(abnormal_joints):
                 pred_hand = pred_norm[:, :, abnormal_joints, :]
                 gt_hand = gt[:, :, abnormal_joints, :]
@@ -273,13 +278,15 @@ class LitResidual(pl.LightningModule):
         loss = (loss_main 
                 + self.vel_weight * loss_vel 
                 + self.acc_weight * loss_acc
-                + self.hand_reg_weight * loss_hand)
+                + self.hand_reg_weight * loss_hand
+                + loss_motion)
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
             disp_gt = mean_frame_disp(gt_raw)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
+            print(f"loss_motion: {loss_motion.item():.6f} (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
             print(f"loss_hand: {loss_hand.item():.6f} (w={self.hand_reg_weight})")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
@@ -291,6 +298,7 @@ class LitResidual(pl.LightningModule):
             "train/vel": loss_vel,
             "train/acc": loss_acc,
             "train/hand": loss_hand,
+            "train/motion": loss_motion,
         }, prog_bar=True)
 
         self.train_logs["loss"].append(loss.item())
