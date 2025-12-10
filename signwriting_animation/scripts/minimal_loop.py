@@ -56,11 +56,11 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
     """
     转换 tensor 到 pose 格式
     
-    新增：fix_abnormal_joints - 修复异常的手指关节
+    新增：gt_btjc - 如果提供，用 GT 来约束异常关节
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -69,27 +69,47 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, 
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
+    gt_np = None
+    if gt_btjc is not None:
+        if gt_btjc.dim() == 4:
+            gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
+        else:
+            gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
+    
     if fix_abnormal_joints:
         T, J, C = t_np.shape
-
-        center = t_np.mean(axis=(0, 1), keepdims=True)  # [1, 1, C]
         
-        right_hand_joints = list(range(153, 174))  # 右手 21 个关节
+        # 右手手指关节 (159-177)
+        hand_joints = list(range(153, min(178, J)))
         
-        for j in right_hand_joints:
-            if j < J:
-                # 计算该关节在所有帧的运动范围
-                joint_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
-                
-                # 如果范围太大（超过整体范围的一定比例），进行修复
-                overall_range = t_np.max(axis=(0,1)) - t_np.min(axis=(0,1))
+        for j in hand_joints:
+            # 计算该关节的运动范围
+            pred_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
+            
+            if gt_np is not None:
+                # 使用 GT 的范围作为参考
+                gt_range = gt_np[:, j].max(axis=0) - gt_np[:, j].min(axis=0)
+                gt_mean = gt_np[:, j].mean(axis=0)
                 
                 for c in range(C):
-                    if joint_range[c] > overall_range[c] * 0.5:  # 单个关节运动超过整体的50%
-                        # 将该关节的值 clamp 到合理范围
+                    if pred_range[c] > gt_range[c] * 2.0:  # 超过 GT 范围的 2 倍
+                        # 将该关节 clamp 到 GT 范围
+                        max_dev = gt_range[c] * 1.5
+                        t_np[:, j, c] = np.clip(t_np[:, j, c], 
+                                                gt_mean[c] - max_dev, 
+                                                gt_mean[c] + max_dev)
+            else:
+                # 没有 GT 时，用整体范围约束
+                overall_mean = t_np.mean(axis=(0, 1))
+                overall_std = t_np.std(axis=(0, 1))
+                
+                for c in range(C):
+                    if pred_range[c] > overall_std[c] * 6:  # 超过 6 倍标准差
                         joint_mean = t_np[:, j, c].mean()
-                        max_dev = overall_range[c] * 0.2  # 最大允许偏离
-                        t_np[:, j, c] = np.clip(t_np[:, j, c], joint_mean - max_dev, joint_mean + max_dev)
+                        max_dev = overall_std[c] * 3
+                        t_np[:, j, c] = np.clip(t_np[:, j, c],
+                                                joint_mean - max_dev,
+                                                joint_mean + max_dev)
         
         print(f"  ✓ 异常关节修复完成")
     
@@ -112,7 +132,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, 
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
     if apply_scale:
-        # 使用原来的 variance 方法
         def _var(a):
             center = a.mean(axis=1, keepdims=True)
             return float(((a - center) ** 2).mean())
@@ -124,7 +143,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, apply_scale=True, max_scale=500.0, 
         
         if var_pred > 1e-8:
             scale = np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6))
-            # 限制缩放范围，避免极端值
             scale = np.clip(scale, 1.0, max_scale)
             print(f"  [scale] apply scale={scale:.2f}")
             pose_obj.body.data *= scale
@@ -325,7 +343,8 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"✓ GT: {out_gt}")
     
-    pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose)
+    # 传入 gt_raw 来约束异常关节
+    pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)

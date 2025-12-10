@@ -176,17 +176,10 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         delta = delta.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
         past_last_expanded = past_last.unsqueeze(-1).expand(-1, -1, -1, num_frames)  # [B, J, C, T]
-        
-        time_offset = torch.linspace(0, 1, steps=num_frames, device=delta.device)  # [T]
-        time_offset = time_offset.view(1, 1, 1, num_frames)  # [1, 1, 1, T]
-        
-        scaled_delta = self.residual_scale * delta * (1.0 + time_offset)
-        
-        result = past_last_expanded + scaled_delta
+        result = past_last_expanded + self.residual_scale * delta
 
         if debug:
             print(f"  delta range: [{delta.min():.4f}, {delta.max():.4f}]")
-            print(f"  scaled_delta range: [{scaled_delta.min():.4f}, {scaled_delta.max():.4f}]")
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
 
         self._forward_count += 1
