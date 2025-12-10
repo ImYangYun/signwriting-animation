@@ -1,16 +1,4 @@
 # pylint: disable=invalid-name,arguments-differ,too-many-locals,too-many-instance-attributes,too-many-arguments,too-many-positional-arguments
-"""
-改进版 LitMinimal - 自回归 Direct 模式
-
-核心问题诊断：
-- 原 direct 模式一次性预测所有 20 帧，但每帧的输入条件完全相同
-- 模型学会了输出"平均姿势"来最小化 MSE，导致静态输出
-
-解决方案：
-- 自回归训练：每次只预测 1 帧，将预测结果加入历史再预测下一帧
-- 这样模型必须学习真正的时序动态
-"""
-
 import os
 import torch
 from torch import nn
@@ -32,7 +20,7 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
         x = x.zero_filled()
     if hasattr(x, "tensor"):
         x = x.tensor
-    if x.dim() == 5:  # [B,T,P,J,C] -> pick first person
+    if x.dim() == 5:
         x = x[:, :, 0]
     if x.dim() != 4:
         raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
@@ -43,23 +31,7 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().float()
 
 
-def masked_mse(pred_btjc, tgt_btjc, mask_bt):
-    pred = sanitize_btjc(pred_btjc)
-    tgt = sanitize_btjc(tgt_btjc)
-
-    t_max = min(pred.size(1), tgt.size(1), mask_bt.size(1))
-    pred = pred[:, :t_max]
-    tgt = tgt[:, :t_max]
-
-    m4 = mask_bt[:, :t_max].float()[:, :, None, None]
-    diff2 = (pred - tgt) ** 2
-    num = (diff2 * m4).sum()
-    den = (m4.sum() * pred.size(2) * pred.size(3)).clamp_min(1.0)
-    return num / den
-
-
 def _btjc_to_tjc_list(x_btjc, mask_bt):
-    """Convert batched [B,T,J,C] + mask -> list of [T,J,C]."""
     x_btjc = sanitize_btjc(x_btjc)
     batch_size, seq_len, _, _ = x_btjc.shape
     mask_bt = (mask_bt > 0.5).float()
@@ -73,7 +45,6 @@ def _btjc_to_tjc_list(x_btjc, mask_bt):
 
 @torch.no_grad()
 def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
-    """DTW over masked sequences."""
     preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
     tgts = _btjc_to_tjc_list(tgt_btjc, mask_bt)
     dtw_metric = PE_DTW()
@@ -92,7 +63,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
 
 
 def mean_frame_disp(x_btjc: torch.Tensor) -> float:
-    """Mean |delta| per frame (for debug)."""
     x = sanitize_btjc(x_btjc)
     if x.size(1) < 2:
         return 0.0
@@ -102,12 +72,7 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
 
 class LitMinimalAutoregressive(pl.LightningModule):
     """
-    改进版 Lightning module - 自回归 Direct 模式
-    
-    关键改动：
-    1. direct 模式改为自回归：每步预测 1 帧，滚动更新历史
-    2. 添加 motion_loss：显式鼓励帧间运动
-    3. 更强的时间编码
+    修复版 - 自回归 Direct 模式
     """
 
     def __init__(
@@ -121,10 +86,11 @@ class LitMinimalAutoregressive(pl.LightningModule):
         beta_end=1e-3,
         pred_target="x0",
         guidance_scale=0.0,
-        train_mode: str = "direct",  # "diffusion" or "direct"
+        train_mode: str = "direct",
         vel_weight: float = 0.5,
         acc_weight: float = 0.25,
-        motion_weight: float = 0.1,  # 新增：鼓励运动的损失权重
+        motion_weight: float = 0.1,
+        history_len: int = 40,  # 保持的历史长度
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -134,12 +100,12 @@ class LitMinimalAutoregressive(pl.LightningModule):
         self.vel_weight = float(vel_weight)
         self.acc_weight = float(acc_weight)
         self.motion_weight = float(motion_weight)
+        self.history_len = history_len
 
         self.mean_pose = None
         self.std_pose = None
         self._step_count = 0
 
-        # ----- Load global mean/std -----
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std = stats["std"].float().view(1, 1, -1, 3)
@@ -156,13 +122,11 @@ class LitMinimalAutoregressive(pl.LightningModule):
             del self._buffers["std_pose"]
         self.register_buffer("std_pose", std.clone())
 
-        # ----- Core model -----
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
         )
 
-        # ----- Diffusion wrapper -----
         self.pred_target = pred_target.lower()
         model_mean_type = (
             ModelMeanType.EPSILON
@@ -181,10 +145,8 @@ class LitMinimalAutoregressive(pl.LightningModule):
 
         self.lr = lr
         self.guidance_scale = float(guidance_scale)
-
         self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": [], "motion": []}
 
-    # ------------------------- basic utils -------------------------
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
 
@@ -200,7 +162,6 @@ class LitMinimalAutoregressive(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def _diffuse_once(self, x0_btjc, t_long, cond):
-        """Standard diffusion training step: q_sample + predict eps/x0."""
         x0_bjct = self.btjc_to_bjct(x0_btjc)
         noise = torch.randn_like(x0_bjct)
         x_t = self.diffusion.q_sample(x0_bjct, t_long, noise=noise)
@@ -212,22 +173,13 @@ class LitMinimalAutoregressive(pl.LightningModule):
         target = noise if self.pred_target == "eps" else x0_bjct
         return pred_bjct, target
 
-    # ------------------- 改进的 direct 预测 -------------------
-    def _predict_single_frame(self, past_norm_btjc, sign_img):
+    def _predict_single_frame(self, past_norm_btjc, sign_img, debug=False):
         """
         预测下一帧（单帧）
-        
-        Args:
-            past_norm_btjc: [B, T_past, J, C] 归一化的历史
-            sign_img: [B, C, H, W] SignWriting 图像
-            
-        Returns:
-            [B, 1, J, C] 预测的下一帧（归一化空间）
         """
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
 
-        # 预测 1 帧
         x0_btjc = torch.zeros(B, 1, J, C, device=device, dtype=past_norm_btjc.dtype)
         x0_bjct = self.btjc_to_bjct(x0_btjc)
         t_long = torch.zeros(B, dtype=torch.long, device=device)
@@ -237,43 +189,64 @@ class LitMinimalAutoregressive(pl.LightningModule):
         pred_bjct = self.model.forward(x0_bjct, t_scaled, past_bjct, sign_img)
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         
-        return pred_btjc  # [B, 1, J, C]
-
-    def _direct_predict_autoregressive(self, past_norm_btjc, sign_img, future_len, teacher_forcing_ratio=0.5):
-        """
-        自回归预测多帧（训练时用）
+        if debug:
+            print(f"    [_predict_single_frame] past: {past_norm_btjc.shape}, pred: {pred_btjc.shape}")
+            print(f"    past[-1] mean: {past_norm_btjc[:, -1].mean().item():.4f}")
+            print(f"    pred mean: {pred_btjc.mean().item():.4f}")
         
-        Args:
-            past_norm_btjc: [B, T_past, J, C]
-            sign_img: [B, C, H, W]
-            future_len: 要预测的帧数
-            teacher_forcing_ratio: 使用 GT 的概率（训练时）
-            
-        Returns:
-            [B, future_len, J, C] 预测序列
+        return pred_btjc
+
+    def _direct_predict_autoregressive(self, past_norm_btjc, sign_img, future_len, debug=False):
+        """
+        自回归预测多帧 - 修复版
+        
+        关键：每次预测后，把预测结果加入历史，滑动窗口
         """
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
         
         predictions = []
+        # 重要：clone 历史，避免原地修改
         current_history = past_norm_btjc.clone()
+        
+        if debug:
+            print(f"\n[_direct_predict_autoregressive] future_len={future_len}")
+            print(f"  initial history shape: {current_history.shape}")
+            print(f"  initial history[-1] mean: {current_history[:, -1].mean().item():.4f}")
         
         for t in range(future_len):
             # 预测下一帧
-            pred_frame = self._predict_single_frame(current_history, sign_img)  # [B, 1, J, C]
-            predictions.append(pred_frame)
+            pred_frame = self._predict_single_frame(current_history, sign_img, debug=(debug and t < 3))
+            predictions.append(pred_frame.clone())  # 重要：clone
             
-            # 更新历史（滑动窗口）
-            current_history = torch.cat([current_history[:, 1:], pred_frame], dim=1)
+            if debug and t < 3:
+                print(f"  step {t}: pred_frame mean={pred_frame.mean().item():.4f}")
+            
+            # 关键修复：滑动窗口更新历史
+            # 去掉最老的一帧，加入新预测的帧
+            current_history = torch.cat([
+                current_history[:, 1:],  # 去掉第一帧
+                pred_frame               # 加入预测帧
+            ], dim=1)
+            
+            if debug and t < 3:
+                print(f"  step {t}: new history[-1] mean={current_history[:, -1].mean().item():.4f}")
         
-        return torch.cat(predictions, dim=1)  # [B, future_len, J, C]
+        result = torch.cat(predictions, dim=1)
+        
+        if debug:
+            print(f"  final result shape: {result.shape}")
+            # 检查帧间差异
+            if result.size(1) > 1:
+                diff = (result[:, 1:] - result[:, :-1]).abs().mean().item()
+                print(f"  frame-to-frame diff: {diff:.6f}")
+        
+        return result
 
-    # ------------------------- training_step -------------------------
     def training_step(self, batch, batch_idx):
         debug_this_step = (
             self._step_count == 0
             or self._step_count % 100 == 0
-            or self._step_count % 1000 == 0
         )
 
         cond_raw = batch["conditions"]
@@ -291,7 +264,6 @@ class LitMinimalAutoregressive(pl.LightningModule):
         gt = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
 
-        # ----------------- branch A: diffusion training -----------------
         if self.train_mode == "diffusion":
             B = gt.size(0)
             t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=self.device)
@@ -304,40 +276,41 @@ class LitMinimalAutoregressive(pl.LightningModule):
             gt_raw = self.unnormalize(gt)
             pred_raw = self.unnormalize(pred_btjc)
 
-        # ----------------- branch B: direct autoregressive training -------------------
         else:
             B, T_future, J, C = gt.shape
             
-            # 方案1：随机选择一个时间步，预测该帧
-            # 这样每个 batch 只预测一帧，但能覆盖所有时间步
+            # 随机选择一个时间步
             t_idx = torch.randint(0, T_future, (1,)).item()
             
-            # 构建到 t_idx 为止的历史
+            # 构建历史：past + gt[:t_idx]
             if t_idx == 0:
-                history = past  # [B, T_past, J, C]
+                history = past
             else:
-                # 使用 GT 的前 t_idx 帧 + past
                 history = torch.cat([past, gt[:, :t_idx]], dim=1)
-                # 只保留最后 T_past 帧
-                history = history[:, -past.size(1):]
+                # 只保留最后 history_len 帧
+                if history.size(1) > self.history_len:
+                    history = history[:, -self.history_len:]
             
             # 预测下一帧
-            pred_frame = self._predict_single_frame(history, sign_img)  # [B, 1, J, C]
-            gt_frame = gt[:, t_idx:t_idx+1]  # [B, 1, J, C]
+            pred_frame = self._predict_single_frame(history, sign_img)
+            gt_frame = gt[:, t_idx:t_idx+1]
             
             loss_main = torch.nn.functional.mse_loss(pred_frame, gt_frame)
             
-            # 为了计算 vel/acc，用自回归方式生成完整序列（每 N 步做一次）
+            # 每隔一段时间做完整自回归预测来计算 vel/acc
             if self._step_count % 10 == 0:
                 with torch.no_grad():
-                    pred_norm_full = self._direct_predict_autoregressive(past, sign_img, T_future)
+                    pred_norm_full = self._direct_predict_autoregressive(
+                        past, sign_img, T_future, debug=debug_this_step
+                    )
                 pred_raw = self.unnormalize(pred_norm_full)
             else:
+                # 简化：用单帧重复
                 pred_raw = self.unnormalize(pred_frame.repeat(1, T_future, 1, 1))
             
             gt_raw = self.unnormalize(gt)
 
-        # --------- shared smooth losses (both modes) ---------
+        # 计算 smooth losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
         loss_motion = torch.tensor(0.0, device=self.device)
@@ -347,10 +320,8 @@ class LitMinimalAutoregressive(pl.LightningModule):
             v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.l1_loss(v_pred, v_gt)
             
-            # Motion loss: 鼓励预测有运动
             motion_magnitude = v_pred.abs().mean()
             gt_motion_magnitude = v_gt.abs().mean()
-            # 如果预测运动小于 GT 运动，给惩罚
             loss_motion = torch.relu(gt_motion_magnitude - motion_magnitude)
             
             if v_pred.size(1) > 1:
@@ -375,7 +346,6 @@ class LitMinimalAutoregressive(pl.LightningModule):
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70 + "\n")
 
-        # logging
         self.log_dict(
             {
                 "train/loss": loss,
@@ -409,14 +379,12 @@ class LitMinimalAutoregressive(pl.LightningModule):
         B, T_future, J, C = gt.shape
 
         if self.train_mode == "direct":
-            # 自回归预测
             pred_norm = self._direct_predict_autoregressive(past, sign_img, T_future)
             loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
             
             pred_raw = self.unnormalize(pred_norm)
             gt_raw = self.unnormalize(gt)
             
-            # 计算 frame displacement
             disp = mean_frame_disp(pred_raw)
             self.log("val/frame_disp", disp, prog_bar=True)
         else:
@@ -448,11 +416,10 @@ class LitMinimalAutoregressive(pl.LightningModule):
 
         return loss_main
 
-    # ------------------------- sampling -------------------------
     @torch.no_grad()
-    def predict_direct(self, past_btjc, sign_img, future_len=20):
+    def predict_direct(self, past_btjc, sign_img, future_len=20, debug=True):
         """
-        自回归推理
+        自回归推理 - 修复版，添加 debug 输出
         """
         self.eval()
         device = self.device
@@ -460,16 +427,24 @@ class LitMinimalAutoregressive(pl.LightningModule):
         past_raw = sanitize_btjc(past_btjc.to(device))
         past_norm = self.normalize(past_raw)
         
+        print(f"\n[predict_direct] past_norm shape: {past_norm.shape}")
+        print(f"[predict_direct] past_norm range: [{past_norm.min():.4f}, {past_norm.max():.4f}]")
+        
         pred_norm = self._direct_predict_autoregressive(
-            past_norm, sign_img.to(device), future_len
+            past_norm, sign_img.to(device), future_len, debug=debug
         )
-        return self.unnormalize(pred_norm)
+        
+        pred_raw = self.unnormalize(pred_norm)
+        
+        print(f"[predict_direct] pred_raw shape: {pred_raw.shape}")
+        print(f"[predict_direct] pred_raw range: [{pred_raw.min():.4f}, {pred_raw.max():.4f}]")
+        
+        return pred_raw
 
     @torch.no_grad()
     def sample_autoregressive_fast(
         self, past_btjc, sign_img, future_len=20, chunk=1, guidance_scale=None
     ):
-        """Diffusion sampling (保持原接口)"""
         assert self.train_mode == "diffusion", "Only valid in diffusion mode"
 
         self.eval()
@@ -522,7 +497,6 @@ class LitMinimalAutoregressive(pl.LightningModule):
 
         return torch.cat(frames_out, dim=1)
 
-    # ------------------------- misc hooks -------------------------
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
         self.std_pose = self.std_pose.to(self.device)
@@ -536,7 +510,6 @@ class LitMinimalAutoregressive(pl.LightningModule):
         return {"optimizer": optimizer, "gradient_clip_val": 1.0}
 
     def on_train_end(self):
-        """Save training curves."""
         try:
             import matplotlib.pyplot as plt
 

@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-测试自回归 Direct 模式
-
-关键检查点：
-1. 训练时 frame-to-frame displacement 应该 > 0
-2. 推理时预测应该有动态运动
-"""
 import os
 import torch
 import numpy as np
@@ -28,76 +21,125 @@ from signwriting_animation.diffusion.lightning_module import (
 try:
     from pose_anonymization.data.normalization import unshift_hands
     HAS_UNSHIFT = True
-    print("[✓] Successfully imported unshift_hands")
-except ImportError as e:
-    print(f"[✗] Warning: Could not import unshift_hands: {e}")
+except ImportError:
     HAS_UNSHIFT = False
 
 
-def tensor_to_pose_complete(
-    t_btjc: torch.Tensor,
-    header,
-    ref_pose: Pose,
-    apply_unshift: bool = True,
-    match_scale_to_ref: bool = True,
-    align_center_to_ref: bool = True,
-):
-    """完整的 tensor → pose 转换"""
+def diagnose_model_sensitivity(model, past_norm, sign_img, device):
+    """
+    诊断：模型是否对输入敏感？
+    """
+    print("\n" + "=" * 70)
+    print("诊断：模型对输入的敏感度")
+    print("=" * 70)
+    
+    model.eval()
+    B, T, J, C = past_norm.shape
+    
+    # 测试 1：相同输入，输出是否相同
+    with torch.no_grad():
+        pred1 = model._predict_single_frame(past_norm, sign_img)
+        pred2 = model._predict_single_frame(past_norm, sign_img)
+        diff_same = (pred1 - pred2).abs().max().item()
+        print(f"1. 相同输入两次预测的差异: {diff_same:.8f}")
+        if diff_same > 1e-6:
+            print("   ⚠️ 有随机性！检查是否有 dropout")
+    
+    # 测试 2：不同 past，输出是否不同
+    with torch.no_grad():
+        past_shifted = past_norm.clone()
+        past_shifted[:, :, :, 0] += 0.1  # X 坐标 +0.1
+        
+        pred_orig = model._predict_single_frame(past_norm, sign_img)
+        pred_shifted = model._predict_single_frame(past_shifted, sign_img)
+        diff_past = (pred_orig - pred_shifted).abs().mean().item()
+        print(f"2. 不同 past 的输出差异: {diff_past:.6f}")
+        if diff_past < 1e-6:
+            print("   ❌ 模型完全忽略了 past_motion！")
+        else:
+            print("   ✓ 模型对 past 敏感")
+    
+    # 测试 3：滑动窗口后，输出是否变化
+    with torch.no_grad():
+        # 原始 past
+        pred_t0 = model._predict_single_frame(past_norm, sign_img)
+        
+        # 滑动一帧：去掉 past[0]，加入 pred_t0
+        new_past = torch.cat([past_norm[:, 1:], pred_t0], dim=1)
+        pred_t1 = model._predict_single_frame(new_past, sign_img)
+        
+        diff_ar = (pred_t0 - pred_t1).abs().mean().item()
+        print(f"3. 自回归第 0 帧 vs 第 1 帧差异: {diff_ar:.6f}")
+        if diff_ar < 1e-6:
+            print("   ❌ 自回归预测相同！问题在于模型架构")
+        else:
+            print("   ✓ 自回归产生不同输出")
+    
+    # 测试 4：检查 past 的哪部分被使用
+    with torch.no_grad():
+        # 只改变 past 的最后一帧
+        past_last_changed = past_norm.clone()
+        past_last_changed[:, -1] += 0.1
+        
+        pred_orig = model._predict_single_frame(past_norm, sign_img)
+        pred_last = model._predict_single_frame(past_last_changed, sign_img)
+        diff_last = (pred_orig - pred_last).abs().mean().item()
+        print(f"4. 只改 past 最后一帧的输出差异: {diff_last:.6f}")
+        
+        # 只改变 past 的第一帧
+        past_first_changed = past_norm.clone()
+        past_first_changed[:, 0] += 0.1
+        pred_first = model._predict_single_frame(past_first_changed, sign_img)
+        diff_first = (pred_orig - pred_first).abs().mean().item()
+        print(f"5. 只改 past 第一帧的输出差异: {diff_first:.6f}")
+        
+        if diff_last > diff_first * 10:
+            print("   ✓ 模型更关注最近的帧（符合预期）")
+        elif diff_last < diff_first:
+            print("   ⚠️ 模型更关注远处的帧（奇怪）")
+
+
+def tensor_to_pose_complete(t_btjc, header, ref_pose):
     if t_btjc.dim() == 4:
         t = t_btjc[0]
-    elif t_btjc.dim() == 3:
-        t = t_btjc
     else:
-        raise ValueError(f"Expected 3D or 4D tensor, got {t_btjc.dim()}D")
-
+        t = t_btjc
+    
     t_np = t.detach().cpu().numpy().astype(np.float32)
-
-    print(f"\n[tensor_to_pose_complete]")
-    print(f"  输入 shape: {t_np.shape}")
-    print(f"  输入 range: [{t_np.min():.4f}, {t_np.max():.4f}]")
-
     arr = t_np[:, None, :, :]
-    conf = ref_pose.body.confidence[: len(t_np)].copy()
+    conf = ref_pose.body.confidence[:len(t_np)].copy()
     fps = ref_pose.body.fps
-
+    
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-
-    # 手部反平移
-    if apply_unshift and HAS_UNSHIFT:
+    
+    if HAS_UNSHIFT:
         try:
             unshift_hands(pose_obj)
-            print("  ✓ unshift 成功")
-        except Exception as e:
-            print(f"  ✗ unshift 失败: {e}")
-
-    # 缩放对齐
+        except:
+            pass
+    
+    # Scale & translate
     T_pred = pose_obj.body.data.shape[0]
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-
-    if match_scale_to_ref:
-        def _var_tjc(a):
-            center = a.mean(axis=1, keepdims=True)
-            return float(((a - center) ** 2).mean())
-
-        var_ref = _var_tjc(ref_arr)
-        var_pred = _var_tjc(pred_arr)
-
-        if var_pred > 1e-8 and var_ref > 0:
-            scale = float(np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6)))
-            print(f"  [scale] apply scale={scale:.3f}")
-            pose_obj.body.data *= scale
-            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-
-    # 平移对齐
-    if align_center_to_ref:
-        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
-        pred_center = pred_arr.reshape(-1, 3).mean(axis=0)
-        delta = ref_center - pred_center
-        print(f"  [translate] apply delta={delta}")
-        pose_obj.body.data += delta
-
+    
+    def _var(a):
+        c = a.mean(axis=1, keepdims=True)
+        return float(((a - c) ** 2).mean())
+    
+    var_ref = _var(ref_arr)
+    var_pred = _var(pred_arr)
+    
+    if var_pred > 1e-8:
+        scale = np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6))
+        pose_obj.body.data *= scale
+        pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
+    
+    ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
+    pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
+    pose_obj.body.data += (ref_c - pred_c)
+    
     return pose_obj
 
 
@@ -106,17 +148,14 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_178_autoregressive"
+    out_dir = "logs/minimal_178_v2"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("自回归 Direct 模式测试")
+    print("诊断 + 测试脚本 v2")
     print("=" * 70)
-    print("✅ 每步只预测 1 帧，滚动更新历史")
-    print("✅ 添加 motion_loss 鼓励运动")
-    print("=" * 70 + "\n")
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -146,15 +185,7 @@ if __name__ == "__main__":
         collate_fn=zero_pad_collator,
     )
 
-    # Trainer
-    trainer = pl.Trainer(
-        max_epochs=1000,
-        accelerator="gpu",
-        devices=1,
-        enable_checkpointing=False,
-        log_every_n_steps=50,
-    )
-
+    # Model
     num_joints = sample_0["data"].shape[-2]
     num_dims = sample_0["data"].shape[-1]
 
@@ -173,91 +204,116 @@ if __name__ == "__main__":
         motion_weight=0.1,
     )
 
-    print("\n[训练中...]")
-    trainer.fit(model, train_loader)
-
-    # Inference
+    # === 训练前诊断 ===
     print("\n" + "=" * 70)
-    print("INFERENCE (autoregressive direct mode)")
+    print("训练前诊断（随机权重）")
     print("=" * 70)
-
-    model.eval()
-    device = trainer.strategy.root_device
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
+    
+    batch = next(iter(train_loader))
+    cond = batch["conditions"]
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    
+    past_norm = model.normalize(past_raw)
+    diagnose_model_sensitivity(model, past_norm, sign, device)
+    
+    # === 训练 ===
+    print("\n" + "=" * 70)
+    print("开始训练")
+    print("=" * 70)
+    
+    trainer = pl.Trainer(
+        max_epochs=1000,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        enable_checkpointing=False,
+        log_every_n_steps=50,
+    )
+    
+    trainer.fit(model, train_loader)
+    
+    # === 训练后诊断 ===
+    print("\n" + "=" * 70)
+    print("训练后诊断")
+    print("=" * 70)
+    
+    model = model.to(device)
+    model.eval()
+    
+    batch = next(iter(train_loader))
+    cond = batch["conditions"]
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
+    
+    past_norm = model.normalize(past_raw)
+    diagnose_model_sensitivity(model, past_norm, sign, device)
+    
+    # === Inference ===
+    print("\n" + "=" * 70)
+    print("INFERENCE")
+    print("=" * 70)
+    
+    future_len = gt_raw.size(1)
+    
     with torch.no_grad():
-        batch = next(iter(train_loader))
-        cond = batch["conditions"]
-
-        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign = cond["sign_image"][:1].float().to(device)
-        gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-
-        future_len = gt_raw.size(1)
-
         # Baseline
-        gt_mean_pose = gt_raw.mean(dim=1, keepdim=True)
-        baseline = gt_mean_pose.repeat(1, future_len, 1, 1)
-        mse_baseline = torch.mean((baseline - gt_raw) ** 2).item()
+        baseline = gt_raw.mean(dim=1, keepdim=True).repeat(1, future_len, 1, 1)
+        mse_base = torch.mean((baseline - gt_raw) ** 2).item()
         disp_base = mean_frame_disp(baseline)
-        print(f"Baseline (static) MSE: {mse_baseline:.4f}")
-        print(f"Baseline frame-to-frame displacement: {disp_base:.6f}")
-
-        # Direct prediction
-        pred_raw = model.predict_direct(past_raw, sign, future_len=future_len)
-
+        print(f"Baseline MSE: {mse_base:.4f}, disp: {disp_base:.6f}")
+        
+        # Prediction
+        pred_raw = model.predict_direct(past_raw, sign, future_len=future_len, debug=True)
+        
         mse_pred = torch.mean((pred_raw - gt_raw) ** 2).item()
         disp_pred = mean_frame_disp(pred_raw)
         disp_gt = mean_frame_disp(gt_raw)
         
-        print(f"\nDirect prediction MSE: {mse_pred:.4f}")
-        print(f"Direct frame-to-frame displacement: {disp_pred:.6f}")
-        print(f"GT frame-to-frame displacement: {disp_gt:.6f}")
+        print(f"\nPrediction MSE: {mse_pred:.4f}")
+        print(f"Prediction displacement: {disp_pred:.6f}")
+        print(f"GT displacement: {disp_gt:.6f}")
         
-        # 关键检查
         if disp_pred < 1e-6:
-            print("\n⚠️ 警告: 预测仍然是静态的！displacement ≈ 0")
+            print("\n❌ 预测仍然是静态的！")
         elif disp_pred < disp_gt * 0.1:
-            print("\n⚠️ 警告: 预测运动远小于 GT")
+            print("\n⚠️ 预测运动太小")
         else:
             print("\n✓ 预测有运动！")
-
+        
         # DTW
-        mask_bt = torch.ones(1, future_len, device=device)
-        dtw_val = masked_dtw(pred_raw, gt_raw, mask_bt)
-        print(f"Direct prediction DTW: {dtw_val:.4f}")
-
-        print(f"\nGT (raw):   [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
-        print(f"PRED (raw): [{pred_raw.min():.4f}, {pred_raw.max():.4f}]")
-
-    # 保存 .pose
+        mask = torch.ones(1, future_len, device=device)
+        dtw = masked_dtw(pred_raw, gt_raw, mask)
+        print(f"DTW: {dtw:.4f}")
+    
+    # === 保存 .pose ===
     print("\n" + "=" * 70)
-    print("保存 .pose 文件")
+    print("保存文件")
     print("=" * 70)
-
+    
     ref_path = base_ds.records[0]["pose"]
-    ref_path = ref_path if os.path.isabs(ref_path) else os.path.join(data_dir, ref_path)
-
+    if not os.path.isabs(ref_path):
+        ref_path = os.path.join(data_dir, ref_path)
+    
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
-
+    
     ref_pose = reduce_holistic(ref_pose)
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = ref_pose.header
-
-    # GT
-    out_gt = os.path.join(out_dir, "gt_reference.pose")
+    
+    out_gt = os.path.join(out_dir, "gt.pose")
     with open(out_gt, "wb") as f:
         ref_pose.write(f)
-    print(f"✓ GT 保存: {out_gt}")
-
-    # PRED
+    print(f"✓ GT: {out_gt}")
+    
     pose_pred = tensor_to_pose_complete(pred_raw, header, ref_pose)
-    out_pred = os.path.join(out_dir, "pred_autoregressive.pose")
+    out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
-    print(f"✓ PRED 保存: {out_pred}")
-
-    print("\n" + "=" * 70)
-    print("✓ 完成！")
-    print("=" * 70)
+    print(f"✓ PRED: {out_pred}")
+    
+    print("\n✓ 完成！")
