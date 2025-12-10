@@ -18,16 +18,13 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-
-# 导入改进版模块
-from lightning_module_autoregressive import (
+from signwriting_animation.diffusion.lightning_module import (
     LitMinimalAutoregressive,
     sanitize_btjc,
     masked_dtw,
     mean_frame_disp,
 )
 
-# 尝试导入 unshift_hands
 try:
     from pose_anonymization.data.normalization import unshift_hands
     HAS_UNSHIFT = True
