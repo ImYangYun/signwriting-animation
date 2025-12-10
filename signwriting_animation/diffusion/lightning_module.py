@@ -58,7 +58,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     try:
         dtw_metric = PE_DTW()
     except:
-        # 如果 DTW 不可用，返回简单的 MSE 作为替代
         pred = sanitize_btjc(pred_btjc)
         tgt = sanitize_btjc(tgt_btjc)
         t_max = min(pred.size(1), tgt.size(1))
@@ -103,7 +102,7 @@ class LitResidual(pl.LightningModule):
         pred_target="x0",
         guidance_scale=0.0,
         train_mode: str = "direct",
-        vel_weight: float = 1.0,  # 增加速度权重
+        vel_weight: float = 1.0,
         acc_weight: float = 0.5,
         residual_scale: float = 0.1,
         hand_reg_weight: float = 1.0,
@@ -111,7 +110,6 @@ class LitResidual(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
-
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
@@ -244,6 +242,10 @@ class LitResidual(pl.LightningModule):
         # Velocity & acceleration losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
+        loss_motion = torch.tensor(0.0, device=self.device)
+        loss_motion_direct = torch.tensor(0.0, device=self.device)
+        mag_pred = torch.tensor(0.0, device=self.device)
+        mag_gt = torch.tensor(0.0, device=self.device)
 
         if pred_raw.size(1) > 1:
             v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
@@ -261,9 +263,12 @@ class LitResidual(pl.LightningModule):
             mag_gt = v_gt.abs().mean()
             
             # 如果预测运动 < GT 运动的 80%，则施加惩罚
-            # 权重要足够大，让模型不敢输出静态
             motion_deficit = torch.relu(mag_gt * 0.8 - mag_pred)
-            loss_motion = motion_deficit * 100.0  # 非常强的惩罚
+            loss_motion = motion_deficit * 100.0
+            
+            # 额外：直接最大化预测的帧间差异
+            # 这会强制模型产生运动，即使 MSE 想让它静态
+            loss_motion_direct = -mag_pred * 50.0  # 负号表示最大化
         else:
             loss_motion = torch.tensor(0.0, device=self.device)
 
@@ -280,15 +285,17 @@ class LitResidual(pl.LightningModule):
                 + self.vel_weight * loss_vel 
                 + self.acc_weight * loss_acc
                 + self.hand_reg_weight * loss_hand
-                + loss_motion)
+                + loss_motion
+                + loss_motion_direct)
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
             disp_gt = mean_frame_disp(gt_raw)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
-            print(f"loss_motion: {loss_motion.item():.6f} (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
-            print(f"loss_hand: {loss_hand.item():.6f} (w={self.hand_reg_weight})")
+            print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
+            print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
+            print(f"loss_hand: {loss_hand.item():.6f}")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70)
