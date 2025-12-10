@@ -206,13 +206,22 @@ class LitMinimal(pl.LightningModule):
                 a_gt   = v_gt[:, 1:]   - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.l1_loss(a_pred, a_gt)
 
-        loss = loss_main + 0.5 * loss_vel + 0.25 * loss_acc
+        motion_w = 10.0
+        acc_w    = 5.0
+        loss = loss_main + motion_w * loss_vel + acc_w * loss_acc
 
         if debug_this_step:
+            if gt_raw.size(1) > 1:
+                d_pred = (pred_raw[:, 1:] - pred_raw[:, :-1]).abs().mean().item()
+                d_gt   = (gt_raw[:, 1:]   - gt_raw[:, :-1]).abs().mean().item()
+            else:
+                d_pred, d_gt = 0.0, 0.0
+
             print(f"  loss_main: {loss_main.item():.6f}")
-            print(f"  loss_vel: {loss_vel.item():.6f}")
-            print(f"  loss_acc: {loss_acc.item():.6f}")
-            print(f"  TOTAL: {loss.item():.6f}")
+            print(f"  loss_vel:  {loss_vel.item():.6f} (w={motion_w})")
+            print(f"  loss_acc:  {loss_acc.item():.6f} (w={acc_w})")
+            print(f"  TOTAL:     {loss.item():.6f}")
+            print(f"  mean |Δ pred|: {d_pred:.6f}, mean |Δ gt|: {d_gt:.6f}")
             print(f"{'='*70}\n")
 
         self.log_dict({
