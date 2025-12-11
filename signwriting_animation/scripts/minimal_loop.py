@@ -205,8 +205,8 @@ if __name__ == "__main__":
         stats_path=stats_path,
         lr=1e-3,
         train_mode="ar",
-        vel_weight=1.0,
-        acc_weight=0.5,
+        vel_weight=10.0,
+        acc_weight=2.0,
         residual_scale=0.1,
         hand_reg_weight=5.0,
     )
