@@ -190,54 +190,32 @@ if __name__ == "__main__":
         split="train",
     )
 
-    # 选择运动最大的样本
-    print("\n寻找运动最大的样本...")
-    best_sample = base_ds[0]  # 默认用第一个
-    best_disp = 0
-    best_idx = 0
+    # 直接指定样本索引（跳过自动搜索）
+    # 你可以改这个数字来测试不同样本
+    SAMPLE_IDX = 5  # 试试样本 5
     
-    # 检查前 20 个样本
-    for i in range(min(20, len(base_ds))):
-        try:
-            sample = base_ds[i]
-            if sample is None:
-                print(f"  Sample {i}: 跳过 - None")
-                continue
-                
-            data = sample["data"]  # future frames
-            
-            # 处理不同类型的 tensor
-            if hasattr(data, 'zero_filled'):
-                data = data.zero_filled()
-            if hasattr(data, 'tensor'):
-                data = data.tensor
-            if isinstance(data, torch.Tensor):
-                data = data.cpu().numpy()
-            
-            if data.ndim == 4:
-                data = data[0]  # remove batch dim if present
-            
-            # 计算帧间位移
-            if data.shape[0] > 1:
-                vel = np.abs(data[1:] - data[:-1])
-                disp = float(vel.mean())
-                
-                print(f"  Sample {i}: disp = {disp:.4f}")
-                
-                if disp > best_disp:
-                    best_disp = disp
-                    best_sample = sample  # 保存 sample 而不是重新获取
-                    best_idx = i
-        except Exception as e:
-            print(f"  Sample {i}: 跳过 - {e}")
-            continue
+    print(f"\n使用样本 {SAMPLE_IDX}")
+    best_sample = base_ds[SAMPLE_IDX]
+    best_idx = SAMPLE_IDX
     
-    if best_sample is None:
-        print("警告：没有找到有效样本，使用 sample_0")
-        best_sample = base_ds[0]
-        best_idx = 0
+    # 计算这个样本的 disp
+    data = best_sample["data"]
+    if hasattr(data, 'zero_filled'):
+        data = data.zero_filled()
+    if hasattr(data, 'tensor'):
+        data = data.tensor
+    if isinstance(data, torch.Tensor):
+        data = data.cpu().numpy()
+    if data.ndim == 4:
+        data = data[0]
     
-    print(f"\n选择样本 {best_idx}，future disp = {best_disp:.4f}")
+    if data.shape[0] > 1:
+        vel = np.abs(data[1:] - data[:-1])
+        best_disp = float(vel.mean())
+    else:
+        best_disp = 0
+    
+    print(f"样本 {SAMPLE_IDX} 的 future disp = {best_disp:.4f}")
 
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
