@@ -290,8 +290,12 @@ class LitResidual(pl.LightningModule):
 
         B, T_future, J, C = gt.shape
 
-        # Direct 模式：直接预测所有帧
-        pred_norm = self._predict_frames(past, sign_img, T_future)
+        if self.train_mode == "direct":
+            pred_norm = self._predict_frames(past, sign_img, T_future)
+        elif self.train_mode == "ar":
+            pred_norm = self._predict_autoregressive(past, sign_img, T_future, chunk_size=5)
+        else:
+            raise ValueError(f"Unknown train_mode: {self.train_mode}")
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
         pred_raw = self.unnormalize(pred_norm)
