@@ -180,6 +180,11 @@ if __name__ == "__main__":
     print("模型被强制学习'变化量'而不是'绝对位置'")
     print("=" * 70)
 
+    SAMPLE_IDX = 50
+    MAX_EPOCHS = 1000
+    
+    print(f"\n配置: 单样本 overfit (sample {SAMPLE_IDX}), epochs={MAX_EPOCHS}")
+
     # Dataset
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
@@ -189,20 +194,16 @@ if __name__ == "__main__":
         with_metadata=True,
         split="train",
     )
-
-    # 直接指定样本索引
-    # 用不同的索引来获取不同的视频/片段
-    SAMPLE_IDX = 50  # 试试样本 50，可能是不同的视频
     
-    # 重置随机种子，让数据集采样到不同的位置
+    # 重置随机种子
     import random
-    random.seed(12345)  # 用不同的种子
+    random.seed(12345)
     
-    print(f"\n使用样本 {SAMPLE_IDX}")
+    # 获取单样本
     best_sample = base_ds[SAMPLE_IDX]
-    best_idx = SAMPLE_IDX
+    print(f"样本 ID: {best_sample.get('id', 'unknown')}")
     
-    # 计算这个样本的 disp
+    # 计算样本的 disp
     data = best_sample["data"]
     if hasattr(data, 'zero_filled'):
         data = data.zero_filled()
@@ -213,15 +214,10 @@ if __name__ == "__main__":
     if data.ndim == 4:
         data = data[0]
     
-    if data.shape[0] > 1:
-        vel = np.abs(data[1:] - data[:-1])
-        best_disp = float(vel.mean())
-    else:
-        best_disp = 0
+    gt_disp_raw = float(np.abs(data[1:] - data[:-1]).mean()) if data.shape[0] > 1 else 0
+    print(f"样本 future disp (raw): {gt_disp_raw:.4f}")
     
-    print(f"样本 {SAMPLE_IDX} 的 future disp = {best_disp:.4f}")
-    print(f"样本 ID: {best_sample.get('id', 'unknown')}")
-
+    # 单样本 Dataset
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
             self.sample = sample
@@ -229,12 +225,15 @@ if __name__ == "__main__":
             return 1
         def __getitem__(self, idx):
             return self.sample
-
+    
     train_ds = FixedSampleDataset(best_sample)
     train_loader = DataLoader(
-        train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator,
+        train_ds, 
+        batch_size=1, 
+        shuffle=False, 
+        collate_fn=zero_pad_collator,
     )
-
+    
     # 获取维度信息
     sample_data = best_sample["data"]
     if hasattr(sample_data, 'zero_filled'):
@@ -244,6 +243,7 @@ if __name__ == "__main__":
     
     num_joints = sample_data.shape[-2]
     num_dims = sample_data.shape[-1]
+    print(f"关节数: {num_joints}, 维度: {num_dims}")
 
     model = LitResidual(
         num_keypoints=num_joints,
@@ -276,11 +276,11 @@ if __name__ == "__main__":
     print("=" * 70)
     
     trainer = pl.Trainer(
-        max_epochs=1000,
+        max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_checkpointing=False,
-        log_every_n_steps=50,
+        log_every_n_steps=10,
     )
     
     trainer.fit(model, train_loader)
@@ -327,33 +327,70 @@ if __name__ == "__main__":
         disp_gt = mean_frame_disp(gt_raw)
         print(f"GT disp: {disp_gt:.6f}")
         
-        # 详细诊断：检查每个关节的预测范围
-        print("\n--- 关节范围诊断 ---")
+        # ===== 完整评估指标 =====
+        print("\n" + "=" * 70)
+        print("完整评估指标 (normalized 空间)")
+        print("=" * 70)
+        
         pred_np = pred_raw_ar[0].cpu().numpy()  # [T, J, C]
         gt_np = gt_raw[0].cpu().numpy()
+        T, J, C = pred_np.shape
         
-        # 计算每个关节的运动范围
-        pred_ranges = pred_np.max(axis=0) - pred_np.min(axis=0)  # [J, C]
+        # Position Errors
+        mse = float(((pred_np - gt_np) ** 2).mean())
+        mae = float(np.abs(pred_np - gt_np).mean())
+        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))  # [T, J]
+        mpjpe = float(per_joint_error.mean())
+        fde = float(np.sqrt(((pred_np[-1] - gt_np[-1]) ** 2).sum(axis=-1)).mean())
+        
+        print(f"\n--- Position Errors (越低越好) ---")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  MPJPE: {mpjpe:.6f}")
+        print(f"  FDE: {fde:.6f}")
+        
+        # Motion Match
+        pred_vel = pred_np[1:] - pred_np[:-1]
+        gt_vel = gt_np[1:] - gt_np[:-1]
+        vel_mse = float(((pred_vel - gt_vel) ** 2).mean())
+        pred_acc = pred_vel[1:] - pred_vel[:-1]
+        gt_acc = gt_vel[1:] - gt_vel[:-1]
+        acc_mse = float(((pred_acc - gt_acc) ** 2).mean())
+        disp_ratio = disp_ar / (disp_gt + 1e-8)
+        
+        print(f"\n--- Motion Match ---")
+        print(f"  disp_ratio: {disp_ratio:.4f} (理想=1.0)")
+        print(f"  vel_mse: {vel_mse:.6f}")
+        print(f"  acc_mse: {acc_mse:.6f}")
+        
+        # PCK
+        print(f"\n--- PCK (越高越好) ---")
+        for thresh in [0.05, 0.1, 0.2, 0.5]:
+            pck = (per_joint_error < thresh).mean()
+            print(f"  PCK@{thresh}: {pck:.2%}")
+        
+        # Joint Range
+        pred_ranges = pred_np.max(axis=0) - pred_np.min(axis=0)
         gt_ranges = gt_np.max(axis=0) - gt_np.min(axis=0)
-        
-        # 找出异常关节（预测范围远大于 GT）
         ratio = (pred_ranges.sum(axis=1) + 1e-6) / (gt_ranges.sum(axis=1) + 1e-6)
-        abnormal = np.where(ratio > 3.0)[0]  # 超过 3 倍的关节
+        abnormal = np.where(ratio > 3.0)[0]
+        
+        print(f"\n--- Joint Range ---")
+        print(f"  range_ratio_mean: {ratio.mean():.4f}")
+        print(f"  range_ratio_max: {ratio.max():.4f}")
+        print(f"  abnormal_joints (>3x): {len(abnormal)}")
         
         if len(abnormal) > 0:
-            print(f"⚠️ 发现 {len(abnormal)} 个异常关节 (预测范围 > 3x GT):")
-            for j in abnormal[:10]:
-                print(f"  Joint {j}: pred_range={pred_ranges[j].sum():.4f}, gt_range={gt_ranges[j].sum():.4f}, ratio={ratio[j]:.1f}x")
-        else:
-            print("✓ 所有关节范围正常")
-        
-        print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
-        print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
+            print(f"  异常关节: {abnormal[:10].tolist()}")
         
         # DTW
         mask = torch.ones(1, future_len, device=device)
         dtw_val = masked_dtw(pred_raw_ar, gt_raw, mask)
-        print(f"DTW: {dtw_val:.4f}")
+        print(f"\n--- Trajectory ---")
+        print(f"  DTW: {dtw_val:.4f}")
+        
+        print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
+        print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
         
         if disp_ar < 1e-6:
             print("\n❌ 预测仍然是静态的!")
@@ -367,7 +404,7 @@ if __name__ == "__main__":
     print("保存文件")
     print("=" * 70)
     
-    ref_path = base_ds.records[best_idx]["pose"]
+    ref_path = base_ds.records[SAMPLE_IDX]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
     
