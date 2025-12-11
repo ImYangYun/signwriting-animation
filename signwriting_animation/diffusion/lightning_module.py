@@ -263,13 +263,12 @@ class LitResidual(pl.LightningModule):
         pred_range = (pred_max - pred_min).norm(dim=-1)
         gt_range   = (gt_max   - gt_min  ).norm(dim=-1)
 
-        # 只对 GT 本身有运动的关节做约束，避免 gt_range≈0 的假阳性
         active = gt_range > 1e-3
         if not active.any():
             return torch.tensor(0.0, device=device)
 
         ratio = pred_range[active] / (gt_range[active] + eps)
-        excess = torch.relu(ratio - upper)  # 只罚超过 upper 的部分
+        excess = torch.relu(ratio - upper)
 
         return (excess ** 2).mean()
 
@@ -339,7 +338,7 @@ class LitResidual(pl.LightningModule):
                 #pred_hand = pred_norm[:, :, abnormal_joints, :]
                 #gt_hand = gt[:, :, abnormal_joints, :]
                 #loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
-            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=2.0)
+            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=1.5)
             loss_hand = self.hand_reg_weight * range_reg
 
             loss = (loss_main 
@@ -356,7 +355,8 @@ class LitResidual(pl.LightningModule):
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
             print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
             print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
-            print(f"loss_hand: {loss_hand.item():.6f}")
+            print(f"range_reg (unweighted): {range_reg.item():.6f}")
+            print(f"loss_hand (with weight): {loss_hand.item():.6f}")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70)
