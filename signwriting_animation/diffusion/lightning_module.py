@@ -328,7 +328,7 @@ class LitResidual(pl.LightningModule):
         loss_hand = torch.tensor(0.0, device=self.device)
         range_reg = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=2.0)
+            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=1.7)
             loss_hand = self.hand_reg_weight * range_reg
 
         # -------- 总 loss（一定要在 if 外面算）--------
@@ -343,7 +343,7 @@ class LitResidual(pl.LightningModule):
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
-            disp_gt   = mean_frame_disp(gt_raw)
+            disp_gt = mean_frame_disp(gt_raw)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
             print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
@@ -352,6 +352,20 @@ class LitResidual(pl.LightningModule):
             print(f"loss_hand (with weight): {loss_hand.item():.6f}")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
+
+            diff = (pred_raw - gt_raw)                     # [B, T, J, C]
+
+            per_frame_mse = (diff ** 2).mean(dim=(2, 3))[0]
+            print("Per-frame MSE (train):",
+                  per_frame_mse.detach().cpu().numpy())
+
+            joint_mse = (diff ** 2).mean(dim=(0, 1, 3))       # [J]
+            top = torch.argsort(joint_mse, descending=True)[:8]
+            print("Top-8 joints by MSE (train):")
+            for j in top:
+                j = int(j)
+                print(f"  Joint {j}: mse={joint_mse[j].item():.6f}")
+
             print("=" * 70)
 
         self.log_dict({
