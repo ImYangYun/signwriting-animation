@@ -285,9 +285,9 @@ class LitResidual(pl.LightningModule):
             print(f"TRAINING STEP {self._step_count}")
             print("=" * 70)
 
+        # -------- 归一化 --------
         gt = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
-
         B, T_future, J, C = gt.shape
 
         if self.train_mode == "direct":
@@ -299,62 +299,51 @@ class LitResidual(pl.LightningModule):
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
         pred_raw = self.unnormalize(pred_norm)
-        gt_raw = self.unnormalize(gt)
+        gt_raw   = self.unnormalize(gt)
 
-        # Velocity & acceleration losses
+        # -------- 速度 / 加速度 loss（保留）--------
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
+        # 先把这两个 motion loss 关掉
         loss_motion = torch.tensor(0.0, device=self.device)
         loss_motion_direct = torch.tensor(0.0, device=self.device)
         mag_pred = torch.tensor(0.0, device=self.device)
-        mag_gt = torch.tensor(0.0, device=self.device)
+        mag_gt   = torch.tensor(0.0, device=self.device)
 
         if pred_raw.size(1) > 1:
             v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
-            v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
+            v_gt   = gt_raw[:,   1:] - gt_raw[:,   :-1]
             loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
-            
+
             if v_pred.size(1) > 1:
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
-                a_gt = v_gt[:, 1:] - v_gt[:, :-1]
+                a_gt   = v_gt[:,   1:] - v_gt[:,   :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
-            
-            # 关键：motion magnitude loss
-            # 惩罚预测运动幅度小于 GT 运动幅度
-            mag_pred = v_pred.abs().mean()
-            mag_gt = v_gt.abs().mean()
-            
-            # 如果预测运动 < GT 运动的 80%，则施加惩罚
-            motion_deficit = torch.relu(mag_gt * 0.8 - mag_pred)
-            loss_motion = motion_deficit * 100.0
-            
-            # 额外：直接最大化预测的帧间差异
-            # 这会强制模型产生运动，即使 MSE 想让它静态
-            loss_motion_direct = -mag_pred * 50.0  # 负号表示最大化
-        else:
-            loss_motion = torch.tensor(0.0, device=self.device)
 
-        # 手指正则化损失
+            mag_pred = v_pred.abs().mean()
+            mag_gt   = v_gt.abs().mean()
+            # 注意：这里不再计算 motion_deficit / loss_motion / loss_motion_direct
+
+        # -------- 手部 range regularizer --------
         loss_hand = torch.tensor(0.0, device=self.device)
+        range_reg = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            #abnormal_joints = list(range(159, 178))
-            #if J > max(abnormal_joints):
-                #pred_hand = pred_norm[:, :, abnormal_joints, :]
-                #gt_hand = gt[:, :, abnormal_joints, :]
-                #loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
             range_reg = self.joint_range_regularizer(pred_norm, gt, upper=1.5)
             loss_hand = self.hand_reg_weight * range_reg
 
-            loss = (loss_main 
-                + self.vel_weight * loss_vel 
-                + self.acc_weight * loss_acc
-                + loss_hand
-                + loss_motion
-                + loss_motion_direct)
+        # -------- 总 loss（一定要在 if 外面算）--------
+        loss = (
+            loss_main
+            + self.vel_weight * loss_vel
+            + self.acc_weight * loss_acc
+            + loss_hand
+            + loss_motion
+            + loss_motion_direct
+        )
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
-            disp_gt = mean_frame_disp(gt_raw)
+            disp_gt   = mean_frame_disp(gt_raw)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
             print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
@@ -366,11 +355,11 @@ class LitResidual(pl.LightningModule):
             print("=" * 70)
 
         self.log_dict({
-            "train/loss": loss,
-            "train/mse": loss_main,
-            "train/vel": loss_vel,
-            "train/acc": loss_acc,
-            "train/hand": loss_hand,
+            "train/loss":   loss,
+            "train/mse":    loss_main,
+            "train/vel":    loss_vel,
+            "train/acc":    loss_acc,
+            "train/hand":   loss_hand,
             "train/motion": loss_motion,
         }, prog_bar=True)
 
