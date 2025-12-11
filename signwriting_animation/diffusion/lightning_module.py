@@ -19,7 +19,6 @@ from CAMDM.diffusion.gaussian_diffusion import (
     LossType,
 )
 
-# 使用新模型
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
@@ -242,12 +241,9 @@ class LitResidual(pl.LightningModule):
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
         # AR 模式预测（用于 motion loss）
-        # 只在 train_mode="ar" 时启用
-        if self.train_mode == "ar":
-            pred_norm_ar = self._predict_autoregressive(past, sign_img, T_future)
-            pred_raw_ar = self.unnormalize(pred_norm_ar)
-        else:
-            pred_raw_ar = self.unnormalize(pred_norm)
+        # 暂时禁用 AR motion loss，因为会导致关节爆炸
+        # 改用 Direct 模式的 velocity loss
+        pred_raw_ar = self.unnormalize(pred_norm)  # 用 Direct 的结果
         
         pred_raw = self.unnormalize(pred_norm)
         gt_raw = self.unnormalize(gt)
@@ -261,7 +257,6 @@ class LitResidual(pl.LightningModule):
         mag_gt = torch.tensor(0.0, device=self.device)
 
         if pred_raw_ar.size(1) > 1:
-            # 用 AR 预测计算 motion loss
             v_pred = pred_raw_ar[:, 1:] - pred_raw_ar[:, :-1]
             v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
@@ -271,18 +266,13 @@ class LitResidual(pl.LightningModule):
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
             
-            # Motion magnitude loss
+            # Motion magnitude (只用于监控，不加到 loss)
             mag_pred = v_pred.abs().mean()
             mag_gt = v_gt.abs().mean()
-            
-            # 双向约束：disp_ratio 应该在 [0.8, 1.2] 范围内
             disp_ratio = mag_pred / (mag_gt + 1e-8)
-            # 惩罚太小 (< 0.8)
-            deficit = torch.relu(0.8 - disp_ratio)
-            # 惩罚太大 (> 1.2)
-            excess = torch.relu(disp_ratio - 1.2)
-            loss_motion = (deficit + excess) * 2.0  # 降低权重
             
+            # 不加 motion loss，让 velocity MSE 自然优化
+            loss_motion = torch.tensor(0.0, device=self.device)
             loss_motion_direct = torch.tensor(0.0, device=self.device)
         else:
             loss_motion = torch.tensor(0.0, device=self.device)
