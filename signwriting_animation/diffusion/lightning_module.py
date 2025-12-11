@@ -59,6 +59,7 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     try:
         dtw_metric = PE_DTW()
     except:
+        # 如果 DTW 不可用，返回简单的 MSE 作为替代
         pred = sanitize_btjc(pred_btjc)
         tgt = sanitize_btjc(tgt_btjc)
         t_max = min(pred.size(1), tgt.size(1))
@@ -103,14 +104,18 @@ class LitResidual(pl.LightningModule):
         pred_target="x0",
         guidance_scale=0.0,
         train_mode: str = "direct",
-        vel_weight: float = 1.0,
+        vel_weight: float = 1.0,  # 增加速度权重
         acc_weight: float = 0.5,
-        residual_scale: float = 0.1,
-        hand_reg_weight: float = 1.0,
+        residual_scale: float = 0.1,  # 残差缩放
+        hand_reg_weight: float = 1.0,  # 手指正则化权重
     ):
         super().__init__()
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
+        
+        # 右手手指关节索引 (根据 178 关节的 holistic 布局)
+        # 通常是: body(33) + face(468 reduced) + left_hand(21) + right_hand(21)
+        # 需要根据你的具体骨架确定，这里假设右手是最后 21 个关节
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
@@ -176,6 +181,7 @@ class LitResidual(pl.LightningModule):
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
 
+        # 创建 dummy x（模型会用残差覆盖）
         x_btjc = torch.zeros(B, num_frames, J, C, device=device, dtype=past_norm_btjc.dtype)
         x_bjct = self.btjc_to_bjct(x_btjc)
         
@@ -232,12 +238,22 @@ class LitResidual(pl.LightningModule):
 
         B, T_future, J, C = gt.shape
 
+        # Direct 模式：直接预测所有帧（用于 MSE loss）
         pred_norm = self._predict_frames(past, sign_img, T_future)
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
+        # AR 模式预测（用于 motion loss）
+        # 只在 train_mode="ar" 时启用
+        if self.train_mode == "ar":
+            pred_norm_ar = self._predict_autoregressive(past, sign_img, T_future)
+            pred_raw_ar = self.unnormalize(pred_norm_ar)
+        else:
+            pred_raw_ar = self.unnormalize(pred_norm)
+        
         pred_raw = self.unnormalize(pred_norm)
         gt_raw = self.unnormalize(gt)
 
+        # Velocity & acceleration losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
         loss_motion = torch.tensor(0.0, device=self.device)
@@ -245,8 +261,9 @@ class LitResidual(pl.LightningModule):
         mag_pred = torch.tensor(0.0, device=self.device)
         mag_gt = torch.tensor(0.0, device=self.device)
 
-        if pred_raw.size(1) > 1:
-            v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
+        if pred_raw_ar.size(1) > 1:
+            # 用 AR 预测计算 motion loss
+            v_pred = pred_raw_ar[:, 1:] - pred_raw_ar[:, :-1]
             v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
             
@@ -259,14 +276,11 @@ class LitResidual(pl.LightningModule):
             mag_pred = v_pred.abs().mean()
             mag_gt = v_gt.abs().mean()
             
+            # 惩罚 disp_ratio 偏离 1.0
             disp_ratio = mag_pred / (mag_gt + 1e-8)
             motion_deficit = torch.relu(1.0 - disp_ratio)
-            loss_motion = motion_deficit * 10.0  # 权重
+            loss_motion = motion_deficit * 10.0
             
-            # 方法2：额外添加一个对称的 loss，鼓励 ratio 接近 1
-            # loss_motion = (disp_ratio - 1.0).abs() * 5.0
-            
-            # 去掉 loss_motion_direct（之前是负的，会不稳定）
             loss_motion_direct = torch.tensor(0.0, device=self.device)
         else:
             loss_motion = torch.tensor(0.0, device=self.device)
@@ -288,14 +302,15 @@ class LitResidual(pl.LightningModule):
                 + loss_motion_direct)
 
         if debug:
-            disp_pred = mean_frame_disp(pred_raw)
+            disp_pred_ar = mean_frame_disp(pred_raw_ar)
             disp_gt = mean_frame_disp(gt_raw)
+            disp_ratio_val = disp_pred_ar / (disp_gt + 1e-8)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
             print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
             print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
             print(f"loss_hand: {loss_hand.item():.6f}")
-            print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
+            print(f"AR disp: {disp_pred_ar:.6f}, gt disp: {disp_gt:.6f}, ratio: {disp_ratio_val:.4f}")
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
