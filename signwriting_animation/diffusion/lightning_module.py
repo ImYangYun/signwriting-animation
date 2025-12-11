@@ -113,7 +113,7 @@ class LitResidual(pl.LightningModule):
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
-        assert train_mode in {"diffusion", "direct"}
+        assert train_mode in {"diffusion", "direct", "ar"}
         self.train_mode = train_mode
         self.vel_weight = float(vel_weight)
         self.acc_weight = float(acc_weight)
