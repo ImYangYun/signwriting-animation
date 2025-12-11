@@ -190,9 +190,13 @@ if __name__ == "__main__":
         split="train",
     )
 
-    # 直接指定样本索引（跳过自动搜索）
-    # 你可以改这个数字来测试不同样本
-    SAMPLE_IDX = 5  # 试试样本 5
+    # 直接指定样本索引
+    # 用不同的索引来获取不同的视频/片段
+    SAMPLE_IDX = 50  # 试试样本 50，可能是不同的视频
+    
+    # 重置随机种子，让数据集采样到不同的位置
+    import random
+    random.seed(12345)  # 用不同的种子
     
     print(f"\n使用样本 {SAMPLE_IDX}")
     best_sample = base_ds[SAMPLE_IDX]
@@ -216,6 +220,7 @@ if __name__ == "__main__":
         best_disp = 0
     
     print(f"样本 {SAMPLE_IDX} 的 future disp = {best_disp:.4f}")
+    print(f"样本 ID: {best_sample.get('id', 'unknown')}")
 
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
