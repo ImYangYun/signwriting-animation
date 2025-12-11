@@ -192,51 +192,52 @@ if __name__ == "__main__":
 
     # 选择运动最大的样本
     print("\n寻找运动最大的样本...")
-    best_sample = None
+    best_sample = base_ds[0]  # 默认用第一个
     best_disp = 0
     best_idx = 0
     
     # 检查前 20 个样本
     for i in range(min(20, len(base_ds))):
-        sample = base_ds[i]
-        data = sample["data"]  # future frames
-        
-        # 处理不同类型的 tensor
-        if hasattr(data, 'zero_filled'):
-            data = data.zero_filled()
-        if hasattr(data, 'tensor'):
-            data = data.tensor
-        if isinstance(data, torch.Tensor):
-            data = data.numpy()
-        
-        if data.ndim == 4:
-            data = data[0]  # remove batch dim if present
-        
-        # 计算帧间位移
-        if data.shape[0] > 1:
-            vel = np.abs(data[1:] - data[:-1])
-            disp = vel.mean()
+        try:
+            sample = base_ds[i]
+            if sample is None:
+                print(f"  Sample {i}: 跳过 - None")
+                continue
+                
+            data = sample["data"]  # future frames
             
-            if disp > best_disp:
-                best_disp = disp
-                best_sample = base_ds[i]
-                best_idx = i
+            # 处理不同类型的 tensor
+            if hasattr(data, 'zero_filled'):
+                data = data.zero_filled()
+            if hasattr(data, 'tensor'):
+                data = data.tensor
+            if isinstance(data, torch.Tensor):
+                data = data.cpu().numpy()
+            
+            if data.ndim == 4:
+                data = data[0]  # remove batch dim if present
+            
+            # 计算帧间位移
+            if data.shape[0] > 1:
+                vel = np.abs(data[1:] - data[:-1])
+                disp = float(vel.mean())
+                
+                print(f"  Sample {i}: disp = {disp:.4f}")
+                
+                if disp > best_disp:
+                    best_disp = disp
+                    best_sample = sample  # 保存 sample 而不是重新获取
+                    best_idx = i
+        except Exception as e:
+            print(f"  Sample {i}: 跳过 - {e}")
+            continue
     
-    print(f"选择样本 {best_idx}，future disp = {best_disp:.6f}")
+    if best_sample is None:
+        print("警告：没有找到有效样本，使用 sample_0")
+        best_sample = base_ds[0]
+        best_idx = 0
     
-    # 也打印 sample_0 的 disp 作对比
-    sample_0 = base_ds[0]
-    data_0 = sample_0["data"]
-    if hasattr(data_0, 'zero_filled'):
-        data_0 = data_0.zero_filled()
-    if hasattr(data_0, 'tensor'):
-        data_0 = data_0.tensor
-    if isinstance(data_0, torch.Tensor):
-        data_0 = data_0.numpy()
-    if data_0.ndim == 4:
-        data_0 = data_0[0]
-    disp_0 = np.abs(data_0[1:] - data_0[:-1]).mean() if data_0.shape[0] > 1 else 0
-    print(f"对比: sample_0 的 future disp = {disp_0:.6f}")
+    print(f"\n选择样本 {best_idx}，future disp = {best_disp:.4f}")
 
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
@@ -251,8 +252,15 @@ if __name__ == "__main__":
         train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator,
     )
 
-    num_joints = sample_0["data"].shape[-2]
-    num_dims = sample_0["data"].shape[-1]
+    # 获取维度信息
+    sample_data = best_sample["data"]
+    if hasattr(sample_data, 'zero_filled'):
+        sample_data = sample_data.zero_filled()
+    if hasattr(sample_data, 'tensor'):
+        sample_data = sample_data.tensor
+    
+    num_joints = sample_data.shape[-2]
+    num_dims = sample_data.shape[-1]
 
     model = LitResidual(
         num_keypoints=num_joints,
