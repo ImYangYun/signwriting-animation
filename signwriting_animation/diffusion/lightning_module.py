@@ -19,6 +19,7 @@ from CAMDM.diffusion.gaussian_diffusion import (
     LossType,
 )
 
+# 使用新模型
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
 
@@ -102,10 +103,10 @@ class LitResidual(pl.LightningModule):
         pred_target="x0",
         guidance_scale=0.0,
         train_mode: str = "direct",
-        vel_weight: float = 1.0,
+        vel_weight: float = 1.0,  # 增加速度权重
         acc_weight: float = 0.5,
-        residual_scale: float = 0.1,
-        hand_reg_weight: float = 1.0,
+        residual_scale: float = 0.1,  # 残差缩放
+        hand_reg_weight: float = 1.0,  # 手指正则化权重
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -113,7 +114,7 @@ class LitResidual(pl.LightningModule):
         self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
         self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
 
-        assert train_mode in {"diffusion", "direct", "ar"}
+        assert train_mode in {"diffusion", "direct"}
         self.train_mode = train_mode
         self.vel_weight = float(vel_weight)
         self.acc_weight = float(acc_weight)
@@ -167,6 +168,11 @@ class LitResidual(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def _predict_frames(self, past_norm_btjc, sign_img, num_frames):
+        """
+        预测 num_frames 帧
+        
+        残差模型会自动使用 past 的最后一帧作为基准
+        """
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
 
@@ -207,70 +213,6 @@ class LitResidual(pl.LightningModule):
             remaining -= n
         
         return torch.cat(predictions, dim=1)
-    
-    def hand_scale_regularizer(self, pred_norm, gt, scale_factor: float = 1.5):
-        """
-        pred_norm, gt: [B, T, J, C]，都是 normalized 空间。
-        """
-        device = pred_norm.device
-        B, T, J, C = pred_norm.shape
-        loss = torch.tensor(0.0, device=device)
-
-        for hand_joints in (self.left_hand_joints, self.right_hand_joints):
-            hand_joints = [j for j in hand_joints if j < J]
-            if len(hand_joints) < 2:
-                continue
-
-            wrist_idx = hand_joints[0]
-            finger_idx = hand_joints[1:]
-
-            # [B, T, C]
-            pred_wrist = pred_norm[:, :, wrist_idx, :]
-            gt_wrist   = gt[:, :, wrist_idx, :]
-
-            # [B, T, F, C]
-            pred_rel = pred_norm[:, :, finger_idx, :] - pred_wrist.unsqueeze(2)
-            gt_rel   = gt[:, :, finger_idx, :] - gt_wrist.unsqueeze(2)
-
-            pred_r = pred_rel.norm(dim=-1)
-            gt_r   = gt_rel.norm(dim=-1) + 1e-6
-            excess = torch.relu(pred_r - scale_factor * gt_r)
-            loss = loss + (excess ** 2).mean()
-
-        return loss
-
-    def joint_range_regularizer(self,
-                                pred_norm: torch.Tensor,
-                                gt: torch.Tensor,
-                                upper: float = 2.0) -> torch.Tensor:
-        """
-        约束每个关节在时间上的运动幅度不要比 GT 大太多。
-
-        pred_norm, gt: [B, T, J, C] (normalized 空间)
-        upper: 允许的最大比例，比如 2.0 表示 pred_range <= 2 * gt_range
-        """
-        device = pred_norm.device
-        B, T, J, C = pred_norm.shape
-        eps = 1e-6
-
-        # [B, J, C]：时间维度上的 max/min
-        pred_max, _ = pred_norm.max(dim=1)
-        pred_min, _ = pred_norm.min(dim=1)
-        gt_max,   _ = gt.max(dim=1)
-        gt_min,   _ = gt.min(dim=1)
-
-        # [B, J]：该关节整体运动幅度
-        pred_range = (pred_max - pred_min).norm(dim=-1)
-        gt_range   = (gt_max   - gt_min  ).norm(dim=-1)
-
-        active = gt_range > 1e-3
-        if not active.any():
-            return torch.tensor(0.0, device=device)
-
-        ratio = pred_range[active] / (gt_range[active] + eps)
-        excess = torch.relu(ratio - upper)
-
-        return (excess ** 2).mean()
 
     def training_step(self, batch, batch_idx):
         debug = self._step_count == 0 or self._step_count % 100 == 0
@@ -285,61 +227,66 @@ class LitResidual(pl.LightningModule):
             print(f"TRAINING STEP {self._step_count}")
             print("=" * 70)
 
-        # -------- 归一化 --------
         gt = self.normalize(gt_btjc)
         past = self.normalize(past_btjc)
+
         B, T_future, J, C = gt.shape
 
-        if self.train_mode == "direct":
-            pred_norm = self._predict_frames(past, sign_img, T_future)
-        elif self.train_mode == "ar":
-            pred_norm = self._predict_autoregressive(past, sign_img, T_future, chunk_size=5)
-        else:
-            raise ValueError(f"Unknown train_mode: {self.train_mode}")
+        # Direct 模式：直接预测所有帧
+        pred_norm = self._predict_frames(past, sign_img, T_future)
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
         pred_raw = self.unnormalize(pred_norm)
-        gt_raw   = self.unnormalize(gt)
+        gt_raw = self.unnormalize(gt)
 
-        # -------- 速度 / 加速度 loss（保留）--------
+        # Velocity & acceleration losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
-        # 先把这两个 motion loss 关掉
         loss_motion = torch.tensor(0.0, device=self.device)
         loss_motion_direct = torch.tensor(0.0, device=self.device)
         mag_pred = torch.tensor(0.0, device=self.device)
-        mag_gt   = torch.tensor(0.0, device=self.device)
+        mag_gt = torch.tensor(0.0, device=self.device)
 
         if pred_raw.size(1) > 1:
             v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
-            v_gt   = gt_raw[:,   1:] - gt_raw[:,   :-1]
+            v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
-
+            
             if v_pred.size(1) > 1:
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
-                a_gt   = v_gt[:,   1:] - v_gt[:,   :-1]
+                a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
-
+            
+            # 关键：motion magnitude loss
+            # 惩罚预测运动幅度小于 GT 运动幅度
             mag_pred = v_pred.abs().mean()
-            mag_gt   = v_gt.abs().mean()
-            # 注意：这里不再计算 motion_deficit / loss_motion / loss_motion_direct
+            mag_gt = v_gt.abs().mean()
+            
+            # 如果预测运动 < GT 运动的 80%，则施加惩罚
+            motion_deficit = torch.relu(mag_gt * 0.8 - mag_pred)
+            loss_motion = motion_deficit * 100.0
+            
+            # 额外：直接最大化预测的帧间差异
+            # 这会强制模型产生运动，即使 MSE 想让它静态
+            loss_motion_direct = -mag_pred * 50.0  # 负号表示最大化
+        else:
+            loss_motion = torch.tensor(0.0, device=self.device)
 
-        # -------- 手部 range regularizer --------
+        # 手指正则化损失
         loss_hand = torch.tensor(0.0, device=self.device)
-        range_reg = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=1.7)
-            loss_hand = self.hand_reg_weight * range_reg
+            abnormal_joints = list(range(159, 178))
+            if J > max(abnormal_joints):
+                pred_hand = pred_norm[:, :, abnormal_joints, :]
+                gt_hand = gt[:, :, abnormal_joints, :]
+                loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
 
-        # -------- 总 loss（一定要在 if 外面算）--------
-        loss = (
-            loss_main
-            + self.vel_weight * loss_vel
-            + self.acc_weight * loss_acc
-            + loss_hand
-            + loss_motion
-            + loss_motion_direct
-        )
+        loss = (loss_main 
+                + self.vel_weight * loss_vel 
+                + self.acc_weight * loss_acc
+                + self.hand_reg_weight * loss_hand
+                + loss_motion
+                + loss_motion_direct)
 
         if debug:
             disp_pred = mean_frame_disp(pred_raw)
@@ -348,32 +295,17 @@ class LitResidual(pl.LightningModule):
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
             print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
             print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
-            print(f"range_reg (unweighted): {range_reg.item():.6f}")
-            print(f"loss_hand (with weight): {loss_hand.item():.6f}")
+            print(f"loss_hand: {loss_hand.item():.6f}")
             print(f"pred disp: {disp_pred:.6f}, gt disp: {disp_gt:.6f}")
             print(f"TOTAL: {loss.item():.6f}")
-
-            diff = (pred_raw - gt_raw)                     # [B, T, J, C]
-
-            per_frame_mse = (diff ** 2).mean(dim=(2, 3))[0]
-            print("Per-frame MSE (train):",
-                  per_frame_mse.detach().cpu().numpy())
-
-            joint_mse = (diff ** 2).mean(dim=(0, 1, 3))       # [J]
-            top = torch.argsort(joint_mse, descending=True)[:8]
-            print("Top-8 joints by MSE (train):")
-            for j in top:
-                j = int(j)
-                print(f"  Joint {j}: mse={joint_mse[j].item():.6f}")
-
             print("=" * 70)
 
         self.log_dict({
-            "train/loss":   loss,
-            "train/mse":    loss_main,
-            "train/vel":    loss_vel,
-            "train/acc":    loss_acc,
-            "train/hand":   loss_hand,
+            "train/loss": loss,
+            "train/mse": loss_main,
+            "train/vel": loss_vel,
+            "train/acc": loss_acc,
+            "train/hand": loss_hand,
             "train/motion": loss_motion,
         }, prog_bar=True)
 

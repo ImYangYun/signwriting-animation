@@ -12,6 +12,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, masked_dtw, mean_frame_disp
+
 try:
     from pose_anonymization.data.normalization import unshift_hands
     HAS_UNSHIFT = True
@@ -31,8 +32,7 @@ def diagnose_model(model, past_norm, sign_img, device):
         pred2 = model._predict_frames(past_norm, sign_img, 5)
         diff = (pred1 - pred2).abs().max().item()
         print(f"1. 相同输入两次预测差异: {diff:.8f}")
-        
-        # 测试2：不同 past
+
         past_shifted = past_norm.clone()
         past_shifted[:, :, :, 0] += 0.1
         pred_orig = model._predict_frames(past_norm, sign_img, 5)
@@ -44,7 +44,7 @@ def diagnose_model(model, past_norm, sign_img, device):
         else:
             print("   ✓ 模型对 past 敏感")
         
-        # 测试3：帧间差异
+
         pred = model._predict_frames(past_norm, sign_img, 10)
         disp = mean_frame_disp(pred)
         print(f"3. 预测帧间 displacement: {disp:.6f}")
@@ -66,14 +66,14 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-    
+
     gt_np = None
     if gt_btjc is not None:
         if gt_btjc.dim() == 4:
             gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
         else:
             gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-    
+
     if fix_abnormal_joints:
         T, J, C = t_np.shape
         
@@ -93,12 +93,11 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max
                                                 gt_mean[c] - max_dev, 
                                                 gt_mean[c] + max_dev)
             else:
-                # 没有 GT 时，用整体范围约束
                 overall_mean = t_np.mean(axis=(0, 1))
                 overall_std = t_np.std(axis=(0, 1))
                 
                 for c in range(C):
-                    if pred_range[c] > overall_std[c] * 6:  # 超过 6 倍标准差
+                    if pred_range[c] > overall_std[c] * 6:
                         joint_mean = t_np[:, j, c].mean()
                         max_dev = overall_std[c] * 3
                         t_np[:, j, c] = np.clip(t_np[:, j, c],
@@ -205,13 +204,12 @@ if __name__ == "__main__":
         stats_path=stats_path,
         lr=1e-3,
         train_mode="ar",
-        vel_weight=10.0,
-        acc_weight=2.0,
+        vel_weight=1.0,
+        acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=5.0,
+        hand_reg_weight=0.0,
     )
 
-    # diagnose
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
@@ -300,26 +298,7 @@ if __name__ == "__main__":
                 print(f"  Joint {j}: pred_range={pred_ranges[j].sum():.4f}, gt_range={gt_ranges[j].sum():.4f}, ratio={ratio[j]:.1f}x")
         else:
             print("✓ 所有关节范围正常")
-
-        print("\n=== Pred vs GT 诊断 (AR) ===")
-        print(f"AR MSE / Baseline MSE: {mse_ar / mse_base:.3f}")
-
-        per_frame_mse = ((pred_raw_ar - gt_raw) ** 2).mean(dim=(2, 3))[0]
-        print("Per-frame MSE (AR):", np.round(per_frame_mse.cpu().numpy(), 6))
-
-        joint_mse = ((pred_raw_ar - gt_raw) ** 2).mean(dim=(0, 1, 3))  # [J]
-        top = torch.argsort(joint_mse, descending=True)[:8]
-
-        print("\nTop-8 误差最大的关节：")
-        for j in top:
-            j = int(j)
-            print(
-                f"  Joint {j:3d}: mse={joint_mse[j].item():.6f}, "
-                f"pred_range={pred_ranges[j].sum():.4f}, "
-                f"gt_range={gt_ranges[j].sum():.4f}, "
-                f"ratio={ratio[j]:.2f}x"
-            )
-
+        
         print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
         print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
         
@@ -356,6 +335,7 @@ if __name__ == "__main__":
         ref_pose.write(f)
     print(f"✓ GT: {out_gt}")
     
+    # 传入 gt_raw 来约束异常关节
     pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
