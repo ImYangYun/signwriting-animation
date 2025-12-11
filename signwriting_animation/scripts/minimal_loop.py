@@ -218,7 +218,7 @@ if __name__ == "__main__":
     gt_disp_raw = float(np.abs(data[1:] - data[:-1]).mean()) if data.shape[0] > 1 else 0
     print(f"样本 future disp (raw): {gt_disp_raw:.4f}")
     
-
+    # 单样本 Dataset
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
             self.sample = sample
@@ -234,7 +234,8 @@ if __name__ == "__main__":
         shuffle=False, 
         collate_fn=zero_pad_collator,
     )
-
+    
+    # 获取维度信息
     sample_data = best_sample["data"]
     if hasattr(sample_data, 'zero_filled'):
         sample_data = sample_data.zero_filled()
@@ -251,8 +252,8 @@ if __name__ == "__main__":
         stats_path=stats_path,
         lr=1e-3,
         train_mode="ar",
-        vel_weight=5.0,
-        acc_weight=1.0,
+        vel_weight=2.0,
+        acc_weight=0.5,
         residual_scale=0.1,
         hand_reg_weight=2.0,
     )
@@ -419,7 +420,8 @@ if __name__ == "__main__":
     with open(out_gt, "wb") as f:
         ref_pose.write(f)
     print(f"✓ GT: {out_gt}")
-
+    
+    # 传入 gt_raw 来约束异常关节
     pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:

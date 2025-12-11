@@ -22,7 +22,6 @@ from CAMDM.diffusion.gaussian_diffusion import (
 # 使用新模型
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
-
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
@@ -276,10 +275,13 @@ class LitResidual(pl.LightningModule):
             mag_pred = v_pred.abs().mean()
             mag_gt = v_gt.abs().mean()
             
-            # 惩罚 disp_ratio 偏离 1.0
+            # 双向约束：disp_ratio 应该在 [0.8, 1.2] 范围内
             disp_ratio = mag_pred / (mag_gt + 1e-8)
-            motion_deficit = torch.relu(1.0 - disp_ratio)
-            loss_motion = motion_deficit * 10.0
+            # 惩罚太小 (< 0.8)
+            deficit = torch.relu(0.8 - disp_ratio)
+            # 惩罚太大 (> 1.2)
+            excess = torch.relu(disp_ratio - 1.2)
+            loss_motion = (deficit + excess) * 2.0  # 降低权重
             
             loss_motion_direct = torch.tensor(0.0, device=self.device)
         else:
