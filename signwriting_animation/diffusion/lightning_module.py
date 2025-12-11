@@ -328,7 +328,7 @@ class LitResidual(pl.LightningModule):
         loss_hand = torch.tensor(0.0, device=self.device)
         range_reg = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=1.5)
+            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=2.0)
             loss_hand = self.hand_reg_weight * range_reg
 
         # -------- 总 loss（一定要在 if 外面算）--------
