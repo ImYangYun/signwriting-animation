@@ -21,6 +21,7 @@ except ImportError:
 
 
 def diagnose_model(model, past_norm, sign_img, device):
+    """诊断模型对输入的敏感度"""
     print("\n" + "=" * 70)
     print("诊断：模型对输入的敏感度")
     print("=" * 70)
@@ -28,11 +29,13 @@ def diagnose_model(model, past_norm, sign_img, device):
     model.eval()
     
     with torch.no_grad():
+        # 测试1：相同输入
         pred1 = model._predict_frames(past_norm, sign_img, 5)
         pred2 = model._predict_frames(past_norm, sign_img, 5)
         diff = (pred1 - pred2).abs().max().item()
         print(f"1. 相同输入两次预测差异: {diff:.8f}")
-
+        
+        # 测试2：不同 past
         past_shifted = past_norm.clone()
         past_shifted[:, :, :, 0] += 0.1
         pred_orig = model._predict_frames(past_norm, sign_img, 5)
@@ -44,7 +47,7 @@ def diagnose_model(model, past_norm, sign_img, device):
         else:
             print("   ✓ 模型对 past 敏感")
         
-
+        # 测试3：帧间差异
         pred = model._predict_frames(past_norm, sign_img, 10)
         disp = mean_frame_disp(pred)
         print(f"3. 预测帧间 displacement: {disp:.6f}")
@@ -66,38 +69,45 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-
+    
+    # 获取 GT 用于约束（如果提供）
     gt_np = None
     if gt_btjc is not None:
         if gt_btjc.dim() == 4:
             gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
         else:
             gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-
+    
+    # 修复异常关节
     if fix_abnormal_joints:
         T, J, C = t_np.shape
         
+        # 右手手指关节 (159-177)
         hand_joints = list(range(153, min(178, J)))
         
         for j in hand_joints:
+            # 计算该关节的运动范围
             pred_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
             
             if gt_np is not None:
+                # 使用 GT 的范围作为参考
                 gt_range = gt_np[:, j].max(axis=0) - gt_np[:, j].min(axis=0)
                 gt_mean = gt_np[:, j].mean(axis=0)
                 
                 for c in range(C):
-                    if pred_range[c] > gt_range[c] * 2.0:
+                    if pred_range[c] > gt_range[c] * 2.0:  # 超过 GT 范围的 2 倍
+                        # 将该关节 clamp 到 GT 范围
                         max_dev = gt_range[c] * 1.5
                         t_np[:, j, c] = np.clip(t_np[:, j, c], 
                                                 gt_mean[c] - max_dev, 
                                                 gt_mean[c] + max_dev)
             else:
+                # 没有 GT 时，用整体范围约束
                 overall_mean = t_np.mean(axis=(0, 1))
                 overall_std = t_np.std(axis=(0, 1))
                 
                 for c in range(C):
-                    if pred_range[c] > overall_std[c] * 6:
+                    if pred_range[c] > overall_std[c] * 6:  # 超过 6 倍标准差
                         joint_mean = t_np[:, j, c].mean()
                         max_dev = overall_std[c] * 3
                         t_np[:, j, c] = np.clip(t_np[:, j, c],
@@ -180,7 +190,47 @@ if __name__ == "__main__":
         split="train",
     )
 
+    # 选择运动最大的样本
+    print("\n寻找运动最大的样本...")
+    best_sample = None
+    best_disp = 0
+    best_idx = 0
+    
+    # 检查前 20 个样本
+    for i in range(min(20, len(base_ds))):
+        sample = base_ds[i]
+        data = sample["data"]  # future frames
+        if hasattr(data, 'numpy'):
+            data = data.numpy()
+        elif hasattr(data, 'zero_filled'):
+            data = data.zero_filled().numpy()
+        
+        if data.ndim == 4:
+            data = data[0]  # remove batch dim if present
+        
+        # 计算帧间位移
+        if data.shape[0] > 1:
+            vel = np.abs(data[1:] - data[:-1])
+            disp = vel.mean()
+            
+            if disp > best_disp:
+                best_disp = disp
+                best_sample = base_ds[i]
+                best_idx = i
+    
+    print(f"选择样本 {best_idx}，future disp = {best_disp:.6f}")
+    
+    # 也打印 sample_0 的 disp 作对比
     sample_0 = base_ds[0]
+    data_0 = sample_0["data"]
+    if hasattr(data_0, 'zero_filled'):
+        data_0 = data_0.zero_filled().numpy()
+    elif hasattr(data_0, 'numpy'):
+        data_0 = data_0.numpy()
+    if data_0.ndim == 4:
+        data_0 = data_0[0]
+    disp_0 = np.abs(data_0[1:] - data_0[:-1]).mean() if data_0.shape[0] > 1 else 0
+    print(f"对比: sample_0 的 future disp = {disp_0:.6f}")
 
     class FixedSampleDataset(torch.utils.data.Dataset):
         def __init__(self, sample):
@@ -190,7 +240,7 @@ if __name__ == "__main__":
         def __getitem__(self, idx):
             return self.sample
 
-    train_ds = FixedSampleDataset(sample_0)
+    train_ds = FixedSampleDataset(best_sample)
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=False, collate_fn=zero_pad_collator,
     )
@@ -207,9 +257,10 @@ if __name__ == "__main__":
         vel_weight=1.0,
         acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=0.0,
+        hand_reg_weight=2.0,  # 折中：比5小，但还是有约束
     )
 
+    # 训练前诊断
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
@@ -319,7 +370,7 @@ if __name__ == "__main__":
     print("保存文件")
     print("=" * 70)
     
-    ref_path = base_ds.records[0]["pose"]
+    ref_path = base_ds.records[best_idx]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
     
