@@ -103,10 +103,10 @@ class LitResidual(pl.LightningModule):
         pred_target="x0",
         guidance_scale=0.0,
         train_mode: str = "direct",
-        vel_weight: float = 1.0,  # 增加速度权重
+        vel_weight: float = 1.0,
         acc_weight: float = 0.5,
-        residual_scale: float = 0.1,  # 残差缩放
-        hand_reg_weight: float = 1.0,  # 手指正则化权重
+        residual_scale: float = 0.1,
+        hand_reg_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -232,14 +232,12 @@ class LitResidual(pl.LightningModule):
 
         B, T_future, J, C = gt.shape
 
-        # Direct 模式：直接预测所有帧
         pred_norm = self._predict_frames(past, sign_img, T_future)
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
         pred_raw = self.unnormalize(pred_norm)
         gt_raw = self.unnormalize(gt)
 
-        # Velocity & acceleration losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
         loss_motion = torch.tensor(0.0, device=self.device)
@@ -257,18 +255,19 @@ class LitResidual(pl.LightningModule):
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
             
-            # 关键：motion magnitude loss
-            # 惩罚预测运动幅度小于 GT 运动幅度
+            # Motion magnitude loss
             mag_pred = v_pred.abs().mean()
             mag_gt = v_gt.abs().mean()
             
-            # 如果预测运动 < GT 运动的 80%，则施加惩罚
-            motion_deficit = torch.relu(mag_gt * 0.8 - mag_pred)
-            loss_motion = motion_deficit * 100.0
+            disp_ratio = mag_pred / (mag_gt + 1e-8)
+            motion_deficit = torch.relu(1.0 - disp_ratio)
+            loss_motion = motion_deficit * 10.0  # 权重
             
-            # 额外：直接最大化预测的帧间差异
-            # 这会强制模型产生运动，即使 MSE 想让它静态
-            loss_motion_direct = -mag_pred * 50.0  # 负号表示最大化
+            # 方法2：额外添加一个对称的 loss，鼓励 ratio 接近 1
+            # loss_motion = (disp_ratio - 1.0).abs() * 5.0
+            
+            # 去掉 loss_motion_direct（之前是负的，会不稳定）
+            loss_motion_direct = torch.tensor(0.0, device=self.device)
         else:
             loss_motion = torch.tensor(0.0, device=self.device)
 
