@@ -239,6 +239,39 @@ class LitResidual(pl.LightningModule):
 
         return loss
 
+    def joint_range_regularizer(self,
+                                pred_norm: torch.Tensor,
+                                gt: torch.Tensor,
+                                upper: float = 2.0) -> torch.Tensor:
+        """
+        约束每个关节在时间上的运动幅度不要比 GT 大太多。
+
+        pred_norm, gt: [B, T, J, C] (normalized 空间)
+        upper: 允许的最大比例，比如 2.0 表示 pred_range <= 2 * gt_range
+        """
+        device = pred_norm.device
+        B, T, J, C = pred_norm.shape
+        eps = 1e-6
+
+        # [B, J, C]：时间维度上的 max/min
+        pred_max, _ = pred_norm.max(dim=1)
+        pred_min, _ = pred_norm.min(dim=1)
+        gt_max,   _ = gt.max(dim=1)
+        gt_min,   _ = gt.min(dim=1)
+
+        # [B, J]：该关节整体运动幅度
+        pred_range = (pred_max - pred_min).norm(dim=-1)
+        gt_range   = (gt_max   - gt_min  ).norm(dim=-1)
+
+        # 只对 GT 本身有运动的关节做约束，避免 gt_range≈0 的假阳性
+        active = gt_range > 1e-3
+        if not active.any():
+            return torch.tensor(0.0, device=device)
+
+        ratio = pred_range[active] / (gt_range[active] + eps)
+        excess = torch.relu(ratio - upper)  # 只罚超过 upper 的部分
+
+        return (excess ** 2).mean()
 
     def training_step(self, batch, batch_idx):
         debug = self._step_count == 0 or self._step_count % 100 == 0
@@ -306,14 +339,13 @@ class LitResidual(pl.LightningModule):
                 #pred_hand = pred_norm[:, :, abnormal_joints, :]
                 #gt_hand = gt[:, :, abnormal_joints, :]
                 #loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
-                # 手部尺度 regularizer：防止一只手整体放大
-            scale_reg = self.hand_scale_regularizer(pred_norm, gt, scale_factor=1.5)
-            loss_hand = self.hand_reg_weight * scale_reg
+            range_reg = self.joint_range_regularizer(pred_norm, gt, upper=2.0)
+            loss_hand = self.hand_reg_weight * range_reg
 
-        loss = (loss_main 
+            loss = (loss_main 
                 + self.vel_weight * loss_vel 
                 + self.acc_weight * loss_acc
-                + self.hand_reg_weight * loss_hand
+                + loss_hand
                 + loss_motion
                 + loss_motion_direct)
 

@@ -208,7 +208,7 @@ if __name__ == "__main__":
         vel_weight=1.0,
         acc_weight=0.5,
         residual_scale=0.1,
-        hand_reg_weight=1.0,
+        hand_reg_weight=5.0,
     )
 
     # diagnose
@@ -300,7 +300,26 @@ if __name__ == "__main__":
                 print(f"  Joint {j}: pred_range={pred_ranges[j].sum():.4f}, gt_range={gt_ranges[j].sum():.4f}, ratio={ratio[j]:.1f}x")
         else:
             print("✓ 所有关节范围正常")
-        
+
+        print("\n=== Pred vs GT 诊断 (AR) ===")
+        print(f"AR MSE / Baseline MSE: {mse_ar / mse_base:.3f}")
+
+        per_frame_mse = ((pred_raw_ar - gt_raw) ** 2).mean(dim=(2, 3))[0]
+        print("Per-frame MSE (AR):", np.round(per_frame_mse.cpu().numpy(), 6))
+
+        joint_mse = ((pred_raw_ar - gt_raw) ** 2).mean(dim=(0, 1, 3))  # [J]
+        top = torch.argsort(joint_mse, descending=True)[:8]
+
+        print("\nTop-8 误差最大的关节：")
+        for j in top:
+            j = int(j)
+            print(
+                f"  Joint {j:3d}: mse={joint_mse[j].item():.6f}, "
+                f"pred_range={pred_ranges[j].sum():.4f}, "
+                f"gt_range={gt_ranges[j].sum():.4f}, "
+                f"ratio={ratio[j]:.2f}x"
+            )
+
         print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
         print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
         
