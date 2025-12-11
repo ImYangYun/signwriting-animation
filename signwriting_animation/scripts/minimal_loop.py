@@ -200,10 +200,14 @@ if __name__ == "__main__":
     for i in range(min(20, len(base_ds))):
         sample = base_ds[i]
         data = sample["data"]  # future frames
-        if hasattr(data, 'numpy'):
+        
+        # 处理不同类型的 tensor
+        if hasattr(data, 'zero_filled'):
+            data = data.zero_filled()
+        if hasattr(data, 'tensor'):
+            data = data.tensor
+        if isinstance(data, torch.Tensor):
             data = data.numpy()
-        elif hasattr(data, 'zero_filled'):
-            data = data.zero_filled().numpy()
         
         if data.ndim == 4:
             data = data[0]  # remove batch dim if present
@@ -224,8 +228,10 @@ if __name__ == "__main__":
     sample_0 = base_ds[0]
     data_0 = sample_0["data"]
     if hasattr(data_0, 'zero_filled'):
-        data_0 = data_0.zero_filled().numpy()
-    elif hasattr(data_0, 'numpy'):
+        data_0 = data_0.zero_filled()
+    if hasattr(data_0, 'tensor'):
+        data_0 = data_0.tensor
+    if isinstance(data_0, torch.Tensor):
         data_0 = data_0.numpy()
     if data_0.ndim == 4:
         data_0 = data_0[0]
