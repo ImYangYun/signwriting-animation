@@ -174,8 +174,6 @@ def main():
         use_reduce_holistic=True,
     )
     
-    # ✅ 不设置 mean_std，返回原始数据
-    # dataset.mean_std = torch.load("/data/yayun/pose_data/mean_std_586.pt")
 
     loader = DataLoader(
         dataset,

@@ -128,7 +128,7 @@ if __name__ == "__main__":
         shuffle=True, 
         collate_fn=zero_pad_collator,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=False,
     )
     
     # 验证集
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         shuffle=False,
         collate_fn=zero_pad_collator,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=False,
     )
     
     print(f"训练集大小: {len(train_ds)}, 每 epoch {len(train_loader)} 个 batch")
