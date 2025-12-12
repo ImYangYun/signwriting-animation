@@ -53,12 +53,8 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, fix
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
     
-    if HAS_UNSHIFT:
-        try:
-            unshift_hands(pose_obj)
-        except:
-            pass
-    
+    unshift_hands(pose_obj)
+
     T_pred = pose_obj.body.data.shape[0]
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
