@@ -95,10 +95,10 @@ if __name__ == "__main__":
     print("多样本训练 (带 Validation)")
     print("=" * 70)
 
-    NUM_TRAIN = 500
-    NUM_VAL = 100
+    NUM_TRAIN = 2000
+    NUM_VAL = 500
     BATCH_SIZE = 8
-    MAX_EPOCHS = 100
+    MAX_EPOCHS = 200
     
     print(f"\n配置:")
     print(f"  训练样本: 0 ~ {NUM_TRAIN-1}")
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     
     early_stop_callback = EarlyStopping(
         monitor="val/loss",
-        patience=20,
+        #patience=20,
         mode="min",
     )
 
