@@ -199,7 +199,7 @@ if __name__ == "__main__":
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         default_root_dir=out_dir,
-        callbacks=[checkpoint_callback, early_stop_callback],
+        callbacks=[checkpoint_callback],
         log_every_n_steps=50,
         check_val_every_n_epoch=1,
     )
