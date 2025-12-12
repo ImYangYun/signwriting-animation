@@ -5,20 +5,9 @@ from torch import nn
 import numpy as np
 import lightning as pl
 
-try:
-    from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
-    HAS_DTW = True
-except ImportError:
-    HAS_DTW = False
-    PE_DTW = None
 
-from CAMDM.diffusion.gaussian_diffusion import (
-    GaussianDiffusion,
-    ModelMeanType,
-    ModelVarType,
-    LossType,
-)
-
+from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
+from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
@@ -57,7 +46,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     try:
         dtw_metric = PE_DTW()
     except:
-        # 如果 DTW 不可用，返回简单的 MSE 作为替代
         pred = sanitize_btjc(pred_btjc)
         tgt = sanitize_btjc(tgt_btjc)
         t_max = min(pred.size(1), tgt.size(1))
@@ -87,7 +75,7 @@ class LitResidual(pl.LightningModule):
     """
     使用残差预测模型的 Lightning Module
     
-    新增：hand_reg_weight - 对手指关节的额外正则化
+    支持多样本训练 + validation
     """
 
     def __init__(
@@ -102,20 +90,17 @@ class LitResidual(pl.LightningModule):
         pred_target="x0",
         guidance_scale=0.0,
         train_mode: str = "direct",
-        vel_weight: float = 1.0,  # 增加速度权重
+        vel_weight: float = 1.0,
         acc_weight: float = 0.5,
-        residual_scale: float = 0.1,  # 残差缩放
-        hand_reg_weight: float = 1.0,  # 手指正则化权重
+        residual_scale: float = 0.1,
+        hand_reg_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.hand_reg_weight = hand_reg_weight
         
-        # 右手手指关节索引 (根据 178 关节的 holistic 布局)
-        # 通常是: body(33) + face(468 reduced) + left_hand(21) + right_hand(21)
-        # 需要根据你的具体骨架确定，这里假设右手是最后 21 个关节
-        self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
-        self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
+        self.right_hand_joints = list(range(157, 178))
+        self.left_hand_joints = list(range(136, 157))
 
         assert train_mode in {"diffusion", "direct", "ar"}
         self.train_mode = train_mode
@@ -131,7 +116,6 @@ class LitResidual(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # 使用新的残差模型
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
@@ -171,15 +155,10 @@ class LitResidual(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def _predict_frames(self, past_norm_btjc, sign_img, num_frames):
-        """
-        预测 num_frames 帧
-        
-        残差模型会自动使用 past 的最后一帧作为基准
-        """
+        """预测 num_frames 帧"""
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
 
-        # 创建 dummy x（模型会用残差覆盖）
         x_btjc = torch.zeros(B, num_frames, J, C, device=device, dtype=past_norm_btjc.dtype)
         x_bjct = self.btjc_to_bjct(x_btjc)
         
@@ -193,9 +172,7 @@ class LitResidual(pl.LightningModule):
         return pred_btjc
 
     def _predict_autoregressive(self, past_norm_btjc, sign_img, future_len, chunk_size=5):
-        """
-        自回归预测：每次预测 chunk_size 帧，然后滚动
-        """
+        """自回归预测"""
         B, T_past, J, C = past_norm_btjc.shape
         device = past_norm_btjc.device
         
@@ -205,21 +182,18 @@ class LitResidual(pl.LightningModule):
         remaining = future_len
         while remaining > 0:
             n = min(chunk_size, remaining)
-            
-            # 预测 n 帧
             pred_chunk = self._predict_frames(current_history, sign_img, n)
             predictions.append(pred_chunk.clone())
             
-            # 更新历史
             current_history = torch.cat([current_history, pred_chunk], dim=1)
-            current_history = current_history[:, -T_past:]  # 保持历史长度
+            current_history = current_history[:, -T_past:]
             
             remaining -= n
         
         return torch.cat(predictions, dim=1)
 
     def training_step(self, batch, batch_idx):
-        debug = self._step_count == 0 or self._step_count % 100 == 0
+        debug = self._step_count == 0 or self._step_count % 500 == 0
 
         cond_raw = batch["conditions"]
         gt_btjc = sanitize_btjc(batch["data"])
@@ -236,28 +210,19 @@ class LitResidual(pl.LightningModule):
 
         B, T_future, J, C = gt.shape
 
-        # Direct 模式：直接预测所有帧（用于 MSE loss）
+        # Direct 预测
         pred_norm = self._predict_frames(past, sign_img, T_future)
         loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
 
-        # AR 模式预测（用于 motion loss）
-        # 暂时禁用 AR motion loss，因为会导致关节爆炸
-        # 改用 Direct 模式的 velocity loss
-        pred_raw_ar = self.unnormalize(pred_norm)  # 用 Direct 的结果
-        
         pred_raw = self.unnormalize(pred_norm)
         gt_raw = self.unnormalize(gt)
 
         # Velocity & acceleration losses
         loss_vel = torch.tensor(0.0, device=self.device)
         loss_acc = torch.tensor(0.0, device=self.device)
-        loss_motion = torch.tensor(0.0, device=self.device)
-        loss_motion_direct = torch.tensor(0.0, device=self.device)
-        mag_pred = torch.tensor(0.0, device=self.device)
-        mag_gt = torch.tensor(0.0, device=self.device)
 
-        if pred_raw_ar.size(1) > 1:
-            v_pred = pred_raw_ar[:, 1:] - pred_raw_ar[:, :-1]
+        if pred_raw.size(1) > 1:
+            v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
             v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
             loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
             
@@ -265,22 +230,11 @@ class LitResidual(pl.LightningModule):
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
-            
-            # Motion magnitude (只用于监控，不加到 loss)
-            mag_pred = v_pred.abs().mean()
-            mag_gt = v_gt.abs().mean()
-            disp_ratio = mag_pred / (mag_gt + 1e-8)
-            
-            # 不加 motion loss，让 velocity MSE 自然优化
-            loss_motion = torch.tensor(0.0, device=self.device)
-            loss_motion_direct = torch.tensor(0.0, device=self.device)
-        else:
-            loss_motion = torch.tensor(0.0, device=self.device)
 
         # 手指正则化损失
         loss_hand = torch.tensor(0.0, device=self.device)
         if self.hand_reg_weight > 0:
-            abnormal_joints = list(range(159, 178))
+            abnormal_joints = list(range(136, 178))  # 所有手部关节
             if J > max(abnormal_joints):
                 pred_hand = pred_norm[:, :, abnormal_joints, :]
                 gt_hand = gt[:, :, abnormal_joints, :]
@@ -289,20 +243,16 @@ class LitResidual(pl.LightningModule):
         loss = (loss_main 
                 + self.vel_weight * loss_vel 
                 + self.acc_weight * loss_acc
-                + self.hand_reg_weight * loss_hand
-                + loss_motion
-                + loss_motion_direct)
+                + self.hand_reg_weight * loss_hand)
 
         if debug:
-            disp_pred_ar = mean_frame_disp(pred_raw_ar)
+            disp_pred = mean_frame_disp(pred_raw)
             disp_gt = mean_frame_disp(gt_raw)
-            disp_ratio_val = disp_pred_ar / (disp_gt + 1e-8)
+            disp_ratio_val = disp_pred / (disp_gt + 1e-8)
             print(f"loss_main: {loss_main.item():.6f}")
             print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
-            print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
-            print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
             print(f"loss_hand: {loss_hand.item():.6f}")
-            print(f"AR disp: {disp_pred_ar:.6f}, gt disp: {disp_gt:.6f}, ratio: {disp_ratio_val:.4f}")
+            print(f"disp: pred={disp_pred:.6f}, gt={disp_gt:.6f}, ratio={disp_ratio_val:.4f}")
             print(f"TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
@@ -312,16 +262,49 @@ class LitResidual(pl.LightningModule):
             "train/vel": loss_vel,
             "train/acc": loss_acc,
             "train/hand": loss_hand,
-            "train/motion": loss_motion,
         }, prog_bar=True)
-
-        self.train_logs["loss"].append(loss.item())
-        self.train_logs["mse"].append(loss_main.item())
-        self.train_logs["vel"].append(loss_vel.item())
-        self.train_logs["acc"].append(loss_acc.item())
 
         self._step_count += 1
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        """验证步骤"""
+        cond_raw = batch["conditions"]
+        gt_btjc = sanitize_btjc(batch["data"])
+        past_btjc = sanitize_btjc(cond_raw["input_pose"])
+        sign_img = cond_raw["sign_image"].float()
+        
+        gt = self.normalize(gt_btjc)
+        past = self.normalize(past_btjc)
+        
+        B, T_future, J, C = gt.shape
+        
+        # Direct 预测
+        pred_norm = self._predict_frames(past, sign_img, T_future)
+        loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
+        
+        # 计算指标
+        pred_raw = self.unnormalize(pred_norm)
+        gt_raw = self.unnormalize(gt)
+        
+        # disp ratio
+        disp_pred = mean_frame_disp(pred_raw)
+        disp_gt = mean_frame_disp(gt_raw)
+        disp_ratio = disp_pred / (disp_gt + 1e-8)
+        
+        # PCK
+        pred_np = pred_raw.cpu().numpy()
+        gt_np = gt_raw.cpu().numpy()
+        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))
+        pck_01 = (per_joint_error < 0.1).mean()
+        
+        self.log_dict({
+            "val/loss": loss_main,
+            "val/disp_ratio": disp_ratio,
+            "val/pck_01": pck_01,
+        }, prog_bar=True, sync_dist=True)
+        
+        return loss_main
 
     @torch.no_grad()
     def predict_direct(self, past_btjc, sign_img, future_len=20, use_autoregressive=True):
@@ -345,12 +328,22 @@ class LitResidual(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        return {"optimizer": optimizer, "gradient_clip_val": 1.0}
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.trainer.max_epochs, eta_min=1e-6
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+            "gradient_clip_val": 1.0,
+        }
 
     def on_train_end(self):
         try:
             import matplotlib.pyplot as plt
-            out_dir = "logs/minimal_residual"
+            out_dir = self.trainer.default_root_dir or "logs/multi_sample"
             os.makedirs(out_dir, exist_ok=True)
 
             fig, ax = plt.subplots(2, 2, figsize=(10, 8))
@@ -364,7 +357,7 @@ class LitResidual(pl.LightningModule):
             ax[1, 1].set_title("acc")
             plt.tight_layout()
             plt.savefig(f"{out_dir}/train_curve.png")
-            print(f"[TRAIN CURVE] saved")
+            print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
         except Exception as e:
             print(f"[TRAIN CURVE] failed: {e}")
 
