@@ -57,7 +57,7 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=False, max_scale=500.0, fix_abnormal_joints=True):
     """
     转换 tensor 到 pose 格式
     
