@@ -176,7 +176,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     # ===== 配置 =====
-    SAMPLE_IDX = 1000 # 使用样本 50
+    SAMPLE_IDX = 500
     MAX_EPOCHS = 1000
     
     print(f"\n配置: 单样本 overfit (sample {SAMPLE_IDX}), epochs={MAX_EPOCHS}")
