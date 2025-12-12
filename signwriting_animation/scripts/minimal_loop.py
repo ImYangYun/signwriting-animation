@@ -319,9 +319,10 @@ if __name__ == "__main__":
     header = ref_pose.header
     
     # GT
+    gt_pose = tensor_to_pose(gt_raw, header, ref_pose, gt_btjc=None, apply_scale=True)
     out_gt = os.path.join(out_dir, "test_gt.pose")
     with open(out_gt, "wb") as f:
-        ref_pose.write(f)
+        gt_pose.write(f)
     print(f"✓ GT: {out_gt}")
     
     # Pred
