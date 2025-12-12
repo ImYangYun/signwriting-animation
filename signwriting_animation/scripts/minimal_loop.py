@@ -57,7 +57,7 @@ def diagnose_model(model, past_norm, sign_img, device):
             print("   ✓ 预测有运动")
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=False, max_scale=500.0, fix_abnormal_joints=True):
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
     """
     转换 tensor 到 pose 格式
     
@@ -69,16 +69,14 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=False, ma
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-    
-    # 获取 GT 用于约束（如果提供）
+
     gt_np = None
     if gt_btjc is not None:
         if gt_btjc.dim() == 4:
             gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
         else:
             gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-    
-    # 修复异常关节
+
     if fix_abnormal_joints:
         T, J, C = t_np.shape
         
@@ -134,24 +132,21 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=False, ma
     ref_arr = np.asarray(ref_pose.body.data[:T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
-    if apply_scale:
+    if apply_scale and gt_np is not None:
         def _var(a):
             center = a.mean(axis=1, keepdims=True)
             return float(((a - center) ** 2).mean())
         
+        var_gt_norm = _var(gt_np)
         var_ref = _var(ref_arr)
-        var_pred = _var(pred_arr)
         
-        print(f"  [scale] var_ref={var_ref:.2f}, var_pred={var_pred:.6f}")
-        
-        if var_pred > 1e-8:
-            scale = np.sqrt((var_ref + 1e-6) / (var_pred + 1e-6))
-            scale = np.clip(scale, 1.0, max_scale)
-            print(f"  [scale] apply scale={scale:.2f}")
+        if var_gt_norm > 1e-8:
+            scale = np.sqrt(var_ref / var_gt_norm)
+            print(f"  [scale] var_ref={var_ref:.2f}, var_gt_norm={var_gt_norm:.6f}")
+            print(f"  [scale] normalized→pixel scale={scale:.2f}")
             pose_obj.body.data *= scale
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    
-    # 平移对齐
+
     ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
     pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
     delta = ref_c - pred_c
@@ -422,7 +417,7 @@ if __name__ == "__main__":
     print(f"✓ GT: {out_gt}")
     
     # 传入 gt_raw 来约束异常关节
-    pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw)
+    pose_pred = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
     out_pred = os.path.join(out_dir, "pred.pose")
     with open(out_pred, "wb") as f:
         pose_pred.write(f)
