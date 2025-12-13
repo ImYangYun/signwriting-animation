@@ -272,20 +272,20 @@ if __name__ == "__main__":
     # ===== 配置 =====
     AUTO_SELECT_SAMPLE = True   # True: 自动筛选好样本, False: 使用 SAMPLE_IDX
     SAMPLE_IDX = 50             # 如果 AUTO_SELECT_SAMPLE=False，使用这个
-    NUM_SAMPLES = 1             # 单样本过拟合！
-    MAX_EPOCHS = 2000           # 增加 epoch
+    NUM_SAMPLES = 100           # 100 样本训练
+    MAX_EPOCHS = 300            # 300 epochs
     DIFFUSION_STEPS = 8         # 师姐用 T=8
-    BATCH_SIZE = 1              # 单样本
+    BATCH_SIZE = 8              # batch size
     
-    # 新参数：让模型学习 x_t
-    VEL_WEIGHT = 5.0            # 高 velocity weight
-    ACC_WEIGHT = 2.0
-    COND_DROP_PROB = 0.2        # 20% 丢弃条件
-    T_ZERO_PROB = 0.3           # 30% 用 t=0 直接重建
+    # 训练参数
+    VEL_WEIGHT = 1.0            # velocity weight (师姐用 1.0)
+    ACC_WEIGHT = 0.5
+    COND_DROP_PROB = 0.1        # 10% 丢弃条件 (CFG)
+    T_ZERO_PROB = 0.0           # 多样本不需要 t=0 trick
     
     print(f"\n配置:")
     print(f"  AUTO_SELECT_SAMPLE: {AUTO_SELECT_SAMPLE}")
-    print(f"  NUM_SAMPLES: {NUM_SAMPLES} (单样本过拟合)")
+    print(f"  NUM_SAMPLES: {NUM_SAMPLES} (多样本训练)")
     print(f"  BATCH_SIZE: {BATCH_SIZE}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
     print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")

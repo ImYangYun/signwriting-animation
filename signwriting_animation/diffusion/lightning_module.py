@@ -128,7 +128,7 @@ class LitDiffusion(pl.LightningModule):
         vel_weight: float = 0.5,
         acc_weight: float = 0.2,
         cond_drop_prob: float = 0.2,  # Condition dropout 概率，强迫模型学习 x_t
-        t_zero_prob: float = 0.3,     # t=0 的概率（直接重建）
+        t_zero_prob: float = 0.3,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -199,6 +199,23 @@ class LitDiffusion(pl.LightningModule):
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img = cond_raw["sign_image"].float()
 
+        gt_mask = None
+        past_mask = None
+        
+        if hasattr(batch["data"], "mask"):
+            gt_mask = batch["data"].mask  # [B, T, J, C] or similar
+        if hasattr(cond_raw["input_pose"], "mask"):
+            past_mask = cond_raw["input_pose"].mask
+        
+        if debug:
+            print(f"\n[MASK DEBUG]")
+            print(f"  gt_mask: {gt_mask.shape if gt_mask is not None else 'None'}")
+            print(f"  past_mask: {past_mask.shape if past_mask is not None else 'None'}")
+            if gt_mask is not None:
+                print(f"  gt_mask sum: {gt_mask.sum().item()}, total: {gt_mask.numel()}")
+            if past_mask is not None:
+                print(f"  past_mask sum: {past_mask.sum().item()}, total: {past_mask.numel()}")
+
         # Normalize
         gt_norm = self.normalize(gt_btjc)
         past_norm = self.normalize(past_btjc)
@@ -233,8 +250,31 @@ class LitDiffusion(pl.LightningModule):
         t_scaled = self.diffusion._scale_timesteps(t)
         pred_x0_bjct = self.model(x_t, t_scaled, past_input, sign_input)
         
-        # 主 Loss：预测的 x0 vs 真实 x0
-        loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
+        # 主 Loss：预测的 x0 vs 真实 x0（使用 mask！）
+        if gt_mask is not None:
+            # gt_mask 可能是 [B,T,J,C] 或 [B,T,J] 或 [B,T]
+            # 需要转换为 BJCT 格式
+            if gt_mask.dim() == 4:
+                mask_bjct = gt_mask.permute(0, 2, 3, 1).float()  # [B,J,C,T]
+            elif gt_mask.dim() == 3:
+                # [B,T,J] -> [B,J,1,T]
+                mask_bjct = gt_mask.permute(0, 2, 1).unsqueeze(2).float()
+            elif gt_mask.dim() == 2:
+                # [B,T] -> [B,1,1,T]
+                mask_bjct = gt_mask.unsqueeze(1).unsqueeze(1).float()
+            else:
+                mask_bjct = None
+            
+            if mask_bjct is not None:
+                # Masked MSE
+                diff_sq = (pred_x0_bjct - gt_bjct) ** 2
+                loss_main = (diff_sq * mask_bjct).sum() / (mask_bjct.sum() + 1e-8)
+                if debug:
+                    print(f"  [MASKED LOSS] mask coverage: {mask_bjct.mean().item():.4f}")
+            else:
+                loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
+        else:
+            loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
         
         # 转回 BTJC 计算辅助 loss
         pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
@@ -262,36 +302,28 @@ class LitDiffusion(pl.LightningModule):
             disp_gt = v_gt.abs().mean()
             ratio = disp_pred / (disp_gt + 1e-8)
             
-            # Log 空间惩罚：静态(ratio→0)惩罚比运动过多更大
-            log_ratio = torch.log(ratio + 0.01)  # +0.01 避免 log(0)
-            loss_disp = log_ratio ** 2
-            
-            # 额外惩罚：如果 disp_pred 太小，直接惩罚
-            # disp_gt ≈ 0.003672，我们希望 disp_pred 至少有这么多
-            loss_disp = loss_disp + 1000.0 * F.relu(disp_gt - disp_pred)
+            # 简单记录 ratio，不作为 loss（多样本训练不需要强制）
+            loss_disp = torch.tensor(0.0, device=device)
         
-        # 权重配置
-        mse_weight = 1.0   # 保持位置准确
-        disp_weight = 100.0  # 强力惩罚静态输出
-        loss = mse_weight * loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc + disp_weight * loss_disp
+        # 权重配置（简化，类似师姐）
+        mse_weight = 1.0
+        disp_weight = 0.0  # 多样本训练不需要 disp loss
+        loss = mse_weight * loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
 
         if debug:
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
             disp_gt = mean_frame_disp(gt_btjc_unnorm)
             t_zero_count = (t == 0).sum().item()
             ratio_val = disp_pred / (disp_gt + 1e-8)
-            log_ratio_val = float(torch.log(torch.tensor(ratio_val + 0.01)))
             print("\n" + "=" * 70)
             print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict x0)")
             print("=" * 70)
             print(f"  t range: [{t.min().item()}, {t.max().item()}], t=0 count: {t_zero_count}/{B}")
-            print(f"  loss weights: mse=1.0, vel={self.vel_weight}, acc={self.acc_weight}, disp=100.0")
+            print(f"  loss weights: mse=1.0, vel={self.vel_weight}, acc={self.acc_weight}")
             print(f"  loss_main (x0): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
-            print(f"  loss_disp: {loss_disp.item():.6f} (log空间惩罚)")
-            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
-            print(f"  disp_ratio: {ratio_val:.4f}, log_ratio: {log_ratio_val:.4f} (目标=0)")
+            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}, ratio: {ratio_val:.4f}")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
