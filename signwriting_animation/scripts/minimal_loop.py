@@ -272,17 +272,25 @@ if __name__ == "__main__":
     # ===== 配置 =====
     AUTO_SELECT_SAMPLE = True   # True: 自动筛选好样本, False: 使用 SAMPLE_IDX
     SAMPLE_IDX = 50             # 如果 AUTO_SELECT_SAMPLE=False，使用这个
-    NUM_SAMPLES = 8             # 训练样本数量（1=单样本overfit, 4-16=多样本）
-    MAX_EPOCHS = 1000
+    NUM_SAMPLES = 1             # 单样本过拟合！
+    MAX_EPOCHS = 2000           # 增加 epoch
     DIFFUSION_STEPS = 8         # 师姐用 T=8
-    BATCH_SIZE = min(4, NUM_SAMPLES)  # batch size
+    BATCH_SIZE = 1              # 单样本
+    
+    # 新参数：让模型学习 x_t
+    VEL_WEIGHT = 5.0            # 高 velocity weight
+    ACC_WEIGHT = 2.0
+    COND_DROP_PROB = 0.2        # 20% 丢弃条件
+    T_ZERO_PROB = 0.3           # 30% 用 t=0 直接重建
     
     print(f"\n配置:")
     print(f"  AUTO_SELECT_SAMPLE: {AUTO_SELECT_SAMPLE}")
-    print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
+    print(f"  NUM_SAMPLES: {NUM_SAMPLES} (单样本过拟合)")
     print(f"  BATCH_SIZE: {BATCH_SIZE}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
     print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")
+    print(f"  VEL_WEIGHT: {VEL_WEIGHT}, ACC_WEIGHT: {ACC_WEIGHT}")
+    print(f"  COND_DROP_PROB: {COND_DROP_PROB}, T_ZERO_PROB: {T_ZERO_PROB}")
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -365,6 +373,8 @@ if __name__ == "__main__":
     num_dims = sample_data.shape[-1]
     print(f"关节数: {num_joints}, 维度: {num_dims}")
 
+    # 创建真正的 Diffusion 模型
+    # 注意：现在用 Epsilon 模式
     model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -372,8 +382,10 @@ if __name__ == "__main__":
         lr=1e-3,
         diffusion_steps=DIFFUSION_STEPS,
         residual_scale=0.1,
-        vel_weight=1.0,   # velocity loss
-        acc_weight=0.5,   # acceleration loss
+        vel_weight=VEL_WEIGHT,
+        acc_weight=ACC_WEIGHT,
+        cond_drop_prob=COND_DROP_PROB,
+        t_zero_prob=T_ZERO_PROB,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

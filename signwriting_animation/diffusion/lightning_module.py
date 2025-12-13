@@ -127,6 +127,8 @@ class LitDiffusion(pl.LightningModule):
         residual_scale: float = 0.1,
         vel_weight: float = 0.5,
         acc_weight: float = 0.2,
+        cond_drop_prob: float = 0.2,  # Condition dropout 概率，强迫模型学习 x_t
+        t_zero_prob: float = 0.3,     # t=0 的概率（直接重建）
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -135,6 +137,8 @@ class LitDiffusion(pl.LightningModule):
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
         self.guidance_scale = guidance_scale
+        self.cond_drop_prob = cond_drop_prob
+        self.t_zero_prob = t_zero_prob
         self._step_count = 0
 
         # 加载统计信息
@@ -207,15 +211,27 @@ class LitDiffusion(pl.LightningModule):
         past_bjct = self.btjc_to_bjct(past_norm)  # [B, J, C, T_past]
 
         # 随机采样 timestep
-        t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
+        # 关键改动：一定概率用 t=0（直接重建），让模型学会保持运动
+        if torch.rand(1).item() < self.t_zero_prob:
+            t = torch.zeros(B, device=device, dtype=torch.long)
+        else:
+            t = torch.randint(1, self.diffusion_steps, (B,), device=device, dtype=torch.long)
         
         # 给 GT 加噪声
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
+        # Condition Dropout: 随机丢弃条件，强迫模型学习 x_t
+        if torch.rand(1).item() < self.cond_drop_prob:
+            past_input = torch.zeros_like(past_bjct)
+            sign_input = torch.zeros_like(sign_img)
+        else:
+            past_input = past_bjct
+            sign_input = sign_img
+        
         # 模型预测 x0
         t_scaled = self.diffusion._scale_timesteps(t)
-        pred_x0_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
+        pred_x0_bjct = self.model(x_t, t_scaled, past_input, sign_input)
         
         # 主 Loss：预测的 x0 vs 真实 x0
         loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
@@ -243,14 +259,17 @@ class LitDiffusion(pl.LightningModule):
         if debug:
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
             disp_gt = mean_frame_disp(gt_btjc_unnorm)
+            t_zero_count = (t == 0).sum().item()
             print("\n" + "=" * 70)
             print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict x0)")
             print("=" * 70)
-            print(f"  t range: [{t.min().item()}, {t.max().item()}]")
+            print(f"  t range: [{t.min().item()}, {t.max().item()}], t=0 count: {t_zero_count}/{B}")
+            print(f"  cond_drop_prob: {self.cond_drop_prob}, t_zero_prob: {self.t_zero_prob}")
             print(f"  loss_main (x0): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
             print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
+            print(f"  disp_ratio: {disp_pred / (disp_gt + 1e-8):.4f}")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 

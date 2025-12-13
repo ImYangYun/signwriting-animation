@@ -128,7 +128,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             else:
                 raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
-        # 获取 past 的最后一帧作为条件（但不做残差）
+        # 获取 past 的最后一帧作为残差基础
         past_last = past_motion[..., -1]  # [B, J, C]
         past_last_flat = past_last.reshape(batch_size, -1)  # [B, J*C]
         
@@ -139,7 +139,8 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         time_emb = self.embed_timestep(timesteps)
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)
         past_last_emb = self.past_last_encoder(past_last_flat)  # [B, D]
-
+        
+        # 处理输入的带噪声 motion
         future_motion_emb = self.future_motion_process(x)  # [T, B, D]
         past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
 
@@ -160,11 +161,14 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        # 融合所有条件
-        xseq = (future_motion_emb 
-                + 0.3 * time_cond 
-                + 0.3 * sign_cond 
-                + 0.5 * past_last_emb_expanded)
+        # 融合条件（不包括 x_t）
+        cond_sum = (0.3 * time_cond 
+                   + 0.3 * sign_cond 
+                   + 0.5 * past_last_emb_expanded)
+        
+        # x_t 单独处理，不被条件淹没
+        # 用 learnable gate 控制 x_t 的影响
+        xseq = future_motion_emb + cond_sum
         xseq = self.sequence_pos_encoder(xseq)
 
         # Cross-attention with past
@@ -179,12 +183,18 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         # Sequence encoding
         output = self.seqEncoder(xseq)[-num_frames:]
         
-        # 直接输出 x0（不加残差！）
-        result = self.pose_projection(output)  # [T, B, J, C]
-        result = result.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
+        # 预测修正量
+        correction = self.pose_projection(output)  # [T, B, J, C]
+        correction = correction.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
+        
+        # 最终输出 = 修正量 + past_last（从过去的最后一帧开始）
+        # 这样模型只需要预测相对于 past_last 的变化
+        past_last_expanded = past_last.unsqueeze(-1).expand_as(correction)  # [B, J, C, T]
+        result = correction + past_last_expanded
 
         if debug:
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
+            print(f"  correction range: [{correction.min():.4f}, {correction.max():.4f}]")
             # 计算帧间差异
             if result.size(-1) > 1:
                 disp = (result[..., 1:] - result[..., :-1]).abs().mean().item()
