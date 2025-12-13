@@ -45,13 +45,6 @@ def mean_frame_disp(x):
     return v.abs().mean().item()
 
 
-def compute_disp_tensor(x_bjct):
-    """计算 displacement (BJCT 格式)"""
-    # [B, J, C, T] -> velocity 在 T 维度
-    vel = x_bjct[:, :, :, 1:] - x_bjct[:, :, :, :-1]
-    return vel.abs().mean()
-
-
 class ConditionalWrapper(nn.Module):
     def __init__(self, model, past, sign):
         super().__init__()
@@ -65,7 +58,7 @@ class ConditionalWrapper(nn.Module):
 
 def main():
     print("=" * 70)
-    print("修复 Diffusion v2：强制 Displacement 匹配")
+    print("修复 Diffusion v3：EPSILON mode")
     print("=" * 70)
     
     pl.seed_everything(42)
@@ -102,23 +95,23 @@ def main():
     past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
     
     gt_disp = mean_frame_disp(gt_raw)
-    gt_disp_tensor = compute_disp_tensor(gt_bjct)
     
     print(f"\n数据:")
     print(f"  GT pixel disp: {gt_disp:.6f}")
-    print(f"  GT norm disp (tensor): {gt_disp_tensor.item():.6f}")
     
-    # 创建 Diffusion
+    # 创建 EPSILON mode Diffusion
     DIFFUSION_STEPS = 8
     betas = cosine_beta_schedule(DIFFUSION_STEPS).numpy()
     
     diffusion = GaussianDiffusion(
         betas=betas,
-        model_mean_type=ModelMeanType.START_X,
+        model_mean_type=ModelMeanType.EPSILON,  # 关键改动！
         model_var_type=ModelVarType.FIXED_SMALL,
         loss_type=LossType.MSE,
         rescale_timesteps=False,
     )
+    
+    print(f"\nDiffusion mode: EPSILON (预测 noise)")
     
     # 创建模型
     model = SignWritingToPoseDiffusionV2(
@@ -130,12 +123,14 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     
-    # ========== 训练（强制 Displacement 匹配）==========
+    # ========== 训练（EPSILON mode）==========
     print("\n" + "=" * 70)
-    print("训练 (3000 步, MSE + Displacement Ratio Loss)")
+    print("训练 (3000 步, EPSILON mode)")
     print("=" * 70)
     
-    DISP_WEIGHT = 100.0  # 大权重！
+    # 存储 diffusion 参数用于手动计算
+    sqrt_alphas_cumprod = torch.tensor(diffusion.sqrt_alphas_cumprod, device=device)
+    sqrt_one_minus_alphas_cumprod = torch.tensor(diffusion.sqrt_one_minus_alphas_cumprod, device=device)
     
     model.train()
     for step in range(3000):
@@ -146,32 +141,32 @@ def main():
         x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
         
         t_scaled = diffusion._scale_timesteps(t)
-        pred_x0 = model(x_t, t_scaled, past_bjct, sign)
+        pred_noise = model(x_t, t_scaled, past_bjct, sign)
         
-        # MSE Loss
-        loss_mse = F.mse_loss(pred_x0, gt_bjct)
-        
-        # Displacement Ratio Loss: |pred_disp - gt_disp|
-        pred_disp = compute_disp_tensor(pred_x0)
-        loss_disp = torch.abs(pred_disp - gt_disp_tensor)
-        
-        # 或者用 relative loss: |pred_disp/gt_disp - 1|
-        # loss_disp = torch.abs(pred_disp / (gt_disp_tensor + 1e-8) - 1.0)
-        
-        # 总 Loss
-        loss = loss_mse + DISP_WEIGHT * loss_disp
+        # EPSILON loss: MSE(pred_noise, noise)
+        loss = F.mse_loss(pred_noise, noise)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         if step % 500 == 0:
+            # 从 pred_noise 计算 pred_x0
+            sqrt_alpha = sqrt_alphas_cumprod[t.item()]
+            sqrt_one_minus_alpha = sqrt_one_minus_alphas_cumprod[t.item()]
+            pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha
+            
             pred_btjc = pred_x0.permute(0, 3, 1, 2)
             pred_unnorm = pred_btjc * std_pose + mean_pose
             disp = mean_frame_disp(pred_unnorm)
             ratio = disp / (gt_disp + 1e-8)
-            print(f"  Step {step}: mse={loss_mse.item():.6f}, disp_loss={loss_disp.item():.6f}, "
-                  f"pred_disp={pred_disp.item():.6f}, ratio={ratio:.4f}, t={t.item()}")
+            
+            # 检查 pred_noise 的统计
+            noise_mean = pred_noise.mean().item()
+            noise_std = pred_noise.std().item()
+            
+            print(f"  Step {step}: loss={loss.item():.6f}, pred_disp={disp:.6f}, ratio={ratio:.4f}, "
+                  f"noise_std={noise_std:.4f}, t={t.item()}")
     
     print(f"\n训练完成!")
     
@@ -192,7 +187,12 @@ def main():
             x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
             
             t_scaled = diffusion._scale_timesteps(t)
-            pred_x0 = model(x_t, t_scaled, past_bjct, sign)
+            pred_noise = model(x_t, t_scaled, past_bjct, sign)
+            
+            # 计算 pred_x0
+            sqrt_alpha = sqrt_alphas_cumprod[t_val]
+            sqrt_one_minus_alpha = sqrt_one_minus_alphas_cumprod[t_val]
+            pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha
             
             pred_btjc = pred_x0.permute(0, 3, 1, 2)
             pred_unnorm = pred_btjc * std_pose + mean_pose
@@ -252,14 +252,14 @@ def main():
     
     if final_ratio > 0.5:
         print(f"\n✅ 成功! disp_ratio={final_ratio:.4f}")
+        print("   EPSILON mode 解决了问题!")
     elif final_ratio > 0.3:
         print(f"\n⚠️ 部分成功: disp_ratio={final_ratio:.4f}")
     else:
         print(f"\n❌ 仍然失败: disp_ratio={final_ratio:.4f}")
-        print("\n可能需要:")
-        print("  1. 更大的 DISP_WEIGHT")
-        print("  2. 换用 relative loss")
-        print("  3. 考虑用 Regression 代替 Diffusion")
+        print("\n建议：")
+        print("  考虑到 deadline，直接用 Regression 方案")
+        print("  Regression 已验证 ratio=1.0")
 
 
 if __name__ == "__main__":
