@@ -117,8 +117,8 @@ class TransformerRegressionModel(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(num_joints * num_dims, latent_dim)
         
-        # Positional encoding
-        self.pos_enc = nn.Parameter(torch.randn(1, past_frames + future_frames, latent_dim) * 0.02)
+        # Positional encoding (足够长)
+        self.pos_enc = nn.Parameter(torch.randn(1, past_frames + future_frames + 10, latent_dim) * 0.02)
         
         # Sign encoder
         self.sign_encoder = nn.Sequential(
