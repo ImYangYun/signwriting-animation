@@ -170,7 +170,7 @@ class LitDiffusion(pl.LightningModule):
         )
 
         self.lr = lr
-        self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": []}
+        self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": [], "disp": []}
 
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
@@ -243,6 +243,7 @@ class LitDiffusion(pl.LightningModule):
         
         loss_vel = torch.tensor(0.0, device=device)
         loss_acc = torch.tensor(0.0, device=device)
+        loss_disp = torch.tensor(0.0, device=device)
         
         if pred_btjc_unnorm.size(1) > 1:
             v_pred = pred_btjc_unnorm[:, 1:] - pred_btjc_unnorm[:, :-1]
@@ -253,8 +254,22 @@ class LitDiffusion(pl.LightningModule):
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
                 loss_acc = F.mse_loss(a_pred, a_gt)
+            
+            # 关键：Displacement Ratio Loss
+            # 惩罚 disp_ratio 偏离 1.0
+            disp_pred = v_pred.abs().mean()
+            disp_gt = v_gt.abs().mean()
+            ratio = disp_pred / (disp_gt + 1e-8)
+            
+            # 双向惩罚：偏离 1.0 + 低于某个值时额外惩罚
+            loss_disp = (ratio - 1.0) ** 2
+            # 使用 ReLU 实现平滑的下限惩罚
+            loss_disp = loss_disp + 10.0 * F.relu(0.5 - ratio)  # ratio < 0.5 时额外惩罚
         
-        loss = loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
+        # 权重配置
+        mse_weight = 1.0   # 保持位置准确
+        disp_weight = 100.0  # 强力惩罚静态输出
+        loss = mse_weight * loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc + disp_weight * loss_disp
 
         if debug:
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
@@ -264,12 +279,13 @@ class LitDiffusion(pl.LightningModule):
             print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict x0)")
             print("=" * 70)
             print(f"  t range: [{t.min().item()}, {t.max().item()}], t=0 count: {t_zero_count}/{B}")
-            print(f"  cond_drop_prob: {self.cond_drop_prob}, t_zero_prob: {self.t_zero_prob}")
+            print(f"  loss weights: mse=1.0, vel={self.vel_weight}, acc={self.acc_weight}, disp=100.0")
             print(f"  loss_main (x0): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
+            print(f"  loss_disp: {loss_disp.item():.6f} (惩罚 ratio 偏离 1.0)")
             print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
-            print(f"  disp_ratio: {disp_pred / (disp_gt + 1e-8):.4f}")
+            print(f"  disp_ratio: {disp_pred / (disp_gt + 1e-8):.4f} (目标=1.0)")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
@@ -278,12 +294,14 @@ class LitDiffusion(pl.LightningModule):
             "train/mse": loss_main,
             "train/vel": loss_vel,
             "train/acc": loss_acc,
+            "train/disp": loss_disp,
         }, prog_bar=True)
 
         self.train_logs["loss"].append(loss.item())
         self.train_logs["mse"].append(loss_main.item())
         self.train_logs["vel"].append(loss_vel.item())
         self.train_logs["acc"].append(loss_acc.item())
+        self.train_logs["disp"].append(loss_disp.item())
 
         self._step_count += 1
         return loss
