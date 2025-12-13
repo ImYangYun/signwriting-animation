@@ -157,17 +157,16 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         # past_last_emb 作为条件
         past_last_emb_expanded = past_last_emb.unsqueeze(0).expand(Tf, -1, -1)  # [Tf, B, D]
 
-        # Condition fusion
+        # Condition fusion - 大幅降低权重，让模型更依赖 x_t
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        # 融合条件（不包括 x_t）
-        cond_sum = (0.3 * time_cond 
-                   + 0.3 * sign_cond 
-                   + 0.5 * past_last_emb_expanded)
+        # 条件权重极低，强迫模型从 x_t 获取信息
+        cond_sum = (0.1 * time_cond 
+                   + 0.1 * sign_cond 
+                   + 0.1 * past_last_emb_expanded)  # 总共 0.3，远小于 x_t 的 1.0
         
-        # x_t 单独处理，不被条件淹没
-        # 用 learnable gate 控制 x_t 的影响
+        # x_t (future_motion_emb) 保持权重 1.0
         xseq = future_motion_emb + cond_sum
         xseq = self.sequence_pos_encoder(xseq)
 
@@ -182,7 +181,6 @@ class SignWritingToPoseDiffusionV2(nn.Module):
 
         # Sequence encoding
         output = self.seqEncoder(xseq)[-num_frames:]
-
         result = self.pose_projection(output)  # [T, B, J, C]
         result = result.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
