@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+"""
+真正的 Diffusion 测试 - T=8 步，cosine schedule，预测 x0
+"""
 import os
 import sys
 import torch
@@ -11,7 +14,8 @@ from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, masked_dtw, mean_frame_disp
+
+from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc, masked_dtw, mean_frame_disp
 
 try:
     from pose_anonymization.data.normalization import unshift_hands
@@ -20,48 +24,8 @@ except ImportError:
     HAS_UNSHIFT = False
 
 
-def diagnose_model(model, past_norm, sign_img, device):
-    """诊断模型对输入的敏感度"""
-    print("\n" + "=" * 70)
-    print("诊断：模型对输入的敏感度")
-    print("=" * 70)
-    
-    model.eval()
-    
-    with torch.no_grad():
-        pred1 = model._predict_frames(past_norm, sign_img, 5)
-        pred2 = model._predict_frames(past_norm, sign_img, 5)
-        diff = (pred1 - pred2).abs().max().item()
-        print(f"1. 相同输入两次预测差异: {diff:.8f}")
-        
-        # 测试2：不同 past
-        past_shifted = past_norm.clone()
-        past_shifted[:, :, :, 0] += 0.1
-        pred_orig = model._predict_frames(past_norm, sign_img, 5)
-        pred_shifted = model._predict_frames(past_shifted, sign_img, 5)
-        diff = (pred_orig - pred_shifted).abs().mean().item()
-        print(f"2. 不同 past 的输出差异: {diff:.6f}")
-        if diff < 1e-6:
-            print("   ❌ 模型忽略了 past!")
-        else:
-            print("   ✓ 模型对 past 敏感")
-        
-        # 测试3：帧间差异
-        pred = model._predict_frames(past_norm, sign_img, 10)
-        disp = mean_frame_disp(pred)
-        print(f"3. 预测帧间 displacement: {disp:.6f}")
-        if disp < 1e-6:
-            print("   ❌ 预测是静态的!")
-        else:
-            print("   ✓ 预测有运动")
-
-
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max_scale=500.0, fix_abnormal_joints=True):
-    """
-    转换 tensor 到 pose 格式
-    
-    新增：gt_btjc - 如果提供，用 GT 来约束异常关节
-    """
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
+    """转换 tensor 到 pose 格式"""
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
@@ -76,43 +40,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, max
         else:
             gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
 
-    if fix_abnormal_joints:
-        T, J, C = t_np.shape
-        
-        # 右手手指关节 (159-177)
-        hand_joints = list(range(153, min(178, J)))
-        
-        for j in hand_joints:
-            # 计算该关节的运动范围
-            pred_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
-            
-            if gt_np is not None:
-                # 使用 GT 的范围作为参考
-                gt_range = gt_np[:, j].max(axis=0) - gt_np[:, j].min(axis=0)
-                gt_mean = gt_np[:, j].mean(axis=0)
-                
-                for c in range(C):
-                    if pred_range[c] > gt_range[c] * 2.0:  # 超过 GT 范围的 2 倍
-                        # 将该关节 clamp 到 GT 范围
-                        max_dev = gt_range[c] * 1.5
-                        t_np[:, j, c] = np.clip(t_np[:, j, c], 
-                                                gt_mean[c] - max_dev, 
-                                                gt_mean[c] + max_dev)
-            else:
-                # 没有 GT 时，用整体范围约束
-                overall_mean = t_np.mean(axis=(0, 1))
-                overall_std = t_np.std(axis=(0, 1))
-                
-                for c in range(C):
-                    if pred_range[c] > overall_std[c] * 6:  # 超过 6 倍标准差
-                        joint_mean = t_np[:, j, c].mean()
-                        max_dev = overall_std[c] * 3
-                        t_np[:, j, c] = np.clip(t_np[:, j, c],
-                                                joint_mean - max_dev,
-                                                joint_mean + max_dev)
-        
-        print(f"  ✓ 异常关节修复完成")
-    
     arr = t_np[:, None, :, :]
     conf = ref_pose.body.confidence[:len(t_np)].copy()
     fps = ref_pose.body.fps
@@ -162,23 +89,26 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/minimal_residual"
+    out_dir = "logs/diffusion_real"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("残差预测模型测试")
+    print("真正的 Diffusion 模型测试")
     print("=" * 70)
-    print("核心思想: output = past_last + scale * delta")
-    print("模型被强制学习'变化量'而不是'绝对位置'")
+    print("参考师姐论文：T=8 步, cosine schedule, 预测 x0")
+    print("训练：对 GT 加噪声 → 模型预测 x0")
+    print("推理：纯噪声 → 8 步去噪 → 干净结果")
     print("=" * 70)
 
     # ===== 配置 =====
-    SAMPLE_IDX = 50      # 用 sample 50，之前效果好
+    SAMPLE_IDX = 50
     MAX_EPOCHS = 1000
+    DIFFUSION_STEPS = 8  # 师姐用 T=8
     
-    print(f"\n配置: 单样本 overfit (sample {SAMPLE_IDX}), epochs={MAX_EPOCHS}")
+    print(f"\n配置: 单样本 overfit (sample {SAMPLE_IDX})")
+    print(f"Diffusion steps: {DIFFUSION_STEPS}")
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -190,27 +120,11 @@ if __name__ == "__main__":
         split="train",
     )
     
-    # 重置随机种子
     import random
     random.seed(12345)
     
-    # 获取单样本
     best_sample = base_ds[SAMPLE_IDX]
     print(f"样本 ID: {best_sample.get('id', 'unknown')}")
-    
-    # 计算样本的 disp
-    data = best_sample["data"]
-    if hasattr(data, 'zero_filled'):
-        data = data.zero_filled()
-    if hasattr(data, 'tensor'):
-        data = data.tensor
-    if isinstance(data, torch.Tensor):
-        data = data.cpu().numpy()
-    if data.ndim == 4:
-        data = data[0]
-    
-    gt_disp_raw = float(np.abs(data[1:] - data[:-1]).mean()) if data.shape[0] > 1 else 0
-    print(f"样本 future disp (raw): {gt_disp_raw:.4f}")
     
     # 单样本 Dataset
     class FixedSampleDataset(torch.utils.data.Dataset):
@@ -240,34 +154,24 @@ if __name__ == "__main__":
     num_dims = sample_data.shape[-1]
     print(f"关节数: {num_joints}, 维度: {num_dims}")
 
-    model = LitResidual(
+    # 创建真正的 Diffusion 模型
+    model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-3,
-        train_mode="direct",  # 用 direct 模式
-        vel_weight=1.0,
-        acc_weight=0.5,
-        residual_scale=0.3,
-        hand_reg_weight=2.0,
+        diffusion_steps=DIFFUSION_STEPS,
+        residual_scale=0.1,
+        vel_weight=0.5,
+        acc_weight=0.2,
     )
 
-    # 训练前诊断
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    
-    batch = next(iter(train_loader))
-    cond = batch["conditions"]
-    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-    sign = cond["sign_image"][:1].float().to(device)
-    past_norm = model.normalize(past_raw)
-    
-    print("\n训练前诊断:")
-    diagnose_model(model, past_norm, sign, device)
 
     # 训练
     print("\n" + "=" * 70)
-    print("开始训练")
+    print("开始 Diffusion 训练")
     print("=" * 70)
     
     trainer = pl.Trainer(
@@ -280,7 +184,11 @@ if __name__ == "__main__":
     
     trainer.fit(model, train_loader)
 
-    # 训练后诊断
+    # Inference
+    print("\n" + "=" * 70)
+    print("DIFFUSION INFERENCE (8 步去噪)")
+    print("=" * 70)
+    
     model = model.to(device)
     model.eval()
     
@@ -289,15 +197,6 @@ if __name__ == "__main__":
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-    past_norm = model.normalize(past_raw)
-    
-    print("\n训练后诊断:")
-    diagnose_model(model, past_norm, sign, device)
-
-    # Inference
-    print("\n" + "=" * 70)
-    print("INFERENCE")
-    print("=" * 70)
     
     future_len = gt_raw.size(1)
     
@@ -307,34 +206,39 @@ if __name__ == "__main__":
         mse_base = torch.mean((baseline - gt_raw) ** 2).item()
         print(f"Baseline MSE: {mse_base:.4f}")
         
-        # 非自回归预测
-        pred_raw_direct = model.predict_direct(past_raw, sign, future_len, use_autoregressive=False)
-        mse_direct = torch.mean((pred_raw_direct - gt_raw) ** 2).item()
-        disp_direct = mean_frame_disp(pred_raw_direct)
-        print(f"\nDirect (non-AR) MSE: {mse_direct:.4f}, disp: {disp_direct:.6f}")
+        # DDPM 采样（8 步）
+        print("\n使用 DDPM 采样 (8 步)...")
+        pred_raw_ddpm = model.sample(past_raw, sign, future_len)
+        mse_ddpm = torch.mean((pred_raw_ddpm - gt_raw) ** 2).item()
+        disp_ddpm = mean_frame_disp(pred_raw_ddpm)
+        print(f"DDPM MSE: {mse_ddpm:.4f}, disp: {disp_ddpm:.6f}")
         
-        # 自回归预测
-        pred_raw_ar = model.predict_direct(past_raw, sign, future_len, use_autoregressive=True)
-        mse_ar = torch.mean((pred_raw_ar - gt_raw) ** 2).item()
-        disp_ar = mean_frame_disp(pred_raw_ar)
-        print(f"Autoregressive MSE: {mse_ar:.4f}, disp: {disp_ar:.6f}")
+        # DDIM 采样（可以更快）
+        print("\n使用 DDIM 采样...")
+        pred_raw_ddim = model.sample_ddim(past_raw, sign, future_len)
+        mse_ddim = torch.mean((pred_raw_ddim - gt_raw) ** 2).item()
+        disp_ddim = mean_frame_disp(pred_raw_ddim)
+        print(f"DDIM MSE: {mse_ddim:.4f}, disp: {disp_ddim:.6f}")
         
         disp_gt = mean_frame_disp(gt_raw)
-        print(f"GT disp: {disp_gt:.6f}")
+        print(f"\nGT disp: {disp_gt:.6f}")
+        
+        # 用 DDPM 结果做评估
+        pred_raw = pred_raw_ddpm
         
         # ===== 完整评估指标 =====
         print("\n" + "=" * 70)
         print("完整评估指标 (normalized 空间)")
         print("=" * 70)
         
-        pred_np = pred_raw_ar[0].cpu().numpy()  # [T, J, C]
+        pred_np = pred_raw[0].cpu().numpy()
         gt_np = gt_raw[0].cpu().numpy()
         T, J, C = pred_np.shape
         
         # Position Errors
         mse = float(((pred_np - gt_np) ** 2).mean())
         mae = float(np.abs(pred_np - gt_np).mean())
-        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))  # [T, J]
+        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))
         mpjpe = float(per_joint_error.mean())
         fde = float(np.sqrt(((pred_np[-1] - gt_np[-1]) ** 2).sum(axis=-1)).mean())
         
@@ -351,7 +255,7 @@ if __name__ == "__main__":
         pred_acc = pred_vel[1:] - pred_vel[:-1]
         gt_acc = gt_vel[1:] - gt_vel[:-1]
         acc_mse = float(((pred_acc - gt_acc) ** 2).mean())
-        disp_ratio = disp_ar / (disp_gt + 1e-8)
+        disp_ratio = disp_ddpm / (disp_gt + 1e-8)
         
         print(f"\n--- Motion Match ---")
         print(f"  disp_ratio: {disp_ratio:.4f} (理想=1.0)")
@@ -375,24 +279,14 @@ if __name__ == "__main__":
         print(f"  range_ratio_max: {ratio.max():.4f}")
         print(f"  abnormal_joints (>3x): {len(abnormal)}")
         
-        if len(abnormal) > 0:
-            print(f"  异常关节: {abnormal[:10].tolist()}")
-        
         # DTW
         mask = torch.ones(1, future_len, device=device)
-        dtw_val = masked_dtw(pred_raw_ar, gt_raw, mask)
+        dtw_val = masked_dtw(pred_raw, gt_raw, mask)
         print(f"\n--- Trajectory ---")
         print(f"  DTW: {dtw_val:.4f}")
         
-        print(f"\n预测范围: [{pred_raw_ar.min():.4f}, {pred_raw_ar.max():.4f}]")
+        print(f"\n预测范围: [{pred_raw.min():.4f}, {pred_raw.max():.4f}]")
         print(f"GT 范围: [{gt_raw.min():.4f}, {gt_raw.max():.4f}]")
-        
-        if disp_ar < 1e-6:
-            print("\n❌ 预测仍然是静态的!")
-        elif disp_ar < disp_gt * 0.1:
-            print("\n⚠️ 预测运动太小")
-        else:
-            print("\n✓ 预测有运动!")
 
     # 保存
     print("\n" + "=" * 70)
@@ -410,24 +304,20 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = ref_pose.header
     
-    # GT - 关键修复：gt_btjc=gt_raw
+    # GT
     gt_pose = tensor_to_pose(gt_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
     out_gt = os.path.join(out_dir, f"gt_{SAMPLE_IDX}.pose")
     with open(out_gt, "wb") as f:
         gt_pose.write(f)
     print(f"\n✓ GT saved: {out_gt}")
-    print(f"  GT pose frames: {gt_pose.body.data.shape[0]}")
-    print(f"  GT pose range: [{gt_pose.body.data.min():.4f}, {gt_pose.body.data.max():.4f}]")
     
     # Pred
-    pred_pose = tensor_to_pose(pred_raw_ar, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    pred_pose = tensor_to_pose(pred_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
     out_pred = os.path.join(out_dir, f"pred_{SAMPLE_IDX}.pose")
     with open(out_pred, "wb") as f:
         pred_pose.write(f)
-    print(f"\n✓ PRED saved: {out_pred}")
-    print(f"  PRED pose frames: {pred_pose.body.data.shape[0]}")
-    print(f"  PRED pose range: [{pred_pose.body.data.min():.4f}, {pred_pose.body.data.max():.4f}]")
+    print(f"✓ PRED saved: {out_pred}")
     
     print("\n" + "=" * 70)
-    print("✓ 完成! 检查 GT 和 PRED 的 frames 和 range 应该相近")
+    print("✓ 完成! Diffusion 版本测试结束")
     print("=" * 70)

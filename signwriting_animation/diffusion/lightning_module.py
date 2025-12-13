@@ -1,7 +1,11 @@
 # pylint: disable=invalid-name,arguments-differ,too-many-locals,too-many-instance-attributes,too-many-arguments,too-many-positional-arguments
+"""
+真正的 Diffusion 版本 - 参考师姐论文 (T=8 步, cosine schedule, 预测 x0)
+"""
 import os
 import torch
 from torch import nn
+import torch.nn.functional as F
 import numpy as np
 import lightning as pl
 
@@ -57,7 +61,6 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     try:
         dtw_metric = PE_DTW()
     except:
-        # 如果 DTW 不可用，返回简单的 MSE 作为替代
         pred = sanitize_btjc(pred_btjc)
         tgt = sanitize_btjc(tgt_btjc)
         t_max = min(pred.size(1), tgt.size(1))
@@ -83,11 +86,25 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     return v.abs().mean().item()
 
 
-class LitResidual(pl.LightningModule):
+def cosine_beta_schedule(timesteps, s=0.008):
     """
-    使用残差预测模型的 Lightning Module
+    Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
+    师姐论文使用的 schedule
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
+
+
+class LitDiffusion(pl.LightningModule):
+    """
+    真正的 Diffusion 版本
     
-    新增：hand_reg_weight - 对手指关节的额外正则化
+    训练：对 GT 加噪声，模型预测 x0
+    推理：从纯噪声开始，多步去噪
     """
 
     def __init__(
@@ -96,53 +113,41 @@ class LitResidual(pl.LightningModule):
         num_dims=3,
         lr=1e-4,
         stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
-        diffusion_steps=200,
-        beta_start=1e-4,
-        beta_end=1e-3,
-        pred_target="x0",
+        diffusion_steps=8,  # 师姐用 T=8
+        pred_target="x0",   # 预测 x0（不是 epsilon）
         guidance_scale=0.0,
-        train_mode: str = "direct",
-        vel_weight: float = 1.0,
-        acc_weight: float = 0.5,
-        residual_scale: float = 0.1, 
-        hand_reg_weight: float = 1.0,
+        residual_scale: float = 0.1,
+        vel_weight: float = 0.5,
+        acc_weight: float = 0.2,
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.hand_reg_weight = hand_reg_weight
-
-        self.right_hand_joints = list(range(157, 178))  # 右手 21 个关节
-        self.left_hand_joints = list(range(136, 157))   # 左手 21 个关节
-
-        assert train_mode in {"diffusion", "direct", "ar"}
-        self.train_mode = train_mode
-        self.vel_weight = float(vel_weight)
-        self.acc_weight = float(acc_weight)
-
+        
+        self.diffusion_steps = diffusion_steps
+        self.vel_weight = vel_weight
+        self.acc_weight = acc_weight
         self._step_count = 0
 
+        # 加载统计信息
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std = stats["std"].float().view(1, 1, -1, 3)
-
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
+        # 模型
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
             residual_scale=residual_scale,
         )
 
-        self.pred_target = pred_target.lower()
-        model_mean_type = (
-            ModelMeanType.EPSILON if self.pred_target == "eps" else ModelMeanType.START_X
-        )
-
-        betas = np.linspace(beta_start, beta_end, diffusion_steps, dtype=np.float64)
+        # Cosine beta schedule (师姐论文)
+        betas = cosine_beta_schedule(diffusion_steps).numpy()
+        
         self.diffusion = GaussianDiffusion(
             betas=betas,
-            model_mean_type=model_mean_type,
+            model_mean_type=ModelMeanType.START_X,  # 预测 x0
             model_var_type=ModelVarType.FIXED_SMALL,
             loss_type=LossType.MSE,
             rescale_timesteps=False,
@@ -166,55 +171,29 @@ class LitResidual(pl.LightningModule):
     def bjct_to_btjc(x):
         return x.permute(0, 3, 1, 2).contiguous()
 
-    def _predict_frames(self, past_norm_btjc, sign_img, num_frames):
+    def _model_forward(self, x_t_btjc, t, past_btjc, sign_img):
         """
-        预测 num_frames 帧
-        
-        残差模型会自动使用 past 的最后一帧作为基准
+        模型前向：输入带噪声的 x_t，预测干净的 x0
         """
-        B, T_past, J, C = past_norm_btjc.shape
-        device = past_norm_btjc.device
-
-        # 创建 dummy x（模型会用残差覆盖）
-        x_btjc = torch.zeros(B, num_frames, J, C, device=device, dtype=past_norm_btjc.dtype)
-        x_bjct = self.btjc_to_bjct(x_btjc)
+        x_t_bjct = self.btjc_to_bjct(x_t_btjc)
+        past_bjct = self.btjc_to_bjct(past_btjc)
         
-        t_long = torch.zeros(B, dtype=torch.long, device=device)
-        t_scaled = getattr(self.diffusion, "_scale_timesteps")(t_long)
-
-        past_bjct = self.btjc_to_bjct(past_norm_btjc)
-        pred_bjct = self.model.forward(x_bjct, t_scaled, past_bjct, sign_img)
+        # t 需要 scale
+        t_scaled = self.diffusion._scale_timesteps(t)
+        
+        pred_bjct = self.model.forward(x_t_bjct, t_scaled, past_bjct, sign_img)
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         
         return pred_btjc
 
-    def _predict_autoregressive(self, past_norm_btjc, sign_img, future_len, chunk_size=5):
-        """
-        自回归预测：每次预测 chunk_size 帧，然后滚动
-        """
-        B, T_past, J, C = past_norm_btjc.shape
-        device = past_norm_btjc.device
-        
-        predictions = []
-        current_history = past_norm_btjc.clone()
-        
-        remaining = future_len
-        while remaining > 0:
-            n = min(chunk_size, remaining)
-            
-            # 预测 n 帧
-            pred_chunk = self._predict_frames(current_history, sign_img, n)
-            predictions.append(pred_chunk.clone())
-            
-            # 更新历史
-            current_history = torch.cat([current_history, pred_chunk], dim=1)
-            current_history = current_history[:, -T_past:]  # 保持历史长度
-            
-            remaining -= n
-        
-        return torch.cat(predictions, dim=1)
-
     def training_step(self, batch, batch_idx):
+        """
+        真正的 Diffusion 训练：
+        1. 随机采样 t
+        2. 给 GT 加噪声得到 x_t
+        3. 模型从 x_t 预测 x0
+        4. Loss = MSE(pred_x0, gt)
+        """
         debug = self._step_count == 0 or self._step_count % 100 == 0
 
         cond_raw = batch["conditions"]
@@ -222,84 +201,59 @@ class LitResidual(pl.LightningModule):
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img = cond_raw["sign_image"].float()
 
-        if debug:
-            print("\n" + "=" * 70)
-            print(f"TRAINING STEP {self._step_count}")
-            print("=" * 70)
+        # Normalize
+        gt_norm = self.normalize(gt_btjc)
+        past_norm = self.normalize(past_btjc)
 
-        gt = self.normalize(gt_btjc)
-        past = self.normalize(past_btjc)
+        B, T_future, J, C = gt_norm.shape
+        device = gt_norm.device
 
-        B, T_future, J, C = gt.shape
-
-        # Direct 模式：直接预测所有帧（用于 MSE loss）
-        pred_norm = self._predict_frames(past, sign_img, T_future)
-        loss_main = torch.nn.functional.mse_loss(pred_norm, gt)
-
-        # AR 模式预测（用于 motion loss）
-        # 暂时禁用 AR motion loss，因为会导致关节爆炸
-        # 改用 Direct 模式的 velocity loss
-        pred_raw_ar = self.unnormalize(pred_norm)  # 用 Direct 的结果
+        # ===== 关键改动：真正的 Diffusion 训练 =====
         
-        pred_raw = self.unnormalize(pred_norm)
-        gt_raw = self.unnormalize(gt)
-
-        # Velocity & acceleration losses
-        loss_vel = torch.tensor(0.0, device=self.device)
-        loss_acc = torch.tensor(0.0, device=self.device)
-        loss_motion = torch.tensor(0.0, device=self.device)
-        loss_motion_direct = torch.tensor(0.0, device=self.device)
-        mag_pred = torch.tensor(0.0, device=self.device)
-        mag_gt = torch.tensor(0.0, device=self.device)
-
-        if pred_raw_ar.size(1) > 1:
-            v_pred = pred_raw_ar[:, 1:] - pred_raw_ar[:, :-1]
+        # 1. 随机采样 timestep t ∈ [0, T)
+        t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
+        
+        # 2. 给 GT 加噪声
+        noise = torch.randn_like(gt_norm)
+        x_t = self.diffusion.q_sample(gt_norm, t, noise=noise)
+        
+        # 3. 模型预测 x0
+        pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
+        
+        # 4. 主 Loss：预测 x0
+        loss_main = F.mse_loss(pred_x0, gt_norm)
+        
+        # ===== 辅助 Loss =====
+        pred_raw = self.unnormalize(pred_x0)
+        gt_raw = self.unnormalize(gt_norm)
+        
+        loss_vel = torch.tensor(0.0, device=device)
+        loss_acc = torch.tensor(0.0, device=device)
+        
+        if pred_raw.size(1) > 1:
+            v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
             v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
-            loss_vel = torch.nn.functional.mse_loss(v_pred, v_gt)
+            loss_vel = F.mse_loss(v_pred, v_gt)
             
             if v_pred.size(1) > 1:
                 a_pred = v_pred[:, 1:] - v_pred[:, :-1]
                 a_gt = v_gt[:, 1:] - v_gt[:, :-1]
-                loss_acc = torch.nn.functional.mse_loss(a_pred, a_gt)
-            
-            # Motion magnitude (只用于监控，不加到 loss)
-            mag_pred = v_pred.abs().mean()
-            mag_gt = v_gt.abs().mean()
-            disp_ratio = mag_pred / (mag_gt + 1e-8)
-            
-            # 不加 motion loss，让 velocity MSE 自然优化
-            loss_motion = torch.tensor(0.0, device=self.device)
-            loss_motion_direct = torch.tensor(0.0, device=self.device)
-        else:
-            loss_motion = torch.tensor(0.0, device=self.device)
-
-        # 手指正则化损失
-        loss_hand = torch.tensor(0.0, device=self.device)
-        if self.hand_reg_weight > 0:
-            abnormal_joints = list(range(159, 178))
-            if J > max(abnormal_joints):
-                pred_hand = pred_norm[:, :, abnormal_joints, :]
-                gt_hand = gt[:, :, abnormal_joints, :]
-                loss_hand = torch.nn.functional.mse_loss(pred_hand, gt_hand)
-
-        loss = (loss_main 
-                + self.vel_weight * loss_vel 
-                + self.acc_weight * loss_acc
-                + self.hand_reg_weight * loss_hand
-                + loss_motion
-                + loss_motion_direct)
+                loss_acc = F.mse_loss(a_pred, a_gt)
+        
+        loss = loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
 
         if debug:
-            disp_pred_ar = mean_frame_disp(pred_raw_ar)
+            disp_pred = mean_frame_disp(pred_raw)
             disp_gt = mean_frame_disp(gt_raw)
-            disp_ratio_val = disp_pred_ar / (disp_gt + 1e-8)
-            print(f"loss_main: {loss_main.item():.6f}")
-            print(f"loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
-            print(f"loss_motion: {loss_motion.item():.6f}, loss_motion_direct: {loss_motion_direct.item():.6f}")
-            print(f"  (mag_pred={mag_pred.item():.6f}, mag_gt={mag_gt.item():.6f})")
-            print(f"loss_hand: {loss_hand.item():.6f}")
-            print(f"AR disp: {disp_pred_ar:.6f}, gt disp: {disp_gt:.6f}, ratio: {disp_ratio_val:.4f}")
-            print(f"TOTAL: {loss.item():.6f}")
+            print("\n" + "=" * 70)
+            print(f"DIFFUSION TRAINING STEP {self._step_count}")
+            print("=" * 70)
+            print(f"  t range: [{t.min().item()}, {t.max().item()}]")
+            print(f"  loss_main: {loss_main.item():.6f}")
+            print(f"  loss_vel: {loss_vel.item():.6f}")
+            print(f"  loss_acc: {loss_acc.item():.6f}")
+            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
+            print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
         self.log_dict({
@@ -307,8 +261,6 @@ class LitResidual(pl.LightningModule):
             "train/mse": loss_main,
             "train/vel": loss_vel,
             "train/acc": loss_acc,
-            "train/hand": loss_hand,
-            "train/motion": loss_motion,
         }, prog_bar=True)
 
         self.train_logs["loss"].append(loss.item())
@@ -320,20 +272,96 @@ class LitResidual(pl.LightningModule):
         return loss
 
     @torch.no_grad()
-    def predict_direct(self, past_btjc, sign_img, future_len=20, use_autoregressive=True):
-        """推理"""
+    def sample(self, past_btjc, sign_img, future_len=20):
+        """
+        真正的 Diffusion 采样：从纯噪声开始，T 步去噪
+        """
         self.eval()
         device = self.device
 
         past_raw = sanitize_btjc(past_btjc.to(device))
         past_norm = self.normalize(past_raw)
 
-        if use_autoregressive:
-            pred_norm = self._predict_autoregressive(past_norm, sign_img.to(device), future_len)
-        else:
-            pred_norm = self._predict_frames(past_norm, sign_img.to(device), future_len)
+        B, _, J, C = past_norm.shape
 
-        return self.unnormalize(pred_norm)
+        # 从纯噪声开始
+        x_t = torch.randn(B, future_len, J, C, device=device)
+
+        # T 步去噪（从 T-1 到 0）
+        for i in reversed(range(self.diffusion_steps)):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+            
+            # 模型预测 x0
+            pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
+            
+            # 用 diffusion 的 p_sample 去噪一步
+            # 这里我们手动实现简化版本
+            if i > 0:
+                # 计算 x_{t-1}
+                alpha_bar_t = self.diffusion.alphas_cumprod[i]
+                alpha_bar_t_prev = self.diffusion.alphas_cumprod[i - 1]
+                
+                # 简化的 DDPM 采样
+                beta_t = 1 - alpha_bar_t / alpha_bar_t_prev
+                
+                # x_{t-1} = sqrt(alpha_bar_{t-1}) * pred_x0 + sqrt(1 - alpha_bar_{t-1}) * noise
+                noise = torch.randn_like(x_t) if i > 1 else torch.zeros_like(x_t)
+                x_t = (
+                    torch.sqrt(torch.tensor(alpha_bar_t_prev, device=device)) * pred_x0
+                    + torch.sqrt(torch.tensor(1 - alpha_bar_t_prev, device=device)) * noise
+                )
+            else:
+                # 最后一步直接用 pred_x0
+                x_t = pred_x0
+
+        return self.unnormalize(x_t)
+
+    @torch.no_grad()
+    def sample_ddim(self, past_btjc, sign_img, future_len=20, ddim_steps=None):
+        """
+        DDIM 采样（更快，可以用更少的步数）
+        """
+        self.eval()
+        device = self.device
+
+        past_raw = sanitize_btjc(past_btjc.to(device))
+        past_norm = self.normalize(past_raw)
+
+        B, _, J, C = past_norm.shape
+
+        # DDIM 可以用更少的步数
+        if ddim_steps is None:
+            ddim_steps = self.diffusion_steps
+        
+        # 创建采样时间步（均匀分布）
+        step_size = self.diffusion_steps // ddim_steps
+        timesteps = list(range(0, self.diffusion_steps, step_size))[::-1]
+
+        # 从纯噪声开始
+        x_t = torch.randn(B, future_len, J, C, device=device)
+
+        for i, t_cur in enumerate(timesteps):
+            t = torch.full((B,), t_cur, device=device, dtype=torch.long)
+            
+            # 模型预测 x0
+            pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
+            
+            if i < len(timesteps) - 1:
+                t_next = timesteps[i + 1]
+                alpha_bar_t = self.diffusion.alphas_cumprod[t_cur]
+                alpha_bar_t_next = self.diffusion.alphas_cumprod[t_next]
+                
+                # DDIM 确定性采样
+                x_t = (
+                    torch.sqrt(torch.tensor(alpha_bar_t_next, device=device)) * pred_x0
+                    + torch.sqrt(torch.tensor(1 - alpha_bar_t_next, device=device)) 
+                    * (x_t - torch.sqrt(torch.tensor(alpha_bar_t, device=device)) * pred_x0)
+                    / torch.sqrt(torch.tensor(1 - alpha_bar_t, device=device))
+                )
+            else:
+                x_t = pred_x0
+
+        return self.unnormalize(x_t)
 
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
@@ -346,7 +374,7 @@ class LitResidual(pl.LightningModule):
     def on_train_end(self):
         try:
             import matplotlib.pyplot as plt
-            out_dir = "logs/minimal_residual"
+            out_dir = "logs/diffusion_real"
             os.makedirs(out_dir, exist_ok=True)
 
             fig, ax = plt.subplots(2, 2, figsize=(10, 8))
@@ -365,5 +393,5 @@ class LitResidual(pl.LightningModule):
             print(f"[TRAIN CURVE] failed: {e}")
 
 
-# Alias
-LitMinimal = LitResidual
+# 保留原来的别名
+LitMinimal = LitDiffusion
