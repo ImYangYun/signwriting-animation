@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-4-Sample Overfit 测试（真实数据 + MeanPool + Diffusion）
-
-参考 AmitMY 的建议：
-"train on like 4 examples from the dataset (the loss will go down fast), 
-and then take these samples, and run the inference loop"
-
-测试目的：
-- 验证 Diffusion 架构和流程是否正确
-- 如果 4 样本能 overfit，说明问题只是数据量
-
-配置：
-- NUM_SAMPLES = 4
-- USE_MEAN_POOL = True（参考师姐）
-- COND_DROP_PROB = 0.0（overfit 不用 dropout）
-"""
 import os
 import sys
 import torch
@@ -28,7 +12,7 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 
-from lightning_module import LitDiffusion, sanitize_btjc, masked_dtw, mean_frame_disp
+from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc, masked_dtw, mean_frame_disp
 
 try:
     from pose_anonymization.data.normalization import unshift_hands
