@@ -95,9 +95,10 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("真正的 Diffusion 模型测试")
+    print("真正的 Diffusion 模型测试 (无残差版本)")
     print("=" * 70)
     print("参考师姐论文：T=8 步, cosine schedule, 预测 x0")
+    print("关键改动：去掉残差，让模型直接预测 x0")
     print("训练：对 GT 加噪声 → 模型预测 x0")
     print("推理：纯噪声 → 8 步去噪 → 干净结果")
     print("=" * 70)

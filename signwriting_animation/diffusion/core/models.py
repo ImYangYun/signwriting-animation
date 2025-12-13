@@ -7,12 +7,10 @@ from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionPro
 
 class SignWritingToPoseDiffusionV2(nn.Module):
     """
-    强制使用 past_motion 的改进版模型
+    Diffusion 版本 - 直接预测 x0（不用残差）
     
-    关键改动：
-    1. 残差预测：output = past_last + predicted_delta
-    2. past_motion 直接 concat 到输入
-    3. 更强的 cross-attention
+    关键改动：去掉残差，让模型直接预测绝对位置
+    这样 diffusion 采样才能正常工作
     """
     
     def __init__(self,
@@ -27,14 +25,14 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                  activation: str = "gelu",
                  arch: str = "trans_enc",
                  cond_mask_prob: float = 0,
-                 residual_scale: float = 0.1):  # 残差预测的缩放
+                 residual_scale: float = 0.1):
         super().__init__()
         self.verbose = False
         self.cond_mask_prob = cond_mask_prob
         self._forward_count = 0
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
-        self.residual_scale = residual_scale
+        self.use_residual = False
 
         input_feats = num_keypoints * num_dims_per_keypoint
         
@@ -58,7 +56,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             activation=activation
         )
 
-        # 改进1：更强的 cross-attention（多层）
+        # Cross-attention layers
         self.cross_attn_layers = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=num_latent_dims,
@@ -66,14 +64,13 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 dropout=0.1,
                 batch_first=False
             )
-            for _ in range(3)  # 3层 cross-attention
+            for _ in range(3)
         ])
         self.cross_lns = nn.ModuleList([
             nn.LayerNorm(num_latent_dims)
             for _ in range(3)
         ])
 
-        # 改进2：past_last 的显式编码
         self.past_last_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
             nn.LayerNorm(num_latent_dims),
@@ -81,7 +78,6 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             nn.Linear(num_latent_dims, num_latent_dims),
         )
 
-        # Output projection
         self.pose_projection = OutputProcessMLP(
             num_latent_dims, num_keypoints, num_dims_per_keypoint
         )
@@ -100,15 +96,24 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
         """
-        残差预测模式：output = past_last + scale * delta
+        直接预测 x0（不用残差）
+        
+        输入：
+            x: 带噪声的 motion [B, J, C, T]
+            timesteps: diffusion timestep
+            past_motion: 历史帧 [B, J, C, T_past]
+            signwriting_im_batch: 条件图像
+            
+        输出：
+            预测的干净 x0 [B, J, C, T]
         """
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
         
         debug = (self._forward_count == 0) or (self._forward_count % 100 == 0)
         
         if debug:
-            print(f"\n[FORWARD #{self._forward_count}]")
-            print(f"  x: {x.shape}")
+            print(f"\n[FORWARD #{self._forward_count}] (No Residual Mode)")
+            print(f"  x: {x.shape}, range=[{x.min():.2f}, {x.max():.2f}]")
             print(f"  past_motion: {past_motion.shape}")
 
         # Format check
@@ -120,20 +125,19 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             else:
                 raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
-        # 获取 past 的最后一帧 [B, J, C]
         past_last = past_motion[..., -1]  # [B, J, C]
         past_last_flat = past_last.reshape(batch_size, -1)  # [B, J*C]
         
         if debug:
-            print(f"  past_last: {past_last.shape}, mean={past_last.mean().item():.4f}")
+            print(f"  past_last mean: {past_last.mean().item():.4f}")
 
         # Embeddings
         time_emb = self.embed_timestep(timesteps)
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)
         past_last_emb = self.past_last_encoder(past_last_flat)  # [B, D]
-        
+
+        future_motion_emb = self.future_motion_process(x)  # [T, B, D]
         past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
-        future_motion_emb = self.future_motion_process(x)  # [T_future, B, D]
 
         Tf = future_motion_emb.size(0)
         B = future_motion_emb.size(1)
@@ -145,21 +149,21 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
-        # 改进：past_last_emb 加到每一帧
+        # past_last_emb 作为条件
         past_last_emb_expanded = past_last_emb.unsqueeze(0).expand(Tf, -1, -1)  # [Tf, B, D]
 
         # Condition fusion
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        # 融合所有条件 + past_last
+        # 融合所有条件
         xseq = (future_motion_emb 
                 + 0.3 * time_cond 
                 + 0.3 * sign_cond 
-                + 0.5 * past_last_emb_expanded)  # 强化 past_last 的影响
+                + 0.5 * past_last_emb_expanded)
         xseq = self.sequence_pos_encoder(xseq)
 
-        # 多层 cross-attention with past
+        # Cross-attention with past
         for cross_attn, cross_ln in zip(self.cross_attn_layers, self.cross_lns):
             attn_out, _ = cross_attn(
                 query=xseq,
@@ -171,16 +175,15 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         # Sequence encoding
         output = self.seqEncoder(xseq)[-num_frames:]
         
-        # Project to pose delta
-        delta = self.pose_projection(output)  # [T, B, J, C]
-        delta = delta.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
-
-        past_last_expanded = past_last.unsqueeze(-1).expand(-1, -1, -1, num_frames)  # [B, J, C, T]
-        result = past_last_expanded + self.residual_scale * delta
+        # 直接输出 x0（不加残差！）
+        result = self.pose_projection(output)  # [T, B, J, C]
+        result = result.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
         if debug:
-            print(f"  delta range: [{delta.min():.4f}, {delta.max():.4f}]")
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
+            if result.size(-1) > 1:
+                disp = (result[..., 1:] - result[..., :-1]).abs().mean().item()
+                print(f"  result disp: {disp:.6f}")
 
         self._forward_count += 1
         return result
