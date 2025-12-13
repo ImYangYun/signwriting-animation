@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+"""快速 overfit 验证 - 验证 GT 保存是否正确"""
 import os
 import torch
 import numpy as np
@@ -11,10 +12,10 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, masked_dtw, mean_frame_disp
+from signwriting_animation.diffusion.lightning_module import LitResidual, sanitize_btjc, mean_frame_disp
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, fix_abnormal_joints=True):
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     """转换 tensor 到 pose 格式"""
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -29,22 +30,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True, fix
             gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
         else:
             gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-    
-    if fix_abnormal_joints and gt_np is not None:
-        T, J, C = t_np.shape
-        hand_joints = list(range(136, min(178, J)))
-        
-        for j in hand_joints:
-            pred_range = t_np[:, j].max(axis=0) - t_np[:, j].min(axis=0)
-            gt_range = gt_np[:, j].max(axis=0) - gt_np[:, j].min(axis=0)
-            gt_mean = gt_np[:, j].mean(axis=0)
-            
-            for c in range(C):
-                if pred_range[c] > gt_range[c] * 2.0:
-                    max_dev = gt_range[c] * 1.5
-                    t_np[:, j, c] = np.clip(t_np[:, j, c], 
-                                            gt_mean[c] - max_dev, 
-                                            gt_mean[c] + max_dev)
     
     arr = t_np[:, None, :, :]
     conf = ref_pose.body.confidence[:len(t_np)].copy()
@@ -86,25 +71,19 @@ if __name__ == "__main__":
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    out_dir = "logs/multi_sample"
+    out_dir = "logs/overfit_gt_test"
     os.makedirs(out_dir, exist_ok=True)
 
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("多样本训练 (带 Validation)")
+    print("快速 Overfit 验证 - 验证 GT 保存")
     print("=" * 70)
 
-    NUM_TRAIN = 2000
-    NUM_VAL = 500
-    BATCH_SIZE = 8
-    MAX_EPOCHS = 200
-    
-    print(f"\n配置:")
-    print(f"  训练样本: 0 ~ {NUM_TRAIN-1}")
-    print(f"  验证样本: {NUM_TRAIN} ~ {NUM_TRAIN + NUM_VAL - 1}")
-    print(f"  Batch size: {BATCH_SIZE}")
-    print(f"  Epochs: {MAX_EPOCHS}")
+    # 单样本 overfit
+    SAMPLE_IDX = 50
+    BATCH_SIZE = 1
+    MAX_EPOCHS = 1000
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -116,36 +95,16 @@ if __name__ == "__main__":
         split="train",
     )
     
-    print(f"数据集总样本数: {len(base_ds)}")
-    
-    # 训练集
-    train_indices = list(range(NUM_TRAIN))
-    train_ds = Subset(base_ds, train_indices)
-    
+    # 单样本
+    train_ds = Subset(base_ds, [SAMPLE_IDX])
     train_loader = DataLoader(
         train_ds, 
         batch_size=BATCH_SIZE, 
-        shuffle=True, 
+        shuffle=False, 
         collate_fn=zero_pad_collator,
-        num_workers=4,
+        num_workers=0,
         pin_memory=False,
     )
-    
-    # 验证集
-    val_indices = list(range(NUM_TRAIN, NUM_TRAIN + NUM_VAL))
-    val_ds = Subset(base_ds, val_indices)
-    
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        collate_fn=zero_pad_collator,
-        num_workers=4,
-        pin_memory=False,
-    )
-    
-    print(f"训练集大小: {len(train_ds)}, 每 epoch {len(train_loader)} 个 batch")
-    print(f"验证集大小: {len(val_ds)}, 每次 {len(val_loader)} 个 batch")
     
     # 获取维度信息
     sample_data = base_ds[0]["data"]
@@ -157,13 +116,15 @@ if __name__ == "__main__":
     num_joints = sample_data.shape[-2]
     num_dims = sample_data.shape[-1]
     print(f"关节数: {num_joints}, 维度: {num_dims}")
+    print(f"训练样本: {SAMPLE_IDX}")
+    print(f"Epochs: {MAX_EPOCHS}")
 
     # 模型
     model = LitResidual(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=1e-4,
+        lr=1e-3,  # overfit 用大学习率
         train_mode="ar",
         vel_weight=1.0,
         acc_weight=0.5,
@@ -171,131 +132,28 @@ if __name__ == "__main__":
         hand_reg_weight=2.0,
     )
 
-    # Callbacks
-    from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-    
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=out_dir,
-        filename="best-{epoch:02d}-{val/loss:.4f}",
-        monitor="val/loss",
-        mode="min",
-        save_top_k=3,
-        save_last=True,
-    )
-    
-    early_stop_callback = EarlyStopping(
-        monitor="val/loss",
-        #patience=20,
-        mode="min",
-    )
-
     # 训练
-    print("\n" + "=" * 70)
-    print("开始训练")
-    print("=" * 70)
-    
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         default_root_dir=out_dir,
-        callbacks=[checkpoint_callback],
-        log_every_n_steps=50,
-        check_val_every_n_epoch=1,
+        log_every_n_steps=1,
+        enable_checkpointing=False,
     )
     
-    # 训练，传入 train_loader 和 val_loader
-    trainer.fit(model, train_loader, val_loader)
-    
-    print(f"\n✓ 最佳模型: {checkpoint_callback.best_model_path}")
+    trainer.fit(model, train_loader)
 
-    # ===== 测试最佳模型 =====
-    print("\n" + "=" * 70)
-    print("加载最佳模型进行测试")
-    print("=" * 70)
-    
-    # 加载最佳模型
-    best_model = LitResidual.load_from_checkpoint(checkpoint_callback.best_model_path)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    best_model = best_model.to(device)
-    best_model.eval()
-    
-    # 多样本测试
-    test_indices = [50, 100, 200, 300, 400, 550, 650, 750, 850, 950]
-    results = []
-    
-    print("\n泛化测试:")
-    print("-" * 60)
-    
-    for idx in test_indices:
-        if idx >= len(base_ds):
-            continue
-            
-        sample = base_ds[idx]
-        batch = zero_pad_collator([sample])
-        
-        cond = batch["conditions"]
-        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign = cond["sign_image"][:1].float().to(device)
-        gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-        
-        future_len = gt_raw.size(1)
-        
-        with torch.no_grad():
-            pred_raw = best_model.predict_direct(past_raw, sign, future_len, use_autoregressive=True)
-            
-            mse = torch.mean((pred_raw - gt_raw) ** 2).item()
-            disp_pred = mean_frame_disp(pred_raw)
-            disp_gt = mean_frame_disp(gt_raw)
-            ratio = disp_pred / (disp_gt + 1e-8)
-            
-            # DTW
-            mask = torch.ones(1, future_len, device=device)
-            dtw = masked_dtw(pred_raw, gt_raw, mask).item()
-            
-            pred_np = pred_raw[0].cpu().numpy()
-            gt_np = gt_raw[0].cpu().numpy()
-            per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))
-            pck = (per_joint_error < 0.1).mean()
-            
-            in_train = idx < NUM_TRAIN
-            results.append({
-                'idx': idx,
-                'mse': mse,
-                'pck': pck,
-                'ratio': ratio,
-                'dtw': dtw,
-                'in_train': in_train
-            })
-            
-            status = "训练" if in_train else "测试"
-            print(f"  Sample {idx:4d} ({status}): MSE={mse:.4f}, PCK@0.1={pck:.2%}, DTW={dtw:.4f}, disp_ratio={ratio:.2f}")
-    
-    # 汇总
-    print("-" * 60)
-    train_results = [r for r in results if r['in_train']]
-    test_results = [r for r in results if not r['in_train']]
-    
-    if train_results:
-        avg_pck_train = np.mean([r['pck'] for r in train_results])
-        avg_ratio_train = np.mean([r['ratio'] for r in train_results])
-        avg_dtw_train = np.mean([r['dtw'] for r in train_results])
-        print(f"训练集: 平均 PCK@0.1={avg_pck_train:.2%}, DTW={avg_dtw_train:.4f}, disp_ratio={avg_ratio_train:.2f}")
-    
-    if test_results:
-        avg_pck_test = np.mean([r['pck'] for r in test_results])
-        avg_ratio_test = np.mean([r['ratio'] for r in test_results])
-        avg_dtw_test = np.mean([r['dtw'] for r in test_results])
-        print(f"测试集: 平均 PCK@0.1={avg_pck_test:.2%}, DTW={avg_dtw_test:.4f}, disp_ratio={avg_ratio_test:.2f}")
-
-    # ===== 保存可视化样本 =====
+    # ===== 测试并保存 =====
     print("\n" + "=" * 70)
     print("保存可视化样本")
     print("=" * 70)
     
-    # 选一个测试集样本
-    vis_idx = 550
-    sample = base_ds[vis_idx]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+    
+    sample = base_ds[SAMPLE_IDX]
     batch = zero_pad_collator([sample])
     
     cond = batch["conditions"]
@@ -303,11 +161,25 @@ if __name__ == "__main__":
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
     
+    print(f"gt_raw shape: {gt_raw.shape}")
+    print(f"gt_raw range: [{gt_raw.min().item():.4f}, {gt_raw.max().item():.4f}]")
+    
     with torch.no_grad():
-        pred_raw = best_model.predict_direct(past_raw, sign, gt_raw.size(1), use_autoregressive=True)
+        pred_raw = model.predict_direct(past_raw, sign, gt_raw.size(1), use_autoregressive=True)
+    
+    print(f"pred_raw shape: {pred_raw.shape}")
+    print(f"pred_raw range: [{pred_raw.min().item():.4f}, {pred_raw.max().item():.4f}]")
+    
+    # 计算指标
+    mse = torch.mean((pred_raw - gt_raw) ** 2).item()
+    disp_pred = mean_frame_disp(pred_raw)
+    disp_gt = mean_frame_disp(gt_raw)
+    ratio = disp_pred / (disp_gt + 1e-8)
+    print(f"\nMSE: {mse:.6f}")
+    print(f"disp_ratio: {ratio:.4f}")
     
     # 获取参考 pose
-    ref_path = base_ds.records[vis_idx]["pose"]
+    ref_path = base_ds.records[SAMPLE_IDX]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
     
@@ -318,20 +190,27 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = ref_pose.header
     
-    # GT
-    gt_pose = tensor_to_pose(gt_raw, header, ref_pose, gt_btjc=None, apply_scale=True)
-    out_gt = os.path.join(out_dir, "test_gt.pose")
+    print(f"\nref_pose frames: {ref_pose.body.data.shape[0]}")
+    print(f"ref_pose range: [{ref_pose.body.data.min():.4f}, {ref_pose.body.data.max():.4f}]")
+    
+    # GT - 关键修复：gt_btjc=gt_raw
+    gt_pose = tensor_to_pose(gt_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    out_gt = os.path.join(out_dir, f"gt_{SAMPLE_IDX}.pose")
     with open(out_gt, "wb") as f:
         gt_pose.write(f)
-    print(f"✓ GT: {out_gt}")
+    print(f"\n✓ GT saved: {out_gt}")
+    print(f"  GT pose frames: {gt_pose.body.data.shape[0]}")
+    print(f"  GT pose range: [{gt_pose.body.data.min():.4f}, {gt_pose.body.data.max():.4f}]")
     
     # Pred
-    pose_pred = tensor_to_pose(pred_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-    out_pred = os.path.join(out_dir, "test_pred.pose")
+    pred_pose = tensor_to_pose(pred_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    out_pred = os.path.join(out_dir, f"pred_{SAMPLE_IDX}.pose")
     with open(out_pred, "wb") as f:
-        pose_pred.write(f)
-    print(f"✓ PRED: {out_pred}")
+        pred_pose.write(f)
+    print(f"\n✓ PRED saved: {out_pred}")
+    print(f"  PRED pose frames: {pred_pose.body.data.shape[0]}")
+    print(f"  PRED pose range: [{pred_pose.body.data.min():.4f}, {pred_pose.body.data.max():.4f}]")
     
     print("\n" + "=" * 70)
-    print("✓ 训练完成!")
+    print("✓ 完成! 检查 GT 和 PRED 的 frames 和 range 应该相近")
     print("=" * 70)
