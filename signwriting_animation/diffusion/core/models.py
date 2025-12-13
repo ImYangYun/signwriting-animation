@@ -5,12 +5,47 @@ from transformers import CLIPModel
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess, seq_encoder_factory
 
 
+class ContextEncoder(nn.Module):
+    def __init__(self, input_feats: int, latent_dim: int, num_layers: int = 2, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.pose_encoder = nn.Linear(input_feats, latent_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=num_heads,
+            dim_feedforward=latent_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [T, B, J*C] (seq_first) 或 [B, T, J, C]
+        returns: [1, B, D] (mean pooled, seq_first format)
+        """
+        if x.dim() == 3:
+            # [T, B, D] -> [B, T, D]
+            x = x.permute(1, 0, 2)
+        elif x.dim() == 4:
+            # [B, T, J, C] -> [B, T, J*C]
+            B, T, J, C = x.shape
+            x = x.reshape(B, T, J * C)
+        
+        x_emb = self.pose_encoder(x)      # [B, T, D]
+        x_enc = self.encoder(x_emb)       # [B, T, D]
+        context = x_enc.mean(dim=1)       # Mean pooling: [B, D]
+        return context.unsqueeze(0)       # [1, B, D] (seq_first format)
+
+
 class SignWritingToPoseDiffusionV2(nn.Module):
     """
     Diffusion 版本 - 直接预测 x0（不用残差）
     
-    关键改动：去掉残差，让模型直接预测绝对位置
-    这样 diffusion 采样才能正常工作
+    支持两种条件注入模式：
+    - Concat 模式: [time(1), sign(1), past(40), x_t(20)] = 62 tokens
+    - MeanPool 模式: [time(1), sign_ctx(1), past_ctx(1), x_t(20)] = 23 tokens (参考师姐)
     """
     
     def __init__(self,
@@ -25,15 +60,16 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                  activation: str = "gelu",
                  arch: str = "trans_enc",
                  cond_mask_prob: float = 0,
-                 residual_scale: float = 0.1):  # 保留参数但不使用
+                 residual_scale: float = 0.1,
+                 use_mean_pool: bool = False):
         super().__init__()
         self.verbose = False
         self.cond_mask_prob = cond_mask_prob
         self._forward_count = 0
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
-        # 不再使用 residual_scale
-        self.use_residual = False  # 关闭残差
+        self.use_residual = False
+        self.use_mean_pool = use_mean_pool
 
         input_feats = num_keypoints * num_dims_per_keypoint
         
@@ -45,6 +81,17 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         # Global conditions
         self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
         self.embed_timestep = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
+
+        # MeanPool
+        if use_mean_pool:
+            self.past_context_encoder = ContextEncoder(
+                input_feats, num_latent_dims,
+                num_layers=2, num_heads=num_heads, dropout=dropout
+            )
+            print(f"✓ 使用 MeanPool 模式 (参考师姐)")
+        else:
+            self.past_context_encoder = None
+            print(f"✓ 使用 Concat 模式")
 
         # Sequence encoder
         self.seqEncoder = seq_encoder_factory(
@@ -72,7 +119,6 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             for _ in range(3)
         ])
 
-        # past_last encoder (用于条件注入，但不做残差)
         self.past_last_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
             nn.LayerNorm(num_latent_dims),
@@ -80,7 +126,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             nn.Linear(num_latent_dims, num_latent_dims),
         )
 
-        # Output projection - 直接输出 x0
+        # Output projection
         self.pose_projection = OutputProcessMLP(
             num_latent_dims, num_keypoints, num_dims_per_keypoint
         )
@@ -139,7 +185,9 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         
         # 处理输入的带噪声 motion
         future_motion_emb = self.future_motion_process(x)  # [T_future, B, D]
-        past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
+
+        if not self.use_mean_pool:
+            past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
 
         B = future_motion_emb.size(1)
         D = future_motion_emb.size(2)
@@ -150,17 +198,35 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
-        
-        # time_emb 和 signwriting_emb 已经是 [1, B, D]
-        xseq = torch.cat([
-            time_emb,           # [1, B, D]
-            signwriting_emb,    # [1, B, D]
-            past_motion_emb,    # [T_past, B, D]
-            future_motion_emb,  # [T_future, B, D]
-        ], dim=0)  # [1+1+T_past+T_future, B, D]
-        
-        if debug:
-            print(f"  Concat: time(1) + sign(1) + past({T_past}) + x_t({T_future}) = {xseq.shape[0]}")
+        # ========== 根据模式选择条件注入方式 ==========
+        if self.use_mean_pool:
+            # MeanPool 模式（参考师姐的 DisfluentContextEncoder）
+            # past_motion: [B, J, C, T] -> mean pooled context [1, B, D]
+            past_btjc = past_motion.permute(0, 3, 1, 2).contiguous()  # [B, T, J, C]
+            past_context = self.past_context_encoder(past_btjc)  # [1, B, D]
+            
+            # 序列结构: [time(1), sign(1), past_ctx(1), x_t(T_future)] = 3 + T_future tokens
+            xseq = torch.cat([
+                time_emb,           # [1, B, D]
+                signwriting_emb,    # [1, B, D]
+                past_context,       # [1, B, D] - mean pooled!
+                future_motion_emb,  # [T_future, B, D]
+            ], dim=0)
+            
+            if debug:
+                print(f"  MeanPool: time(1) + sign(1) + past_ctx(1) + x_t({T_future}) = {xseq.shape[0]} tokens")
+        else:
+            # Concat 模式（原来的方式）
+            # 序列结构: [time(1), sign(1), past(T_past), x_t(T_future)]
+            xseq = torch.cat([
+                time_emb,           # [1, B, D]
+                signwriting_emb,    # [1, B, D]
+                past_motion_emb,    # [T_past, B, D]
+                future_motion_emb,  # [T_future, B, D]
+            ], dim=0)
+            
+            if debug:
+                print(f"  Concat: time(1) + sign(1) + past({T_past}) + x_t({T_future}) = {xseq.shape[0]} tokens")
         
         # Positional encoding
         xseq = self.sequence_pos_encoder(xseq)
