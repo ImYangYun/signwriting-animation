@@ -5,23 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import lightning as pl
-from torch.utils.data import DataLoader
+
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-
-from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
-from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
-from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
-
-try:
-    from pose_anonymization.data.normalization import unshift_hands
-    HAS_UNSHIFT = True
-except ImportError:
-    HAS_UNSHIFT = False
-
 
 
 def sanitize_btjc(x):
@@ -70,7 +59,7 @@ class SimpleRegressionModel(nn.Module):
         
         # Sign image encoder (简化)
         self.sign_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, 4, 2, 1),  # [1, H, W] -> [32, H/2, W/2]
+            nn.Conv2d(3, 32, 4, 2, 1),  # [3, H, W] -> [32, H/2, W/2]
             nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2, 1),  # -> [64, H/4, W/4]
             nn.ReLU(),
@@ -133,7 +122,7 @@ class TransformerRegressionModel(nn.Module):
         
         # Sign encoder
         self.sign_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, 4, 2, 1),
+            nn.Conv2d(3, 32, 4, 2, 1),
             nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2, 1),
             nn.ReLU(),
