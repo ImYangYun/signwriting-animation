@@ -157,12 +157,13 @@ def find_good_samples(dataset, data_dir, num_to_check=200, top_k=10):
     # 按运动幅度排序
     good_samples.sort(key=lambda x: x['stats'].get('mean_frame_disp', 0), reverse=True)
     
-    # 找理想样本（运动均匀）
+    # 找理想样本（运动量大且均匀）
+    # 修改：mean_disp > 2.0（之前是 1.0），找运动量更大的
     ideal_samples = [s for s in good_samples 
                      if s['stats'].get('jump_ratio', 100) < 10
-                     and s['stats'].get('mean_frame_disp', 0) > 1.0]
+                     and s['stats'].get('mean_frame_disp', 0) > 2.0]
     
-    print("\n推荐样本 (运动均匀，无大跳变):")
+    print(f"\n推荐样本 (运动量大 >2px，无大跳变): {len(ideal_samples)} 个")
     for i, s in enumerate(ideal_samples[:top_k]):
         stats = s['stats']
         print(f"  {i+1}. 样本 {s['idx']}: mean_disp={stats.get('mean_frame_disp', 0):.2f}px, "
@@ -170,7 +171,15 @@ def find_good_samples(dataset, data_dir, num_to_check=200, top_k=10):
     
     recommended = [s['idx'] for s in ideal_samples[:top_k]]
     if not recommended and good_samples:
-        recommended = [s['idx'] for s in good_samples[:top_k]]
+        # Fallback: 降低阈值到 1.5px
+        fallback_samples = [s for s in good_samples 
+                           if s['stats'].get('jump_ratio', 100) < 10
+                           and s['stats'].get('mean_frame_disp', 0) > 1.5]
+        if fallback_samples:
+            print(f"  (降低阈值到 1.5px，找到 {len(fallback_samples)} 个)")
+            recommended = [s['idx'] for s in fallback_samples[:top_k]]
+        else:
+            recommended = [s['idx'] for s in good_samples[:top_k]]
     
     return recommended, good_samples
 
@@ -295,7 +304,7 @@ if __name__ == "__main__":
 
     # ===== 样本选择 =====
     if AUTO_SELECT_SAMPLE:
-        recommended, good_samples = find_good_samples(base_ds, data_dir, num_to_check=300)
+        recommended, good_samples = find_good_samples(base_ds, data_dir, num_to_check=500)  # 增加搜索数量
         if len(recommended) >= NUM_SAMPLES:
             selected_indices = recommended[:NUM_SAMPLES]
             print(f"\n✓ 自动选择 {NUM_SAMPLES} 个好样本: {selected_indices}")
@@ -370,8 +379,8 @@ if __name__ == "__main__":
         lr=1e-3,
         diffusion_steps=DIFFUSION_STEPS,
         residual_scale=0.1,
-        vel_weight=0.5,
-        acc_weight=0.2,
+        vel_weight=2.0,   # 增大！让模型关注运动
+        acc_weight=1.0,   # 增大！
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
