@@ -13,6 +13,15 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 
 
+def cosine_beta_schedule(timesteps, s=0.008):
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
+
+
 def sanitize_btjc(x):
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
@@ -37,335 +46,20 @@ def mean_frame_disp(x):
     return v.abs().mean().item()
 
 
-class SimpleRegressionModel(nn.Module):
-    """
-    简单的回归模型：直接从 past + sign 预测 future
-    不用 Diffusion，不用 timestep embedding
-    """
-    def __init__(self, num_joints=178, num_dims=3, past_frames=40, future_frames=20, latent_dim=256):
+class ConditionalWrapper(nn.Module):
+    def __init__(self, model, past, sign):
         super().__init__()
-        self.num_joints = num_joints
-        self.num_dims = num_dims
-        self.past_frames = past_frames
-        self.future_frames = future_frames
-        
-        # Past motion encoder
-        self.past_encoder = nn.Sequential(
-            nn.Linear(past_frames * num_joints * num_dims, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim),
-            nn.ReLU(),
-        )
-        
-        # Sign image encoder (简化)
-        self.sign_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1),  # [3, H, W] -> [32, H/2, W/2]
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1),  # -> [64, H/4, W/4]
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),  # -> [64, 1, 1]
-            nn.Flatten(),
-            nn.Linear(64, latent_dim),
-            nn.ReLU(),
-        )
-        
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim * 2, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, future_frames * num_joints * num_dims),
-        )
+        self.model = model
+        self.past = past
+        self.sign = sign
     
-    def forward(self, past_motion, sign_image):
-        """
-        past_motion: [B, T_past, J, C]
-        sign_image: [B, 1, H, W]
-        return: [B, T_future, J, C]
-        """
-        B = past_motion.shape[0]
-        
-        # Encode past
-        past_flat = past_motion.reshape(B, -1)
-        past_feat = self.past_encoder(past_flat)
-        
-        # Encode sign
-        sign_feat = self.sign_encoder(sign_image)
-        
-        # Decode
-        combined = torch.cat([past_feat, sign_feat], dim=-1)
-        output = self.decoder(combined)
-        
-        # Reshape
-        output = output.reshape(B, self.future_frames, self.num_joints, self.num_dims)
-        
-        return output
-
-
-class TransformerRegressionModel(nn.Module):
-    """
-    Transformer 回归模型：更强的架构
-    """
-    def __init__(self, num_joints=178, num_dims=3, past_frames=40, future_frames=20, 
-                 latent_dim=256, num_layers=4, num_heads=4):
-        super().__init__()
-        self.num_joints = num_joints
-        self.num_dims = num_dims
-        self.future_frames = future_frames
-        
-        # Input projection
-        self.input_proj = nn.Linear(num_joints * num_dims, latent_dim)
-        
-        # Positional encoding (足够长)
-        self.pos_enc = nn.Parameter(torch.randn(1, past_frames + future_frames + 10, latent_dim) * 0.02)
-        
-        # Sign encoder
-        self.sign_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, 2, 1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2, 1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, latent_dim),
-        )
-        
-        # Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=latent_dim, nhead=num_heads, 
-            dim_feedforward=latent_dim * 4, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Output projection
-        self.output_proj = nn.Linear(latent_dim, num_joints * num_dims)
-        
-        # Learnable future queries
-        self.future_queries = nn.Parameter(torch.randn(1, future_frames, latent_dim) * 0.02)
-    
-    def forward(self, past_motion, sign_image):
-        """
-        past_motion: [B, T_past, J, C]
-        sign_image: [B, 1, H, W]
-        """
-        B, T_past, J, C = past_motion.shape
-        
-        # Project past motion
-        past_flat = past_motion.reshape(B, T_past, -1)  # [B, T, J*C]
-        past_emb = self.input_proj(past_flat)  # [B, T, D]
-        
-        # Sign embedding as first token
-        sign_emb = self.sign_encoder(sign_image).unsqueeze(1)  # [B, 1, D]
-        
-        # Future queries
-        future_q = self.future_queries.expand(B, -1, -1)  # [B, T_future, D]
-        
-        # Concatenate: [sign, past, future_queries]
-        seq = torch.cat([sign_emb, past_emb, future_q], dim=1)  # [B, 1+T_past+T_future, D]
-        
-        # Add positional encoding
-        seq = seq + self.pos_enc[:, :seq.shape[1], :]
-        
-        # Transformer (with causal mask for future)
-        # 简化：不用 mask，让模型自己学
-        out = self.transformer(seq)
-        
-        # 取最后 T_future 个输出
-        future_out = out[:, -self.future_frames:, :]  # [B, T_future, D]
-        
-        # Project to poses
-        output = self.output_proj(future_out)  # [B, T_future, J*C]
-        output = output.reshape(B, self.future_frames, J, C)
-        
-        return output
-
-
-def test_regression_model(model_class, model_name, gt_raw, past_raw, sign, 
-                          mean_pose, std_pose, device, max_steps=3000):
-    """测试回归模型"""
-    print(f"\n" + "=" * 70)
-    print(f"测试: {model_name}")
-    print("=" * 70)
-    
-    # Normalize
-    gt_norm = (gt_raw - mean_pose) / (std_pose + 1e-6)
-    past_norm = (past_raw - mean_pose) / (std_pose + 1e-6)
-    
-    gt_disp = mean_frame_disp(gt_raw)
-    gt_norm_disp = mean_frame_disp(gt_norm)
-    
-    print(f"  GT pixel disp: {gt_disp:.6f}")
-    print(f"  GT norm disp: {gt_norm_disp:.6f}")
-    
-    # 创建模型
-    model = model_class(
-        num_joints=gt_raw.shape[2],
-        num_dims=gt_raw.shape[3],
-        past_frames=past_raw.shape[1],
-        future_frames=gt_raw.shape[1],
-    ).to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    model.train()
-    
-    for step in range(max_steps):
-        optimizer.zero_grad()
-        
-        # 直接预测（不用 Diffusion）
-        pred_norm = model(past_norm, sign)
-        
-        # MSE Loss
-        loss_mse = F.mse_loss(pred_norm, gt_norm)
-        
-        # Velocity Loss
-        pred_vel = pred_norm[:, 1:] - pred_norm[:, :-1]
-        gt_vel = gt_norm[:, 1:] - gt_norm[:, :-1]
-        loss_vel = F.mse_loss(pred_vel, gt_vel)
-        
-        # 总 loss
-        loss = loss_mse + 1.0 * loss_vel
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        if step % 500 == 0:
-            pred_unnorm = pred_norm * std_pose + mean_pose
-            disp = mean_frame_disp(pred_unnorm)
-            ratio = disp / (gt_disp + 1e-8)
-            
-            pred_norm_disp = mean_frame_disp(pred_norm)
-            
-            print(f"  Step {step}: loss={loss.item():.6f}, "
-                  f"pred_norm_disp={pred_norm_disp:.6f}, ratio={ratio:.4f}")
-    
-    # 最终评估
-    model.eval()
-    with torch.no_grad():
-        pred_norm = model(past_norm, sign)
-        pred_unnorm = pred_norm * std_pose + mean_pose
-        
-        disp = mean_frame_disp(pred_unnorm)
-        mse = F.mse_loss(pred_unnorm, gt_raw).item()
-        ratio = disp / (gt_disp + 1e-8)
-        
-        # Velocity match
-        pred_vel = pred_unnorm[:, 1:] - pred_unnorm[:, :-1]
-        gt_vel_raw = gt_raw[:, 1:] - gt_raw[:, :-1]
-        vel_mse = F.mse_loss(pred_vel, gt_vel_raw).item()
-        
-        print(f"\n  最终结果:")
-        print(f"    MSE: {mse:.6f}")
-        print(f"    disp: {disp:.6f}")
-        print(f"    disp_ratio: {ratio:.4f}")
-        print(f"    vel_mse: {vel_mse:.6f}")
-        
-        # PCK
-        pred_np = pred_unnorm[0].cpu().numpy()
-        gt_np = gt_raw[0].cpu().numpy()
-        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))
-        
-        print(f"\n    PCK@0.05: {(per_joint_error < 0.05).mean():.2%}")
-        print(f"    PCK@0.1: {(per_joint_error < 0.1).mean():.2%}")
-        print(f"    PCK@0.2: {(per_joint_error < 0.2).mean():.2%}")
-    
-    return ratio, model
-
-
-def test_velocity_regression(gt_raw, past_raw, sign, mean_pose, std_pose, device, max_steps=3000):
-    """直接预测 velocity 的回归模型"""
-    print(f"\n" + "=" * 70)
-    print(f"测试: Velocity Regression")
-    print("=" * 70)
-    
-    # Normalize past
-    past_norm = (past_raw - mean_pose) / (std_pose + 1e-6)
-    
-    # 计算 GT velocity (pixel 空间)
-    gt_vel = gt_raw[:, 1:] - gt_raw[:, :-1]  # [B, 19, J, C]
-    
-    # Velocity 的 normalize（用 velocity 自己的 std）
-    vel_mean = gt_vel.mean()
-    vel_std = gt_vel.std() + 1e-6
-    gt_vel_norm = (gt_vel - vel_mean) / vel_std
-    
-    gt_disp = mean_frame_disp(gt_raw)
-    
-    print(f"  GT pixel disp: {gt_disp:.6f}")
-    print(f"  Velocity std: {vel_std.item():.6f}")
-    print(f"  GT vel_norm range: [{gt_vel_norm.min():.2f}, {gt_vel_norm.max():.2f}]")
-    
-    # 创建模型（预测 19 帧 velocity）
-    model = TransformerRegressionModel(
-        num_joints=gt_raw.shape[2],
-        num_dims=gt_raw.shape[3],
-        past_frames=past_raw.shape[1],
-        future_frames=gt_vel.shape[1],  # 19
-    ).to(device)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    model.train()
-    
-    for step in range(max_steps):
-        optimizer.zero_grad()
-        
-        pred_vel_norm = model(past_norm, sign)
-        loss = F.mse_loss(pred_vel_norm, gt_vel_norm)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        if step % 500 == 0:
-            # Unnormalize velocity
-            pred_vel = pred_vel_norm * vel_std + vel_mean
-            
-            # 重建位置
-            start_pos = past_raw[:, -1:, :, :]
-            positions = [start_pos]
-            for t in range(pred_vel.shape[1]):
-                next_pos = positions[-1] + pred_vel[:, t:t+1]
-                positions.append(next_pos)
-            pred_pos = torch.cat(positions[1:], dim=1)
-            
-            disp = mean_frame_disp(pred_pos)
-            ratio = disp / (gt_disp + 1e-8)
-            
-            print(f"  Step {step}: loss={loss.item():.6f}, disp={disp:.6f}, ratio={ratio:.4f}")
-    
-    # 最终评估
-    model.eval()
-    with torch.no_grad():
-        pred_vel_norm = model(past_norm, sign)
-        pred_vel = pred_vel_norm * vel_std + vel_mean
-        
-        # 重建位置
-        start_pos = past_raw[:, -1:, :, :]
-        positions = [start_pos]
-        for t in range(pred_vel.shape[1]):
-            next_pos = positions[-1] + pred_vel[:, t:t+1]
-            positions.append(next_pos)
-        pred_pos = torch.cat(positions[1:], dim=1)  # [B, 19, J, C]
-        
-        # 对比需要用 GT 的后 19 帧
-        gt_19 = gt_raw[:, 1:]  # 跳过第一帧
-        
-        disp = mean_frame_disp(pred_pos)
-        mse = F.mse_loss(pred_pos, gt_19).item()
-        ratio = disp / (gt_disp + 1e-8)
-        
-        print(f"\n  最终结果:")
-        print(f"    MSE: {mse:.6f}")
-        print(f"    disp: {disp:.6f}")
-        print(f"    disp_ratio: {ratio:.4f}")
-    
-    return ratio, model
+    def forward(self, x, t, **kwargs):
+        return self.model(x, t, self.past, self.sign)
 
 
 def main():
     print("=" * 70)
-    print("方案 4: 直接 Regression（不用 Diffusion）")
+    print("Debug Diffusion 采样过程")
     print("=" * 70)
     
     pl.seed_everything(42)
@@ -378,34 +72,12 @@ def main():
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     
     base_ds = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
+        data_dir=data_dir, csv_path=csv_path,
+        num_past_frames=40, num_future_frames=20,
+        with_metadata=True, split="train",
     )
     
-    # 先找一个运动量大的样本
-    print("\n寻找运动量大的样本...")
-    best_idx = 36
-    best_disp = 0
-    
-    for idx in range(min(200, len(base_ds))):
-        try:
-            s = base_ds[idx]
-            b = zero_pad_collator([s])
-            gt = sanitize_btjc(b["data"][:1])
-            disp = mean_frame_disp(gt)
-            if disp > best_disp:
-                best_disp = disp
-                best_idx = idx
-        except:
-            continue
-    
-    print(f"  最大运动样本: {best_idx}, disp={best_disp:.6f}")
-    
-    sample = base_ds[best_idx]
+    sample = base_ds[36]
     batch = zero_pad_collator([sample])
     
     cond = batch["conditions"]
@@ -417,104 +89,311 @@ def main():
     mean_pose = stats["mean"].float().view(1, 1, -1, 3).to(device)
     std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
     
-    print(f"\n样本 {best_idx}:")
-    print(f"  past: {past_raw.shape}")
-    print(f"  gt: {gt_raw.shape}")
-    print(f"  sign: {sign.shape}")
+    gt_norm = (gt_raw - mean_pose) / (std_pose + 1e-6)
+    past_norm = (past_raw - mean_pose) / (std_pose + 1e-6)
     
-    # 详细分析
-    gt_np = gt_raw[0].cpu().numpy()
+    gt_bjct = gt_norm.permute(0, 2, 3, 1).contiguous()
+    past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
     
-    # 全体关节
-    all_disp = np.abs(gt_np[1:] - gt_np[:-1]).mean()
-    print(f"\n  运动量分析 (pixel 空间):")
-    print(f"    全体关节 mean disp: {all_disp:.4f} px")
+    gt_disp = mean_frame_disp(gt_raw)
+    gt_norm_disp = mean_frame_disp(gt_norm)
     
-    # 手部关节 (136-178)
-    hand_disp = np.abs(gt_np[1:, 136:178] - gt_np[:-1, 136:178]).mean()
-    print(f"    手部关节 mean disp: {hand_disp:.4f} px")
+    print(f"\n数据:")
+    print(f"  GT pixel disp: {gt_disp:.6f}")
+    print(f"  GT norm disp: {gt_norm_disp:.6f}")
     
-    # 身体关节 (0-33)
-    body_disp = np.abs(gt_np[1:, :33] - gt_np[:-1, :33]).mean()
-    print(f"    身体关节 mean disp: {body_disp:.4f} px")
+    # 创建 Diffusion
+    DIFFUSION_STEPS = 8
+    betas = cosine_beta_schedule(DIFFUSION_STEPS).numpy()
     
-    # 第一帧和最后一帧的差异
-    total_motion = np.abs(gt_np[-1] - gt_np[0]).mean()
-    print(f"    首尾帧差异: {total_motion:.4f} px")
-    
-    results = {}
-    
-    # Sanity Check: 直接输出 GT
-    print("\n" + "=" * 70)
-    print("Sanity Check: 直接输出 GT（验证评估代码）")
-    print("=" * 70)
-    sanity_disp = mean_frame_disp(gt_raw)
-    gt_disp = sanity_disp
-    print(f"  GT disp: {sanity_disp:.6f}")
-    print(f"  GT disp_ratio: {sanity_disp / (sanity_disp + 1e-8):.4f} (应该=1.0)")
-    results['Sanity_GT'] = 1.0
-    
-    # Baseline: 输出 past 的最后一帧（完全静态）
-    print("\n" + "=" * 70)
-    print("Baseline: 输出 past 最后一帧（完全静态）")
-    print("=" * 70)
-    static_pred = past_raw[:, -1:].expand(-1, gt_raw.shape[1], -1, -1)
-    static_disp = mean_frame_disp(static_pred)
-    static_mse = F.mse_loss(static_pred, gt_raw).item()
-    print(f"  Static pred disp: {static_disp:.6f}")
-    print(f"  Static pred MSE: {static_mse:.6f}")
-    print(f"  这就是'预测静态均值'的 baseline")
-    results['Static_Baseline'] = static_disp / (gt_disp + 1e-8)
-    
-    # 测试 1: 简单 MLP 回归
-    ratio_1, _ = test_regression_model(
-        SimpleRegressionModel, "Simple MLP",
-        gt_raw, past_raw, sign, mean_pose, std_pose, device,
-        max_steps=3000
+    diffusion = GaussianDiffusion(
+        betas=betas,
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+        rescale_timesteps=False,
     )
-    results['Simple_MLP'] = ratio_1
     
-    # 测试 2: Transformer 回归
-    ratio_2, _ = test_regression_model(
-        TransformerRegressionModel, "Transformer",
-        gt_raw, past_raw, sign, mean_pose, std_pose, device,
-        max_steps=3000
-    )
-    results['Transformer'] = ratio_2
+    # 打印 diffusion 参数
+    print(f"\nDiffusion 参数:")
+    print(f"  num_timesteps: {diffusion.num_timesteps}")
+    print(f"  betas: {diffusion.betas}")
+    print(f"  alphas_cumprod: {diffusion.alphas_cumprod}")
+    print(f"  sqrt_alphas_cumprod: {diffusion.sqrt_alphas_cumprod}")
+    print(f"  sqrt_one_minus_alphas_cumprod: {diffusion.sqrt_one_minus_alphas_cumprod}")
     
-    # 测试 3: Velocity 回归
-    ratio_3, _ = test_velocity_regression(
-        gt_raw, past_raw, sign, mean_pose, std_pose, device,
-        max_steps=3000
-    )
-    results['Velocity_Reg'] = ratio_3
+    # 创建模型
+    model = SignWritingToPoseDiffusionV2(
+        num_keypoints=gt_raw.shape[2],
+        num_dims_per_keypoint=gt_raw.shape[3],
+        residual_scale=0.1,
+        use_mean_pool=True,
+    ).to(device)
     
-    # 总结
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    
+    # ========== 训练 ==========
     print("\n" + "=" * 70)
-    print("结果对比")
+    print("训练 (3000 步)")
     print("=" * 70)
-    print(f"\n{'模型':<20} | {'disp_ratio':<12} | {'评价'}")
-    print("-" * 50)
-    for name, ratio in results.items():
-        if ratio > 0.5:
-            eval_str = "✓ 好"
-        elif ratio > 0.3:
-            eval_str = "○ 可以"
+    
+    model.train()
+    for step in range(3000):
+        optimizer.zero_grad()
+        
+        t = torch.randint(0, DIFFUSION_STEPS, (1,), device=device)
+        noise = torch.randn_like(gt_bjct)
+        x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
+        
+        t_scaled = diffusion._scale_timesteps(t)
+        pred_x0 = model(x_t, t_scaled, past_bjct, sign)
+        
+        loss = F.mse_loss(pred_x0, gt_bjct)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        if step % 500 == 0:
+            pred_btjc = pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * std_pose + mean_pose
+            disp = mean_frame_disp(pred_unnorm)
+            ratio = disp / (gt_disp + 1e-8)
+            print(f"  Step {step}: loss={loss.item():.6f}, disp={disp:.6f}, ratio={ratio:.4f}, t={t.item()}")
+    
+    print(f"\n训练完成!")
+    
+    # ========== Debug 1: 模型在不同 t 的直接预测 ==========
+    print("\n" + "=" * 70)
+    print("Debug 1: 模型在不同 t 的直接预测 (从 GT+noise)")
+    print("=" * 70)
+    
+    model.eval()
+    with torch.no_grad():
+        for t_val in range(DIFFUSION_STEPS):
+            t = torch.tensor([t_val], device=device)
+            
+            # 从 GT 加噪
+            noise = torch.randn_like(gt_bjct)
+            x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
+            
+            # 模型预测
+            t_scaled = diffusion._scale_timesteps(t)
+            pred_x0 = model(x_t, t_scaled, past_bjct, sign)
+            
+            # 评估
+            pred_btjc = pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * std_pose + mean_pose
+            
+            disp = mean_frame_disp(pred_unnorm)
+            mse = F.mse_loss(pred_unnorm, gt_raw).item()
+            ratio = disp / (gt_disp + 1e-8)
+            
+            # x_t 的信息
+            x_t_btjc = x_t.permute(0, 3, 1, 2)
+            x_t_unnorm = x_t_btjc * std_pose + mean_pose
+            x_t_disp = mean_frame_disp(x_t_unnorm)
+            
+            print(f"  t={t_val}: pred_disp={disp:.6f}, ratio={ratio:.4f}, "
+                  f"mse={mse:.6f}, x_t_disp={x_t_disp:.6f}")
+    
+    # ========== Debug 2: 从纯噪声开始的模型预测 ==========
+    print("\n" + "=" * 70)
+    print("Debug 2: 从纯噪声开始的模型预测")
+    print("=" * 70)
+    
+    with torch.no_grad():
+        target_shape = (1, gt_raw.shape[2], gt_raw.shape[3], gt_raw.shape[1])
+        
+        # 纯噪声
+        x_noise = torch.randn(target_shape, device=device)
+        print(f"  纯噪声 range: [{x_noise.min():.2f}, {x_noise.max():.2f}]")
+        
+        for t_val in range(DIFFUSION_STEPS - 1, -1, -1):
+            t = torch.tensor([t_val], device=device)
+            t_scaled = diffusion._scale_timesteps(t)
+            
+            pred_x0 = model(x_noise, t_scaled, past_bjct, sign)
+            
+            pred_btjc = pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * std_pose + mean_pose
+            
+            disp = mean_frame_disp(pred_unnorm)
+            ratio = disp / (gt_disp + 1e-8)
+            
+            print(f"  t={t_val}: pred_disp={disp:.6f}, ratio={ratio:.4f}, "
+                  f"pred_range=[{pred_x0.min():.2f}, {pred_x0.max():.2f}]")
+    
+    # ========== Debug 3: 手动 p_sample 每一步 ==========
+    print("\n" + "=" * 70)
+    print("Debug 3: 手动 p_sample 每一步详细分析")
+    print("=" * 70)
+    
+    with torch.no_grad():
+        wrapped = ConditionalWrapper(model, past_bjct, sign)
+        
+        x = torch.randn(target_shape, device=device)
+        print(f"\n  初始噪声: range=[{x.min():.2f}, {x.max():.2f}]")
+        
+        for i in range(DIFFUSION_STEPS - 1, -1, -1):
+            t = torch.tensor([i], device=device)
+            
+            # 获取 p_sample 的详细输出
+            out = diffusion.p_sample(
+                wrapped, x, t, 
+                clip_denoised=False, 
+                model_kwargs={"y": {}}
+            )
+            
+            x_prev = out["sample"]
+            pred_xstart = out.get("pred_xstart", None)
+            
+            # 分析
+            x_btjc = x_prev.permute(0, 3, 1, 2)
+            x_unnorm = x_btjc * std_pose + mean_pose
+            sample_disp = mean_frame_disp(x_unnorm)
+            
+            if pred_xstart is not None:
+                pred_btjc = pred_xstart.permute(0, 3, 1, 2)
+                pred_unnorm = pred_btjc * std_pose + mean_pose
+                pred_disp = mean_frame_disp(pred_unnorm)
+            else:
+                pred_disp = -1
+            
+            sample_ratio = sample_disp / (gt_disp + 1e-8)
+            pred_ratio = pred_disp / (gt_disp + 1e-8) if pred_disp >= 0 else -1
+            
+            print(f"  t={i}: sample_disp={sample_disp:.6f} (ratio={sample_ratio:.4f}), "
+                  f"pred_x0_disp={pred_disp:.6f} (ratio={pred_ratio:.4f}), "
+                  f"range=[{x_prev.min():.2f}, {x_prev.max():.2f}]")
+            
+            x = x_prev
+        
+        # 最终结果
+        final_btjc = x.permute(0, 3, 1, 2)
+        final_unnorm = final_btjc * std_pose + mean_pose
+        final_disp = mean_frame_disp(final_unnorm)
+        final_ratio = final_disp / (gt_disp + 1e-8)
+        
+        print(f"\n  最终: disp={final_disp:.6f}, ratio={final_ratio:.4f}")
+    
+    # ========== Debug 4: 检查 p_sample 内部计算 ==========
+    print("\n" + "=" * 70)
+    print("Debug 4: 手动实现 p_sample 检查每个步骤")
+    print("=" * 70)
+    
+    with torch.no_grad():
+        x = torch.randn(target_shape, device=device)
+        
+        for i in range(DIFFUSION_STEPS - 1, -1, -1):
+            t = torch.tensor([i], device=device)
+            t_scaled = diffusion._scale_timesteps(t)
+            
+            # Step 1: 模型预测 x_0
+            model_output = model(x, t_scaled, past_bjct, sign)
+            pred_x0 = model_output  # 因为是 START_X mode
+            
+            # Step 2: 计算 mean
+            # p_mean_variance 会用 pred_x0 计算 mean
+            # mean = sqrt_recip_alphas_cumprod * x - sqrt_recipm1_alphas_cumprod * pred_x0
+            # 或者对于 START_X: mean = posterior_mean_coef1 * pred_x0 + posterior_mean_coef2 * x
+            
+            posterior_mean_coef1 = diffusion.posterior_mean_coef1[i]
+            posterior_mean_coef2 = diffusion.posterior_mean_coef2[i]
+            
+            mean = posterior_mean_coef1 * pred_x0 + posterior_mean_coef2 * x
+            
+            # Step 3: 计算 variance
+            posterior_variance = diffusion.posterior_variance[i]
+            posterior_log_variance = diffusion.posterior_log_variance_clipped[i]
+            
+            # Step 4: 采样
+            if i > 0:
+                noise = torch.randn_like(x)
+                x_prev = mean + torch.sqrt(torch.tensor(posterior_variance, device=device)) * noise
+            else:
+                # t=0 时不加噪声
+                x_prev = mean
+            
+            # 分析
+            pred_btjc = pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * std_pose + mean_pose
+            pred_disp = mean_frame_disp(pred_unnorm)
+            
+            mean_btjc = mean.permute(0, 3, 1, 2)
+            mean_unnorm = mean_btjc * std_pose + mean_pose
+            mean_disp = mean_frame_disp(mean_unnorm)
+            
+            x_prev_btjc = x_prev.permute(0, 3, 1, 2)
+            x_prev_unnorm = x_prev_btjc * std_pose + mean_pose
+            x_prev_disp = mean_frame_disp(x_prev_unnorm)
+            
+            print(f"  t={i}:")
+            print(f"    coef1={posterior_mean_coef1:.4f}, coef2={posterior_mean_coef2:.4f}, var={posterior_variance:.6f}")
+            print(f"    pred_x0 disp={pred_disp:.6f} (ratio={pred_disp/gt_disp:.4f})")
+            print(f"    mean disp={mean_disp:.6f} (ratio={mean_disp/gt_disp:.4f})")
+            print(f"    x_prev disp={x_prev_disp:.6f} (ratio={x_prev_disp/gt_disp:.4f})")
+            
+            x = x_prev
+    
+    # ========== Debug 5: 直接用 pred_x0 作为最终输出（跳过采样） ==========
+    print("\n" + "=" * 70)
+    print("Debug 5: 跳过采样，直接用最终 pred_x0")
+    print("=" * 70)
+    
+    with torch.no_grad():
+        x = torch.randn(target_shape, device=device)
+        
+        # 迭代到最后
+        for i in range(DIFFUSION_STEPS - 1, -1, -1):
+            t = torch.tensor([i], device=device)
+            out = diffusion.p_sample(wrapped, x, t, clip_denoised=False, model_kwargs={"y": {}})
+            x = out["sample"]
+            last_pred_x0 = out.get("pred_xstart", None)
+        
+        # 用 p_sample_loop 的最终 sample
+        sample_btjc = x.permute(0, 3, 1, 2)
+        sample_unnorm = sample_btjc * std_pose + mean_pose
+        sample_disp = mean_frame_disp(sample_unnorm)
+        
+        # 用最后一步的 pred_x0
+        if last_pred_x0 is not None:
+            pred_btjc = last_pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * std_pose + mean_pose
+            pred_disp = mean_frame_disp(pred_unnorm)
         else:
-            eval_str = "✗ 差"
-        print(f"{name:<20} | {ratio:<12.4f} | {eval_str}")
+            pred_disp = -1
+        
+        print(f"  p_sample_loop 最终 sample: disp={sample_disp:.6f}, ratio={sample_disp/gt_disp:.4f}")
+        print(f"  最后一步的 pred_x0: disp={pred_disp:.6f}, ratio={pred_disp/gt_disp:.4f}")
+        
+        # 直接用模型预测 t=0
+        t = torch.tensor([0], device=device)
+        t_scaled = diffusion._scale_timesteps(t)
+        direct_pred = model(x, t_scaled, past_bjct, sign)
+        
+        direct_btjc = direct_pred.permute(0, 3, 1, 2)
+        direct_unnorm = direct_btjc * std_pose + mean_pose
+        direct_disp = mean_frame_disp(direct_unnorm)
+        
+        print(f"  直接用 t=0 预测: disp={direct_disp:.6f}, ratio={direct_disp/gt_disp:.4f}")
     
-    best = max(results, key=results.get)
-    print(f"\n最佳: {best} (ratio={results[best]:.4f})")
-    
-    if results[best] < 0.3:
-        print(f"\n⚠️ 所有方案都失败！")
-        print(f"可能的原因:")
-        print(f"  1. 数据本身运动量太小")
-        print(f"  2. 需要更强的运动约束")
-        print(f"  3. 需要换更大运动的样本测试")
-    
+    # ========== 总结 ==========
     print("\n" + "=" * 70)
+    print("总结")
+    print("=" * 70)
+    print(f"""
+    关键发现：
+    1. 模型从 GT+noise 预测时有运动 (Debug 1)
+    2. 从纯噪声预测时运动量如何？ (Debug 2)
+    3. p_sample 每步的 pred_x0 vs mean vs sample 变化 (Debug 3, 4)
+    4. 最终 sample vs pred_x0 的差异 (Debug 5)
+
+    如果 pred_x0 一直有运动，但 sample 逐渐变静态：
+    → 问题在 posterior mean 的混合过程
+
+    如果 pred_x0 本身就变静态：
+    → 问题在模型对纯噪声输入的处理
+    """)
 
 
 if __name__ == "__main__":
