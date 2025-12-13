@@ -56,79 +56,7 @@ def mean_frame_disp(x):
     return v.abs().mean().item()
 
 
-def compute_dtw(pred_btjc, gt_btjc):
-    """计算 DTW 距离"""
-    if not HAS_DTW:
-        return 0.0
-    
-    try:
-        pred = pred_btjc[0].cpu().numpy().astype("float32")[:, None, :, :]
-        gt = gt_btjc[0].cpu().numpy().astype("float32")[:, None, :, :]
-        dtw_metric = PE_DTW()
-        return float(dtw_metric.get_distance(pred, gt))
-    except:
-        return 0.0
-
-
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
-    """转换 tensor 到 pose 格式"""
-    if t_btjc.dim() == 4:
-        t = t_btjc[0]
-    else:
-        t = t_btjc
-    
-    t_np = t.detach().cpu().numpy().astype(np.float32)
-
-    gt_np = None
-    if gt_btjc is not None:
-        if gt_btjc.dim() == 4:
-            gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
-        else:
-            gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-
-    arr = t_np[:, None, :, :]
-    conf = ref_pose.body.confidence[:len(t_np)].copy()
-    fps = ref_pose.body.fps
-    
-    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
-    pose_obj = Pose(header=header, body=body)
-    
-    if HAS_UNSHIFT:
-        try:
-            unshift_hands(pose_obj)
-        except:
-            pass
-    
-    T_pred = pose_obj.body.data.shape[0]
-    T_ref_total = ref_pose.body.data.shape[0]
-    
-    future_start = max(0, T_ref_total - T_pred)
-    ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-    pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    
-    if apply_scale and gt_np is not None:
-        def _var(a):
-            center = a.mean(axis=1, keepdims=True)
-            return float(((a - center) ** 2).mean())
-        
-        var_gt_norm = _var(gt_np)
-        var_ref = _var(ref_arr)
-        
-        if var_gt_norm > 1e-8:
-            scale = np.sqrt(var_ref / var_gt_norm)
-            pose_obj.body.data *= scale
-            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-
-    ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
-    pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
-    delta = ref_c - pred_c
-    pose_obj.body.data += delta
-    
-    return pose_obj
-
-
 class ConditionalWrapper(torch.nn.Module):
-    """包装模型，固定条件输入"""
     def __init__(self, model, past, sign):
         super().__init__()
         self.model = model
@@ -139,96 +67,292 @@ class ConditionalWrapper(torch.nn.Module):
         return self.model(x, t, self.past, self.sign)
 
 
+def test_scheme_1_disp_loss(gt_raw, past_raw, sign, gt_bjct, past_bjct, 
+                            model, diffusion, device, max_steps=2000):
+    """方案 1: 加 Displacement Loss"""
+    print("\n" + "=" * 70)
+    print("方案 1: 加 Displacement Loss")
+    print("=" * 70)
+    
+    # 重置模型
+    model_1 = SignWritingToPoseDiffusionV2(
+        num_keypoints=gt_raw.shape[2],
+        num_dims_per_keypoint=gt_raw.shape[3],
+        residual_scale=0.1,
+        use_mean_pool=True,
+    ).to(device)
+    
+    optimizer = torch.optim.AdamW(model_1.parameters(), lr=1e-3)
+    model_1.train()
+    
+    gt_disp = mean_frame_disp(gt_raw)
+    
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        
+        t = torch.randint(0, 8, (1,), device=device)
+        noise = torch.randn_like(gt_bjct)
+        x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
+        
+        t_scaled = diffusion._scale_timesteps(t)
+        pred_x0 = model_1(x_t, t_scaled, past_bjct, sign)
+        
+        # 主 loss: MSE
+        loss_mse = F.mse_loss(pred_x0, gt_bjct)
+        
+        # Displacement loss
+        pred_btjc = pred_x0.permute(0, 3, 1, 2)  # [B,J,C,T] -> [B,T,J,C]
+        gt_btjc_local = gt_bjct.permute(0, 3, 1, 2)
+        
+        pred_vel = pred_btjc[:, 1:] - pred_btjc[:, :-1]
+        gt_vel = gt_btjc_local[:, 1:] - gt_btjc_local[:, :-1]
+        
+        pred_disp = pred_vel.abs().mean()
+        gt_disp_local = gt_vel.abs().mean()
+        
+        # 强制运动量匹配
+        loss_disp = torch.abs(pred_disp - gt_disp_local)
+        
+        # 总 loss
+        loss = loss_mse + 10.0 * loss_disp  # disp loss 权重大一些
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_1.parameters(), 1.0)
+        optimizer.step()
+        
+        if step % 500 == 0:
+            print(f"  Step {step}: mse={loss_mse.item():.6f}, disp_loss={loss_disp.item():.6f}, "
+                  f"pred_disp={pred_disp.item():.6f}, gt_disp={gt_disp_local.item():.6f}")
+    
+    # 测试
+    model_1.eval()
+    with torch.no_grad():
+        wrapped = ConditionalWrapper(model_1, past_bjct, sign)
+        target_shape = (1, gt_raw.shape[2], gt_raw.shape[3], gt_raw.shape[1])
+        
+        pred_bjct = diffusion.p_sample_loop(
+            model=wrapped, shape=target_shape,
+            clip_denoised=False, model_kwargs={"y": {}}, progress=False,
+        )
+        pred_btjc = pred_bjct.permute(0, 3, 1, 2)
+        
+        # Unnormalize（用原始方式）
+        stats_path = "/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt"
+        stats = torch.load(stats_path, map_location=device)
+        mean_pose = stats["mean"].float().view(1, 1, -1, 3).to(device)
+        std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
+        pred_unnorm = pred_btjc * std_pose + mean_pose
+        
+        disp = mean_frame_disp(pred_unnorm)
+        ratio = disp / (gt_disp + 1e-8)
+        
+        print(f"\n  结果: disp={disp:.6f}, ratio={ratio:.4f}")
+    
+    return ratio, model_1
+
+
+def test_scheme_2_small_std(gt_raw, past_raw, sign, device, max_steps=2000):
+    """方案 2: 用更小的 std normalize"""
+    print("\n" + "=" * 70)
+    print("方案 2: 调整 Normalize（用更小的 std）")
+    print("=" * 70)
+    
+    # 用更小的 std（只用位置的 std，不用全局）
+    # 或者直接用固定的小 std
+    small_std = 50.0  # 而不是 ~200
+    
+    gt_mean = gt_raw.mean()
+    gt_norm_small = (gt_raw - gt_mean) / small_std
+    past_norm_small = (past_raw - gt_mean) / small_std
+    
+    gt_bjct = gt_norm_small.permute(0, 2, 3, 1).contiguous()
+    past_bjct = past_norm_small.permute(0, 2, 3, 1).contiguous()
+    
+    print(f"  小 std normalize:")
+    print(f"    std = {small_std}")
+    print(f"    gt_norm range: [{gt_norm_small.min():.2f}, {gt_norm_small.max():.2f}]")
+    print(f"    gt_norm disp: {mean_frame_disp(gt_norm_small):.6f}")
+    
+    model_2 = SignWritingToPoseDiffusionV2(
+        num_keypoints=gt_raw.shape[2],
+        num_dims_per_keypoint=gt_raw.shape[3],
+        residual_scale=0.1,
+        use_mean_pool=True,
+    ).to(device)
+    
+    betas = cosine_beta_schedule(8).numpy()
+    diffusion = GaussianDiffusion(
+        betas=betas,
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+        rescale_timesteps=False,
+    )
+    
+    optimizer = torch.optim.AdamW(model_2.parameters(), lr=1e-3)
+    model_2.train()
+    
+    gt_disp = mean_frame_disp(gt_raw)
+    
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        
+        t = torch.randint(0, 8, (1,), device=device)
+        noise = torch.randn_like(gt_bjct)
+        x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
+        
+        t_scaled = diffusion._scale_timesteps(t)
+        pred_x0 = model_2(x_t, t_scaled, past_bjct, sign)
+        
+        loss = F.mse_loss(pred_x0, gt_bjct)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_2.parameters(), 1.0)
+        optimizer.step()
+        
+        if step % 500 == 0:
+            pred_btjc = pred_x0.permute(0, 3, 1, 2)
+            pred_unnorm = pred_btjc * small_std + gt_mean
+            disp = mean_frame_disp(pred_unnorm)
+            ratio = disp / (gt_disp + 1e-8)
+            print(f"  Step {step}: loss={loss.item():.6f}, disp={disp:.6f}, ratio={ratio:.4f}")
+    
+    # 测试
+    model_2.eval()
+    with torch.no_grad():
+        wrapped = ConditionalWrapper(model_2, past_bjct, sign)
+        target_shape = (1, gt_raw.shape[2], gt_raw.shape[3], gt_raw.shape[1])
+        
+        pred_bjct = diffusion.p_sample_loop(
+            model=wrapped, shape=target_shape,
+            clip_denoised=False, model_kwargs={"y": {}}, progress=False,
+        )
+        pred_btjc = pred_bjct.permute(0, 3, 1, 2)
+        pred_unnorm = pred_btjc * small_std + gt_mean
+        
+        disp = mean_frame_disp(pred_unnorm)
+        ratio = disp / (gt_disp + 1e-8)
+        
+        print(f"\n  结果: disp={disp:.6f}, ratio={ratio:.4f}")
+    
+    return ratio, model_2
+
+
+def test_scheme_3_velocity(gt_raw, past_raw, sign, device, max_steps=2000):
+    """方案 3: 预测 Velocity 而不是位置"""
+    print("\n" + "=" * 70)
+    print("方案 3: 预测 Velocity（帧间差）")
+    print("=" * 70)
+    
+    # 计算 velocity
+    gt_vel = gt_raw[:, 1:] - gt_raw[:, :-1]  # [B, T-1, J, C]
+    
+    # Normalize velocity（用 velocity 自己的 std）
+    vel_mean = gt_vel.mean()
+    vel_std = gt_vel.std() + 1e-6
+    gt_vel_norm = (gt_vel - vel_mean) / vel_std
+    
+    print(f"  Velocity normalize:")
+    print(f"    vel_std = {vel_std.item():.6f}")
+    print(f"    gt_vel_norm range: [{gt_vel_norm.min():.2f}, {gt_vel_norm.max():.2f}]")
+    print(f"    gt_vel_norm disp: {mean_frame_disp(gt_vel_norm):.6f}")
+    
+    # 模型输出维度变了：T-1 帧
+    future_len = gt_vel.shape[1]  # 19 instead of 20
+    
+    gt_vel_bjct = gt_vel_norm.permute(0, 2, 3, 1).contiguous()
+    
+    # Past 还是用位置（normalize）
+    stats_path = "/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt"
+    stats = torch.load(stats_path, map_location=device)
+    mean_pose = stats["mean"].float().view(1, 1, -1, 3).to(device)
+    std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
+    past_norm = (past_raw - mean_pose) / (std_pose + 1e-6)
+    past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
+    
+    model_3 = SignWritingToPoseDiffusionV2(
+        num_keypoints=gt_raw.shape[2],
+        num_dims_per_keypoint=gt_raw.shape[3],
+        residual_scale=0.1,
+        use_mean_pool=True,
+    ).to(device)
+    
+    betas = cosine_beta_schedule(8).numpy()
+    diffusion = GaussianDiffusion(
+        betas=betas,
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+        loss_type=LossType.MSE,
+        rescale_timesteps=False,
+    )
+    
+    optimizer = torch.optim.AdamW(model_3.parameters(), lr=1e-3)
+    model_3.train()
+    
+    gt_disp = mean_frame_disp(gt_raw)
+    
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        
+        t = torch.randint(0, 8, (1,), device=device)
+        noise = torch.randn_like(gt_vel_bjct)
+        x_t = diffusion.q_sample(gt_vel_bjct, t, noise=noise)
+        
+        t_scaled = diffusion._scale_timesteps(t)
+        pred_vel_bjct = model_3(x_t, t_scaled, past_bjct, sign)
+        
+        loss = F.mse_loss(pred_vel_bjct, gt_vel_bjct)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_3.parameters(), 1.0)
+        optimizer.step()
+        
+        if step % 500 == 0:
+            print(f"  Step {step}: loss={loss.item():.6f}")
+    
+    # 测试
+    model_3.eval()
+    with torch.no_grad():
+        wrapped = ConditionalWrapper(model_3, past_bjct, sign)
+        target_shape = (1, gt_raw.shape[2], gt_raw.shape[3], future_len)
+        
+        pred_vel_bjct = diffusion.p_sample_loop(
+            model=wrapped, shape=target_shape,
+            clip_denoised=False, model_kwargs={"y": {}}, progress=False,
+        )
+        pred_vel_btjc = pred_vel_bjct.permute(0, 3, 1, 2)
+        
+        # Unnormalize velocity
+        pred_vel_unnorm = pred_vel_btjc * vel_std + vel_mean
+        
+        # 从 velocity 重建位置
+        # 用 past 的最后一帧作为起点
+        start_pos = past_raw[:, -1:, :, :]  # [B, 1, J, C]
+        pred_pos = [start_pos]
+        for t in range(future_len):
+            next_pos = pred_pos[-1] + pred_vel_unnorm[:, t:t+1]
+            pred_pos.append(next_pos)
+        pred_pos = torch.cat(pred_pos[1:], dim=1)  # [B, T-1, J, C]
+        
+        disp = mean_frame_disp(pred_pos)
+        ratio = disp / (gt_disp + 1e-8)
+        
+        print(f"\n  结果: disp={disp:.6f}, ratio={ratio:.4f}")
+    
+    return ratio, model_3
+
+
 def main():
     print("=" * 70)
-    print("完整的最小化 Overfit 测试")
-    print("=" * 70)
-    print("目标: 1 样本 overfit，loss < 0.001，disp_ratio > 0.3")
+    print("三种方案对比测试")
     print("=" * 70)
     
     pl.seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nDevice: {device}")
+    print(f"Device: {device}")
     
-    # ========== 配置 ==========
+    # 加载数据
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/minimal_overfit"
-    os.makedirs(out_dir, exist_ok=True)
-    
-    DIFFUSION_STEPS = 8
-    USE_MEAN_POOL = True
-    LR = 1e-3
-    MAX_STEPS = 5000
-    TARGET_LOSS = 0.001
-    MIN_GT_DISP = 0.02  # 要求 GT 运动量至少这么大
-    
-    # 先找一个运动量足够大的样本
-    print(f"\n寻找运动量足够大的样本 (disp > {MIN_GT_DISP})...")
-    
-    base_ds_temp = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
-    )
-    
-    SAMPLE_IDX = None
-    best_disp = 0
-    best_idx = 0
-    
-    for idx in range(min(200, len(base_ds_temp))):
-        try:
-            sample_temp = base_ds_temp[idx]
-            batch_temp = zero_pad_collator([sample_temp])
-            gt_temp = sanitize_btjc(batch_temp["data"][:1])
-            disp_temp = mean_frame_disp(gt_temp)
-            
-            if disp_temp > best_disp:
-                best_disp = disp_temp
-                best_idx = idx
-            
-            if disp_temp > MIN_GT_DISP:
-                SAMPLE_IDX = idx
-                print(f"  ✓ 找到样本 {idx}: disp={disp_temp:.6f}")
-                break
-        except:
-            continue
-    
-    if SAMPLE_IDX is None:
-        SAMPLE_IDX = best_idx
-        print(f"  ⚠ 未找到 disp > {MIN_GT_DISP} 的样本")
-        print(f"  使用最大运动量样本 {best_idx}: disp={best_disp:.6f}")
-    
-    del base_ds_temp
-    
-    print(f"\n配置:")
-    print(f"  SAMPLE_IDX: {SAMPLE_IDX}")
-    print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")
-    print(f"  USE_MEAN_POOL: {USE_MEAN_POOL}")
-    print(f"  LR: {LR}")
-    print(f"  MAX_STEPS: {MAX_STEPS}")
-    print(f"  TARGET_LOSS: {TARGET_LOSS}")
-    
-    # ========== 加载数据 ==========
-    stats = torch.load(stats_path, map_location="cpu")
-    mean_pose = stats["mean"].float().view(1, 1, -1, 3).to(device)
-    std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
-    
-    def normalize(x):
-        return (x - mean_pose) / (std_pose + 1e-6)
-    
-    def unnormalize(x):
-        return x * std_pose + mean_pose
-    
-    def btjc_to_bjct(x):
-        return x.permute(0, 2, 3, 1).contiguous()
-    
-    def bjct_to_btjc(x):
-        return x.permute(0, 3, 1, 2).contiguous()
     
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
@@ -239,7 +363,8 @@ def main():
         split="train",
     )
     
-    sample = base_ds[SAMPLE_IDX]
+    # 用样本 36（之前测试过的）
+    sample = base_ds[36]
     batch = zero_pad_collator([sample])
     
     cond = batch["conditions"]
@@ -247,36 +372,27 @@ def main():
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
     
-    num_joints = gt_raw.shape[2]
-    num_dims = gt_raw.shape[3]
-    future_len = gt_raw.shape[1]
-    
     gt_disp = mean_frame_disp(gt_raw)
+    print(f"\n样本 36:")
+    print(f"  gt shape: {gt_raw.shape}")
+    print(f"  gt disp (pixel): {gt_disp:.6f}")
     
-    print(f"\n数据信息:")
-    print(f"  past: {past_raw.shape}")
-    print(f"  gt: {gt_raw.shape}")
-    print(f"  gt disp: {gt_disp:.6f}")
-    print(f"  joints: {num_joints}, dims: {num_dims}")
+    # 原始 normalize
+    stats = torch.load(stats_path, map_location=device)
+    mean_pose = stats["mean"].float().view(1, 1, -1, 3).to(device)
+    std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
     
-    # Normalize
-    gt_norm = normalize(gt_raw)
-    past_norm = normalize(past_raw)
-    gt_bjct = btjc_to_bjct(gt_norm)
-    past_bjct = btjc_to_bjct(past_norm)
+    gt_norm = (gt_raw - mean_pose) / (std_pose + 1e-6)
+    past_norm = (past_raw - mean_pose) / (std_pose + 1e-6)
     
-    print(f"  gt_norm range: [{gt_norm.min():.2f}, {gt_norm.max():.2f}]")
+    gt_bjct = gt_norm.permute(0, 2, 3, 1).contiguous()
+    past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
     
-    # ========== 创建模型 ==========
-    print(f"\n创建模型 (use_mean_pool={USE_MEAN_POOL})...")
-    model = SignWritingToPoseDiffusionV2(
-        num_keypoints=num_joints,
-        num_dims_per_keypoint=num_dims,
-        residual_scale=0.1,
-        use_mean_pool=USE_MEAN_POOL,
-    ).to(device)
+    print(f"  gt_norm disp: {mean_frame_disp(gt_norm):.6f}")
+    print(f"  std mean: {std_pose.mean().item():.2f}")
     
-    betas = cosine_beta_schedule(DIFFUSION_STEPS).numpy()
+    # Diffusion
+    betas = cosine_beta_schedule(8).numpy()
     diffusion = GaussianDiffusion(
         betas=betas,
         model_mean_type=ModelMeanType.START_X,
@@ -285,259 +401,48 @@ def main():
         rescale_timesteps=False,
     )
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    # 测试三种方案
+    results = {}
     
-    # ========== 训练 ==========
+    # 方案 1
+    ratio_1, _ = test_scheme_1_disp_loss(
+        gt_raw, past_raw, sign, gt_bjct, past_bjct,
+        None, diffusion, device, max_steps=2000
+    )
+    results['方案1_DispLoss'] = ratio_1
+    
+    # 方案 2
+    ratio_2, _ = test_scheme_2_small_std(
+        gt_raw, past_raw, sign, device, max_steps=2000
+    )
+    results['方案2_SmallStd'] = ratio_2
+    
+    # 方案 3
+    ratio_3, _ = test_scheme_3_velocity(
+        gt_raw, past_raw, sign, device, max_steps=2000
+    )
+    results['方案3_Velocity'] = ratio_3
+    
+    # 总结
     print("\n" + "=" * 70)
-    print(f"开始训练 (目标: loss < {TARGET_LOSS})")
+    print("结果对比")
     print("=" * 70)
+    print(f"\n{'方案':<20} | {'disp_ratio':<12} | {'评价'}")
+    print("-" * 50)
+    for name, ratio in results.items():
+        if ratio > 0.5:
+            eval_str = "✓ 好"
+        elif ratio > 0.3:
+            eval_str = "○ 可以"
+        else:
+            eval_str = "✗ 差"
+        print(f"{name:<20} | {ratio:<12.4f} | {eval_str}")
     
-    model.train()
-    losses = []
-    converged = False
-    
-    for step in range(MAX_STEPS):
-        optimizer.zero_grad()
-        
-        t = torch.randint(0, DIFFUSION_STEPS, (1,), device=device)
-        noise = torch.randn_like(gt_bjct)
-        x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
-        
-        t_scaled = diffusion._scale_timesteps(t)
-        pred_x0 = model(x_t, t_scaled, past_bjct, sign)
-        
-        loss = F.mse_loss(pred_x0, gt_bjct)
-        loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        losses.append(loss.item())
-        
-        if step % 200 == 0:
-            pred_btjc = bjct_to_btjc(pred_x0.detach())
-            pred_unnorm = unnormalize(pred_btjc)
-            disp = mean_frame_disp(pred_unnorm)
-            ratio = disp / (gt_disp + 1e-8)
-            
-            print(f"  Step {step}: loss={loss.item():.6f}, disp={disp:.6f}, ratio={ratio:.4f}, t={t.item()}")
-        
-        if loss.item() < TARGET_LOSS:
-            print(f"\n  ✓ 收敛! Step {step}, loss={loss.item():.6f}")
-            converged = True
-            break
-    
-    final_loss = losses[-1]
-    print(f"\n最终 loss: {final_loss:.6f}")
-    
-    if not converged:
-        print(f"  ⚠️ 警告: {MAX_STEPS} 步后未达到目标 loss")
-    
-    # ========== 测试 1: 模型直接预测 ==========
-    print("\n" + "=" * 70)
-    print("测试 1: 模型直接预测 (不经过 p_sample_loop)")
-    print("=" * 70)
-    
-    model.eval()
-    with torch.no_grad():
-        for t_val in [0, 1, 4, 7]:
-            t = torch.tensor([t_val], device=device)
-            noise = torch.randn_like(gt_bjct)
-            x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
-            
-            t_scaled = diffusion._scale_timesteps(t)
-            pred_x0 = model(x_t, t_scaled, past_bjct, sign)
-            
-            pred_btjc = bjct_to_btjc(pred_x0)
-            pred_unnorm = unnormalize(pred_btjc)
-            
-            disp = mean_frame_disp(pred_unnorm)
-            mse = F.mse_loss(pred_unnorm, gt_raw).item()
-            ratio = disp / (gt_disp + 1e-8)
-            
-            print(f"  t={t_val}: disp={disp:.6f}, ratio={ratio:.4f}, MSE={mse:.6f}")
-    
-    # ========== 测试 2: 逐步 p_sample ==========
-    print("\n" + "=" * 70)
-    print("测试 2: 逐步 p_sample 观察")
-    print("=" * 70)
-    
-    with torch.no_grad():
-        target_shape = (1, num_joints, num_dims, future_len)
-        wrapped = ConditionalWrapper(model, past_bjct, sign)
-        
-        x = torch.randn(target_shape, device=device)
-        print(f"\n  初始噪声范围: [{x.min():.2f}, {x.max():.2f}]")
-        
-        for i in range(DIFFUSION_STEPS - 1, -1, -1):
-            t = torch.tensor([i], device=device)
-            out = diffusion.p_sample(wrapped, x, t, clip_denoised=False, model_kwargs={"y": {}})
-            x = out["sample"]
-            
-            x_btjc = bjct_to_btjc(x)
-            x_unnorm = unnormalize(x_btjc)
-            disp = mean_frame_disp(x_unnorm)
-            ratio = disp / (gt_disp + 1e-8)
-            
-            print(f"  t={i}: disp={disp:.6f}, ratio={ratio:.4f}, range=[{x.min():.2f}, {x.max():.2f}]")
-        
-        # 最终结果
-        final_pred = x_unnorm
-        final_disp = disp
-        final_ratio = ratio
-    
-    # ========== 测试 3: 完整 p_sample_loop ==========
-    print("\n" + "=" * 70)
-    print("测试 3: 完整 p_sample_loop")
-    print("=" * 70)
-    
-    with torch.no_grad():
-        pred_bjct = diffusion.p_sample_loop(
-            model=wrapped,
-            shape=target_shape,
-            clip_denoised=False,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        
-        pred_btjc = bjct_to_btjc(pred_bjct)
-        pred_raw = unnormalize(pred_btjc)
-        
-        disp = mean_frame_disp(pred_raw)
-        mse = F.mse_loss(pred_raw, gt_raw).item()
-        ratio = disp / (gt_disp + 1e-8)
-        
-        print(f"\n  p_sample_loop 结果:")
-        print(f"    disp: {disp:.6f}")
-        print(f"    disp_ratio: {ratio:.4f}")
-        print(f"    MSE: {mse:.6f}")
-        print(f"    pred range: [{pred_raw.min():.2f}, {pred_raw.max():.2f}]")
-        print(f"    GT range: [{gt_raw.min():.2f}, {gt_raw.max():.2f}]")
-    
-    # ========== 完整评估 ==========
-    print("\n" + "=" * 70)
-    print("完整评估指标")
-    print("=" * 70)
-    
-    with torch.no_grad():
-        pred_np = pred_raw[0].cpu().numpy()
-        gt_np = gt_raw[0].cpu().numpy()
-        T, J, C = pred_np.shape
-        
-        # Position Errors
-        mse = float(((pred_np - gt_np) ** 2).mean())
-        mae = float(np.abs(pred_np - gt_np).mean())
-        per_joint_error = np.sqrt(((pred_np - gt_np) ** 2).sum(axis=-1))
-        mpjpe = float(per_joint_error.mean())
-        fde = float(np.sqrt(((pred_np[-1] - gt_np[-1]) ** 2).sum(axis=-1)).mean())
-        
-        print(f"\n--- Position Errors ---")
-        print(f"  MSE: {mse:.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print(f"  MPJPE: {mpjpe:.6f}")
-        print(f"  FDE: {fde:.6f}")
-        
-        # Motion Match
-        pred_vel = pred_np[1:] - pred_np[:-1]
-        gt_vel = gt_np[1:] - gt_np[:-1]
-        vel_mse = float(((pred_vel - gt_vel) ** 2).mean())
-        
-        print(f"\n--- Motion Match ---")
-        print(f"  disp_ratio: {ratio:.4f} (理想=1.0)")
-        print(f"  vel_mse: {vel_mse:.6f}")
-        
-        # PCK
-        print(f"\n--- PCK ---")
-        for thresh in [0.05, 0.1, 0.2, 0.5]:
-            pck = (per_joint_error < thresh).mean()
-            print(f"  PCK@{thresh}: {pck:.2%}")
-        
-        # DTW
-        dtw_val = compute_dtw(pred_raw, gt_raw)
-        print(f"\n--- Trajectory ---")
-        print(f"  DTW: {dtw_val:.4f}")
-    
-    # ========== 保存文件 ==========
-    print("\n" + "=" * 70)
-    print("保存文件")
-    print("=" * 70)
-    
-    ref_path = base_ds.records[SAMPLE_IDX]["pose"]
-    if not os.path.isabs(ref_path):
-        ref_path = os.path.join(data_dir, ref_path)
-    
-    with open(ref_path, "rb") as f:
-        ref_pose = Pose.read(f)
-    
-    ref_pose = reduce_holistic(ref_pose)
-    if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
-        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    header = ref_pose.header
-    
-    # GT
-    T_total = ref_pose.body.data.shape[0]
-    gt_data = ref_pose.body.data[-future_len:]
-    gt_conf = ref_pose.body.confidence[-future_len:]
-    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_data, confidence=gt_conf)
-    gt_pose = Pose(header=header, body=gt_body)
-    
-    out_gt = os.path.join(out_dir, f"gt_{SAMPLE_IDX}.pose")
-    with open(out_gt, "wb") as f:
-        gt_pose.write(f)
-    print(f"✓ GT saved: {out_gt}")
-    
-    # Pred
-    pred_pose = tensor_to_pose(pred_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-    out_pred = os.path.join(out_dir, f"pred_{SAMPLE_IDX}.pose")
-    with open(out_pred, "wb") as f:
-        pred_pose.write(f)
-    print(f"✓ PRED saved: {out_pred}")
-    
-    # ========== 分析保存的文件 ==========
-    print("\n" + "=" * 70)
-    print("分析保存的 pose 文件 (pixel 空间)")
-    print("=" * 70)
-    
-    with open(out_gt, "rb") as f:
-        saved_gt = Pose.read(f)
-    with open(out_pred, "rb") as f:
-        saved_pred = Pose.read(f)
-    
-    gt_data_px = np.array(saved_gt.body.data[:, 0])
-    pred_data_px = np.array(saved_pred.body.data[:, 0])
-    
-    gt_disp_px = np.abs(gt_data_px[1:] - gt_data_px[:-1]).mean()
-    pred_disp_px = np.abs(pred_data_px[1:] - pred_data_px[:-1]).mean()
-    
-    print(f"\n  GT 平均帧间位移: {gt_disp_px:.2f} px")
-    print(f"  PRED 平均帧间位移: {pred_disp_px:.2f} px")
-    print(f"  disp_ratio (pixel): {pred_disp_px / (gt_disp_px + 1e-8):.4f}")
-    
-    # ========== 最终判断 ==========
-    print("\n" + "=" * 70)
-    print("测试结果")
-    print("=" * 70)
-    
-    print(f"\n最终 Loss: {final_loss:.6f}")
-    print(f"disp_ratio: {ratio:.4f}")
-    
-    if final_loss < 0.01 and ratio > 0.3:
-        print("\n✅ 测试 PASS!")
-        print("   - 训练 loss 收敛 (< 0.01)")
-        print("   - 预测有运动 (disp_ratio > 0.3)")
-        print("   → 模型架构和 Diffusion 流程正确!")
-    elif final_loss < 0.01:
-        print("\n⚠️ 部分 PASS")
-        print("   - 训练 loss 收敛")
-        print(f"   - 但 disp_ratio={ratio:.4f} 偏低")
-        print("   → 问题在 p_sample_loop 采样过程")
-    else:
-        print("\n❌ 测试 FAIL")
-        print(f"   - 训练 loss={final_loss:.6f} 未充分收敛")
-        print("   → 检查模型架构或学习率")
+    best = max(results, key=results.get)
+    print(f"\n最佳方案: {best} (ratio={results[best]:.4f})")
     
     print("\n" + "=" * 70)
-    print("✓ 完成!")
+    print("完成")
     print("=" * 70)
 
 
