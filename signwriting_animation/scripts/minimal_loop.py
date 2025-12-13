@@ -157,12 +157,53 @@ def main():
     out_dir = "logs/minimal_overfit"
     os.makedirs(out_dir, exist_ok=True)
     
-    SAMPLE_IDX = 34
     DIFFUSION_STEPS = 8
     USE_MEAN_POOL = True
     LR = 1e-3
     MAX_STEPS = 5000
     TARGET_LOSS = 0.001
+    MIN_GT_DISP = 0.02  # 要求 GT 运动量至少这么大
+    
+    # 先找一个运动量足够大的样本
+    print(f"\n寻找运动量足够大的样本 (disp > {MIN_GT_DISP})...")
+    
+    base_ds_temp = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split="train",
+    )
+    
+    SAMPLE_IDX = None
+    best_disp = 0
+    best_idx = 0
+    
+    for idx in range(min(200, len(base_ds_temp))):
+        try:
+            sample_temp = base_ds_temp[idx]
+            batch_temp = zero_pad_collator([sample_temp])
+            gt_temp = sanitize_btjc(batch_temp["data"][:1])
+            disp_temp = mean_frame_disp(gt_temp)
+            
+            if disp_temp > best_disp:
+                best_disp = disp_temp
+                best_idx = idx
+            
+            if disp_temp > MIN_GT_DISP:
+                SAMPLE_IDX = idx
+                print(f"  ✓ 找到样本 {idx}: disp={disp_temp:.6f}")
+                break
+        except:
+            continue
+    
+    if SAMPLE_IDX is None:
+        SAMPLE_IDX = best_idx
+        print(f"  ⚠ 未找到 disp > {MIN_GT_DISP} 的样本")
+        print(f"  使用最大运动量样本 {best_idx}: disp={best_disp:.6f}")
+    
+    del base_ds_temp
     
     print(f"\n配置:")
     print(f"  SAMPLE_IDX: {SAMPLE_IDX}")
