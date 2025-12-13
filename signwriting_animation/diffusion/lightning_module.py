@@ -222,8 +222,10 @@ class LitDiffusion(pl.LightningModule):
         
         # 从预测的噪声反推 x0，用于计算辅助 loss
         # x0 = (x_t - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
-        alpha_bar = self.diffusion.alphas_cumprod[t].view(-1, 1, 1, 1).to(device)
-        pred_x0_bjct = (x_t - torch.sqrt(1 - alpha_bar) * pred_eps_bjct) / torch.sqrt(alpha_bar)
+        # 注意：alphas_cumprod 是 numpy array，需要转成 tensor
+        alphas_cumprod = torch.tensor(self.diffusion.alphas_cumprod, device=device, dtype=torch.float32)
+        alpha_bar = alphas_cumprod[t].view(-1, 1, 1, 1)
+        pred_x0_bjct = (x_t - torch.sqrt(1 - alpha_bar) * pred_eps_bjct) / (torch.sqrt(alpha_bar) + 1e-8)
         
         # 转回 BTJC 计算辅助 loss
         pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
