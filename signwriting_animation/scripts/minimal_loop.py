@@ -157,13 +157,13 @@ def find_good_samples(dataset, data_dir, num_to_check=200, top_k=10):
     # 按运动幅度排序
     good_samples.sort(key=lambda x: x['stats'].get('mean_frame_disp', 0), reverse=True)
     
-    # 找理想样本（运动量大且均匀）
-    # 修改：mean_disp > 2.0（之前是 1.0），找运动量更大的
+    # 找理想样本（运动均匀，无异常跳变）
+    # 注意：这个数据集运动量普遍很小，降低阈值
     ideal_samples = [s for s in good_samples 
                      if s['stats'].get('jump_ratio', 100) < 10
-                     and s['stats'].get('mean_frame_disp', 0) > 2.0]
+                     and s['stats'].get('mean_frame_disp', 0) > 0.5]
     
-    print(f"\n推荐样本 (运动量大 >2px，无大跳变): {len(ideal_samples)} 个")
+    print(f"\n推荐样本 (运动均匀 >0.5px，无大跳变): {len(ideal_samples)} 个")
     for i, s in enumerate(ideal_samples[:top_k]):
         stats = s['stats']
         print(f"  {i+1}. 样本 {s['idx']}: mean_disp={stats.get('mean_frame_disp', 0):.2f}px, "
@@ -171,15 +171,9 @@ def find_good_samples(dataset, data_dir, num_to_check=200, top_k=10):
     
     recommended = [s['idx'] for s in ideal_samples[:top_k]]
     if not recommended and good_samples:
-        # Fallback: 降低阈值到 1.5px
-        fallback_samples = [s for s in good_samples 
-                           if s['stats'].get('jump_ratio', 100) < 10
-                           and s['stats'].get('mean_frame_disp', 0) > 1.5]
-        if fallback_samples:
-            print(f"  (降低阈值到 1.5px，找到 {len(fallback_samples)} 个)")
-            recommended = [s['idx'] for s in fallback_samples[:top_k]]
-        else:
-            recommended = [s['idx'] for s in good_samples[:top_k]]
+        # Fallback: 用任何好样本
+        print(f"  (使用任意好样本)")
+        recommended = [s['idx'] for s in good_samples[:top_k]]
     
     return recommended, good_samples
 
@@ -270,9 +264,11 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("真正的 Diffusion 模型测试 (带样本质量检查)")
+    print("真正的 Diffusion 模型测试 (Epsilon 预测版本)")
     print("=" * 70)
-    print("参考师姐论文：T=8 步, cosine schedule, 预测 x0")
+    print("关键改动：预测 Epsilon（噪声）而不是 x0")
+    print("  - 预测 x0：模型可能忽略 x_t，只根据条件预测静态结果")
+    print("  - 预测 Epsilon：模型必须关注 x_t 才能正确去噪")
     print("=" * 70)
 
     # ===== 配置 =====
@@ -371,7 +367,6 @@ if __name__ == "__main__":
     num_dims = sample_data.shape[-1]
     print(f"关节数: {num_joints}, 维度: {num_dims}")
 
-    # 创建真正的 Diffusion 模型
     model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -379,8 +374,8 @@ if __name__ == "__main__":
         lr=1e-3,
         diffusion_steps=DIFFUSION_STEPS,
         residual_scale=0.1,
-        vel_weight=2.0,   # 增大！让模型关注运动
-        acc_weight=1.0,   # 增大！
+        vel_weight=1.0,   # velocity loss
+        acc_weight=0.5,   # acceleration loss
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

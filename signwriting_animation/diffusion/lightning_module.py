@@ -105,6 +105,7 @@ class _ConditionalWrapper(nn.Module):
         x: [B, J, C, T] (BJCT 格式，GaussianDiffusion 期望的)
         t: [B] timesteps
         """
+        # 直接调用模型 forward
         return self.base_model(x, t, self.past_bjct, self.sign_img)
 
 
@@ -143,7 +144,7 @@ class LitDiffusion(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # model
+        # 模型
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
@@ -152,10 +153,13 @@ class LitDiffusion(pl.LightningModule):
 
         # Cosine beta schedule
         betas = cosine_beta_schedule(diffusion_steps).numpy()
-
+        
+        # 使用 GaussianDiffusion（和师姐一样）
+        # 改成预测 EPSILON 而不是 START_X
+        # 这样模型必须关注 x_t 输入，不能只靠条件预测
         self.diffusion = GaussianDiffusion(
             betas=betas,
-            model_mean_type=ModelMeanType.START_X,  # predict x0
+            model_mean_type=ModelMeanType.EPSILON,  # 预测噪声！
             model_var_type=ModelVarType.FIXED_SMALL,
             loss_type=LossType.MSE,
             rescale_timesteps=False,
@@ -198,6 +202,7 @@ class LitDiffusion(pl.LightningModule):
         B, T_future, J, C = gt_norm.shape
         device = gt_norm.device
 
+        # 转换为 BJCT 格式（GaussianDiffusion 期望的）
         gt_bjct = self.btjc_to_bjct(gt_norm)  # [B, J, C, T]
         past_bjct = self.btjc_to_bjct(past_norm)  # [B, J, C, T_past]
 
@@ -208,12 +213,17 @@ class LitDiffusion(pl.LightningModule):
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
-        # 模型预测 x0
+        # 模型预测 epsilon（噪声）
         t_scaled = self.diffusion._scale_timesteps(t)
-        pred_x0_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
+        pred_eps_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
         
-        # 主 Loss
-        loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
+        # 主 Loss：预测的噪声 vs 真实噪声
+        loss_main = F.mse_loss(pred_eps_bjct, noise)
+        
+        # 从预测的噪声反推 x0，用于计算辅助 loss
+        # x0 = (x_t - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+        alpha_bar = self.diffusion.alphas_cumprod[t].view(-1, 1, 1, 1).to(device)
+        pred_x0_bjct = (x_t - torch.sqrt(1 - alpha_bar) * pred_eps_bjct) / torch.sqrt(alpha_bar)
         
         # 转回 BTJC 计算辅助 loss
         pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
@@ -239,13 +249,13 @@ class LitDiffusion(pl.LightningModule):
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
             disp_gt = mean_frame_disp(gt_btjc_unnorm)
             print("\n" + "=" * 70)
-            print(f"DIFFUSION TRAINING STEP {self._step_count}")
+            print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict Epsilon)")
             print("=" * 70)
             print(f"  t range: [{t.min().item()}, {t.max().item()}]")
-            print(f"  loss_main: {loss_main.item():.6f}")
+            print(f"  loss_main (eps): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
-            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
+            print(f"  disp_pred (from x0): {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
