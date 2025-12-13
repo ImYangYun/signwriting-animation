@@ -1,7 +1,4 @@
-# pylint: disable=invalid-name,arguments-differ,too-many-locals,too-many-instance-attributes,too-many-arguments,too-many-positional-arguments
-"""
-真正的 Diffusion 版本 - 参考师姐论文 (T=8 步, cosine schedule, 预测 x0)
-"""
+# -*- coding: utf-8 -*-
 import os
 import torch
 from torch import nn
@@ -9,21 +6,16 @@ import torch.nn.functional as F
 import numpy as np
 import lightning as pl
 
-try:
-    from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
-    HAS_DTW = True
-except ImportError:
-    HAS_DTW = False
-    PE_DTW = None
 
+from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import (
     GaussianDiffusion,
     ModelMeanType,
     ModelVarType,
     LossType,
 )
-
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
+
 
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     if hasattr(x, "zero_filled"):
@@ -95,12 +87,26 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return torch.clip(betas, 0.0001, 0.9999)
 
 
+class _ConditionalWrapper(nn.Module):
+    def __init__(self, base_model: nn.Module, past_bjct: torch.Tensor, sign_img: torch.Tensor):
+        super().__init__()
+        self.base_model = base_model
+        self.past_bjct = past_bjct
+        self.sign_img = sign_img
+    
+    def forward(self, x, t, **kwargs):
+        """
+        x: [B, J, C, T] (BJCT 格式，GaussianDiffusion 期望的)
+        t: [B] timesteps
+        """
+        return self.base_model(x, t, self.past_bjct, self.sign_img)
+
+
 class LitDiffusion(pl.LightningModule):
     """
-    真正的 Diffusion 版本
+    修复版 Diffusion
     
-    训练：对 GT 加噪声，模型预测 x0
-    推理：从纯噪声开始，多步去噪
+    关键改动：使用 GaussianDiffusion.p_sample_loop 进行采样
     """
 
     def __init__(
@@ -109,9 +115,8 @@ class LitDiffusion(pl.LightningModule):
         num_dims=3,
         lr=1e-4,
         stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
-        diffusion_steps=8,  # 师姐用 T=8
-        pred_target="x0",   # 预测 x0（不是 epsilon）
-        guidance_scale=0.0,
+        diffusion_steps=8,
+        guidance_scale=0.0,  # CFG scale，0 表示不用 CFG
         residual_scale: float = 0.1,
         vel_weight: float = 0.5,
         acc_weight: float = 0.2,
@@ -122,6 +127,7 @@ class LitDiffusion(pl.LightningModule):
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
+        self.guidance_scale = guidance_scale
         self._step_count = 0
 
         # 加载统计信息
@@ -138,9 +144,10 @@ class LitDiffusion(pl.LightningModule):
             residual_scale=residual_scale,
         )
 
-        # Cosine beta schedule (师姐论文)
+        # Cosine beta schedule
         betas = cosine_beta_schedule(diffusion_steps).numpy()
         
+        # 使用 GaussianDiffusion（和师姐一样）
         self.diffusion = GaussianDiffusion(
             betas=betas,
             model_mean_type=ModelMeanType.START_X,  # 预测 x0
@@ -150,7 +157,6 @@ class LitDiffusion(pl.LightningModule):
         )
 
         self.lr = lr
-        self.guidance_scale = float(guidance_scale)
         self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": []}
 
     def normalize(self, x):
@@ -161,34 +167,17 @@ class LitDiffusion(pl.LightningModule):
 
     @staticmethod
     def btjc_to_bjct(x):
+        """[B,T,J,C] -> [B,J,C,T]"""
         return x.permute(0, 2, 3, 1).contiguous()
 
     @staticmethod
     def bjct_to_btjc(x):
+        """[B,J,C,T] -> [B,T,J,C]"""
         return x.permute(0, 3, 1, 2).contiguous()
-
-    def _model_forward(self, x_t_btjc, t, past_btjc, sign_img):
-        """
-        模型前向：输入带噪声的 x_t，预测干净的 x0
-        """
-        x_t_bjct = self.btjc_to_bjct(x_t_btjc)
-        past_bjct = self.btjc_to_bjct(past_btjc)
-        
-        # t 需要 scale
-        t_scaled = self.diffusion._scale_timesteps(t)
-        
-        pred_bjct = self.model.forward(x_t_bjct, t_scaled, past_bjct, sign_img)
-        pred_btjc = self.bjct_to_btjc(pred_bjct)
-        
-        return pred_btjc
 
     def training_step(self, batch, batch_idx):
         """
-        真正的 Diffusion 训练：
-        1. 随机采样 t
-        2. 给 GT 加噪声得到 x_t
-        3. 模型从 x_t 预测 x0
-        4. Loss = MSE(pred_x0, gt)
+        Diffusion 训练
         """
         debug = self._step_count == 0 or self._step_count % 100 == 0
 
@@ -204,31 +193,35 @@ class LitDiffusion(pl.LightningModule):
         B, T_future, J, C = gt_norm.shape
         device = gt_norm.device
 
-        # ===== 关键改动：真正的 Diffusion 训练 =====
-        
-        # 1. 随机采样 timestep t ∈ [0, T)
+        # 转换为 BJCT 格式（GaussianDiffusion 期望的）
+        gt_bjct = self.btjc_to_bjct(gt_norm)  # [B, J, C, T]
+        past_bjct = self.btjc_to_bjct(past_norm)  # [B, J, C, T_past]
+
+        # 随机采样 timestep
         t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
         
-        # 2. 给 GT 加噪声
-        noise = torch.randn_like(gt_norm)
-        x_t = self.diffusion.q_sample(gt_norm, t, noise=noise)
+        # 给 GT 加噪声
+        noise = torch.randn_like(gt_bjct)
+        x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
-        # 3. 模型预测 x0
-        pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
+        # 模型预测 x0
+        t_scaled = self.diffusion._scale_timesteps(t)
+        pred_x0_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
         
-        # 4. 主 Loss：预测 x0
-        loss_main = F.mse_loss(pred_x0, gt_norm)
+        # 主 Loss
+        loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
         
-        # ===== 辅助 Loss =====
-        pred_raw = self.unnormalize(pred_x0)
-        gt_raw = self.unnormalize(gt_norm)
+        # 转回 BTJC 计算辅助 loss
+        pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
+        gt_btjc_unnorm = self.unnormalize(gt_norm)
+        pred_btjc_unnorm = self.unnormalize(pred_x0_btjc)
         
         loss_vel = torch.tensor(0.0, device=device)
         loss_acc = torch.tensor(0.0, device=device)
         
-        if pred_raw.size(1) > 1:
-            v_pred = pred_raw[:, 1:] - pred_raw[:, :-1]
-            v_gt = gt_raw[:, 1:] - gt_raw[:, :-1]
+        if pred_btjc_unnorm.size(1) > 1:
+            v_pred = pred_btjc_unnorm[:, 1:] - pred_btjc_unnorm[:, :-1]
+            v_gt = gt_btjc_unnorm[:, 1:] - gt_btjc_unnorm[:, :-1]
             loss_vel = F.mse_loss(v_pred, v_gt)
             
             if v_pred.size(1) > 1:
@@ -239,8 +232,8 @@ class LitDiffusion(pl.LightningModule):
         loss = loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
 
         if debug:
-            disp_pred = mean_frame_disp(pred_raw)
-            disp_gt = mean_frame_disp(gt_raw)
+            disp_pred = mean_frame_disp(pred_btjc_unnorm)
+            disp_gt = mean_frame_disp(gt_btjc_unnorm)
             print("\n" + "=" * 70)
             print(f"DIFFUSION TRAINING STEP {self._step_count}")
             print("=" * 70)
@@ -270,110 +263,124 @@ class LitDiffusion(pl.LightningModule):
     @torch.no_grad()
     def sample(self, past_btjc, sign_img, future_len=20):
         """
-        改进的 Diffusion 采样：从 past_last 开始，而不是纯噪声
+        使用 GaussianDiffusion.p_sample_loop 进行采样（正确的方式）
         
-        这样模型可以基于历史位置进行去噪，避免完全静态的问题
+        参考师姐的 _process_validation_batch 实现
         """
         self.eval()
         device = self.device
 
         past_raw = sanitize_btjc(past_btjc.to(device))
         past_norm = self.normalize(past_raw)
+        past_bjct = self.btjc_to_bjct(past_norm)  # [B, J, C, T_past]
 
-        B, _, J, C = past_norm.shape
-
-        past_last = past_norm[:, -1:, :, :]  # [B, 1, J, C]
-        past_last_expanded = past_last.expand(-1, future_len, -1, -1)  # [B, T, J, C]
+        B, J, C, _ = past_bjct.shape
         
-        # 加上对应 t=T-1 的噪声水平
-        alpha_bar_T = self.diffusion.alphas_cumprod[-1]
-        noise = torch.randn(B, future_len, J, C, device=device)
-        x_t = (
-            torch.sqrt(torch.tensor(alpha_bar_T, device=device)) * past_last_expanded
-            + torch.sqrt(torch.tensor(1 - alpha_bar_T, device=device)) * noise
+        # 目标 shape: [B, J, C, T_future]
+        target_shape = (B, J, C, future_len)
+        
+        # 包装模型，固定条件
+        wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
+        
+        # 使用 GaussianDiffusion 的 p_sample_loop（正确的采样！）
+        pred_bjct = self.diffusion.p_sample_loop(
+            model=wrapped_model,
+            shape=target_shape,
+            clip_denoised=False,
+            model_kwargs={},
+            progress=False,
         )
+        
+        # 转回 BTJC
+        pred_btjc = self.bjct_to_btjc(pred_bjct)
+        
+        return self.unnormalize(pred_btjc)
 
-        # T 步去噪（从 T-1 到 0）
-        for i in reversed(range(self.diffusion_steps)):
-            t = torch.full((B,), i, device=device, dtype=torch.long)
-            
-            # 模型预测 x0
-            pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
-            
-            # 用 diffusion 的 p_sample 去噪一步
-            # 这里我们手动实现简化版本
-            if i > 0:
-                # 计算 x_{t-1}
-                alpha_bar_t = self.diffusion.alphas_cumprod[i]
-                alpha_bar_t_prev = self.diffusion.alphas_cumprod[i - 1]
-                
-                # 简化的 DDPM 采样
-                beta_t = 1 - alpha_bar_t / alpha_bar_t_prev
-                
-                # x_{t-1} = sqrt(alpha_bar_{t-1}) * pred_x0 + sqrt(1 - alpha_bar_{t-1}) * noise
-                noise = torch.randn_like(x_t) if i > 1 else torch.zeros_like(x_t)
-                x_t = (
-                    torch.sqrt(torch.tensor(alpha_bar_t_prev, device=device)) * pred_x0
-                    + torch.sqrt(torch.tensor(1 - alpha_bar_t_prev, device=device)) * noise
-                )
-            else:
-                # 最后一步直接用 pred_x0
-                x_t = pred_x0
+    @torch.no_grad()
+    def sample_with_cfg(self, past_btjc, sign_img, future_len=20, guidance_scale=2.0):
+        """
+        使用 Classifier-Free Guidance 采样
+        
+        参考师姐的实现：
+        chunk = uncond_chunk + guidance_scale * (cond_chunk - uncond_chunk)
+        """
+        self.eval()
+        device = self.device
 
-        return self.unnormalize(x_t)
+        past_raw = sanitize_btjc(past_btjc.to(device))
+        past_norm = self.normalize(past_raw)
+        past_bjct = self.btjc_to_bjct(past_norm)
+
+        B, J, C, _ = past_bjct.shape
+        target_shape = (B, J, C, future_len)
+        
+        # Conditional sampling
+        wrapped_model_cond = _ConditionalWrapper(self.model, past_bjct, sign_img)
+        cond_pred = self.diffusion.p_sample_loop(
+            model=wrapped_model_cond,
+            shape=target_shape,
+            clip_denoised=False,
+            model_kwargs={},
+            progress=False,
+        )
+        
+        # Unconditional sampling (zero out conditions)
+        uncond_past = torch.zeros_like(past_bjct)
+        uncond_sign = torch.zeros_like(sign_img)
+        wrapped_model_uncond = _ConditionalWrapper(self.model, uncond_past, uncond_sign)
+        uncond_pred = self.diffusion.p_sample_loop(
+            model=wrapped_model_uncond,
+            shape=target_shape,
+            clip_denoised=False,
+            model_kwargs={},
+            progress=False,
+        )
+        
+        # CFG combination
+        pred_bjct = uncond_pred + guidance_scale * (cond_pred - uncond_pred)
+        
+        pred_btjc = self.bjct_to_btjc(pred_bjct)
+        return self.unnormalize(pred_btjc)
 
     @torch.no_grad()
     def sample_ddim(self, past_btjc, sign_img, future_len=20, ddim_steps=None):
         """
-        改进的 DDIM 采样：从 past_last 开始
+        使用 DDIM 采样（如果 GaussianDiffusion 支持）
+        否则 fallback 到 p_sample_loop
         """
         self.eval()
         device = self.device
 
         past_raw = sanitize_btjc(past_btjc.to(device))
         past_norm = self.normalize(past_raw)
+        past_bjct = self.btjc_to_bjct(past_norm)
 
-        B, _, J, C = past_norm.shape
-
-        if ddim_steps is None:
-            ddim_steps = self.diffusion_steps
+        B, J, C, _ = past_bjct.shape
+        target_shape = (B, J, C, future_len)
         
-        step_size = self.diffusion_steps // ddim_steps
-        timesteps = list(range(0, self.diffusion_steps, step_size))[::-1]
-
-        # 改进：从 past_last 开始
-        past_last = past_norm[:, -1:, :, :]
-        past_last_expanded = past_last.expand(-1, future_len, -1, -1)
+        wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
         
-        alpha_bar_T = self.diffusion.alphas_cumprod[-1]
-        noise = torch.randn(B, future_len, J, C, device=device)
-        x_t = (
-            torch.sqrt(torch.tensor(alpha_bar_T, device=device)) * past_last_expanded
-            + torch.sqrt(torch.tensor(1 - alpha_bar_T, device=device)) * noise
-        )
-
-        for i, t_cur in enumerate(timesteps):
-            t = torch.full((B,), t_cur, device=device, dtype=torch.long)
-            
-            # 模型预测 x0
-            pred_x0 = self._model_forward(x_t, t, past_norm, sign_img)
-            
-            if i < len(timesteps) - 1:
-                t_next = timesteps[i + 1]
-                alpha_bar_t = self.diffusion.alphas_cumprod[t_cur]
-                alpha_bar_t_next = self.diffusion.alphas_cumprod[t_next]
-                
-                # DDIM 确定性采样
-                x_t = (
-                    torch.sqrt(torch.tensor(alpha_bar_t_next, device=device)) * pred_x0
-                    + torch.sqrt(torch.tensor(1 - alpha_bar_t_next, device=device)) 
-                    * (x_t - torch.sqrt(torch.tensor(alpha_bar_t, device=device)) * pred_x0)
-                    / torch.sqrt(torch.tensor(1 - alpha_bar_t, device=device))
-                )
-            else:
-                x_t = pred_x0
-
-        return self.unnormalize(x_t)
+        # 尝试使用 ddim_sample_loop
+        if hasattr(self.diffusion, 'ddim_sample_loop'):
+            pred_bjct = self.diffusion.ddim_sample_loop(
+                model=wrapped_model,
+                shape=target_shape,
+                clip_denoised=False,
+                model_kwargs={},
+                progress=False,
+            )
+        else:
+            # Fallback to p_sample_loop
+            pred_bjct = self.diffusion.p_sample_loop(
+                model=wrapped_model,
+                shape=target_shape,
+                clip_denoised=False,
+                model_kwargs={},
+                progress=False,
+            )
+        
+        pred_btjc = self.bjct_to_btjc(pred_bjct)
+        return self.unnormalize(pred_btjc)
 
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
@@ -405,4 +412,5 @@ class LitDiffusion(pl.LightningModule):
             print(f"[TRAIN CURVE] failed: {e}")
 
 
+# Alias
 LitMinimal = LitDiffusion

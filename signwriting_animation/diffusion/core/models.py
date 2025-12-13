@@ -160,6 +160,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
+        # 融合所有条件
         xseq = (future_motion_emb 
                 + 0.3 * time_cond 
                 + 0.3 * sign_cond 
@@ -259,4 +260,6 @@ class EmbedSignWriting(nn.Module):
             embeddings_batch = self.proj(embeddings_batch)
         return embeddings_batch[None, ...]
 
+
+# Alias
 SignWritingToPoseDiffusion = SignWritingToPoseDiffusionV2
