@@ -25,14 +25,15 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                  activation: str = "gelu",
                  arch: str = "trans_enc",
                  cond_mask_prob: float = 0,
-                 residual_scale: float = 0.1):
+                 residual_scale: float = 0.1):  # 保留参数但不使用
         super().__init__()
         self.verbose = False
         self.cond_mask_prob = cond_mask_prob
         self._forward_count = 0
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
-        self.use_residual = False
+        # 不再使用 residual_scale
+        self.use_residual = False  # 关闭残差
 
         input_feats = num_keypoints * num_dims_per_keypoint
         
@@ -71,6 +72,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             for _ in range(3)
         ])
 
+        # past_last encoder (用于条件注入，但不做残差)
         self.past_last_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
             nn.LayerNorm(num_latent_dims),
@@ -78,6 +80,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             nn.Linear(num_latent_dims, num_latent_dims),
         )
 
+        # Output projection - 直接输出 x0
         self.pose_projection = OutputProcessMLP(
             num_latent_dims, num_keypoints, num_dims_per_keypoint
         )
@@ -125,6 +128,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             else:
                 raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
+        # 获取 past 的最后一帧作为条件（但不做残差）
         past_last = past_motion[..., -1]  # [B, J, C]
         past_last_flat = past_last.reshape(batch_size, -1)  # [B, J*C]
         
@@ -156,7 +160,6 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         time_cond = time_emb.repeat(Tf, 1, 1)
         sign_cond = signwriting_emb.repeat(Tf, 1, 1)
 
-        # 融合所有条件
         xseq = (future_motion_emb 
                 + 0.3 * time_cond 
                 + 0.3 * sign_cond 
@@ -181,6 +184,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
 
         if debug:
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
+            # 计算帧间差异
             if result.size(-1) > 1:
                 disp = (result[..., 1:] - result[..., :-1]).abs().mean().item()
                 print(f"  result disp: {disp:.6f}")

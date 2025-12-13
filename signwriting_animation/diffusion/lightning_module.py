@@ -87,10 +87,6 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
-    """
-    Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
-    师姐论文使用的 schedule
-    """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
@@ -274,7 +270,9 @@ class LitDiffusion(pl.LightningModule):
     @torch.no_grad()
     def sample(self, past_btjc, sign_img, future_len=20):
         """
-        真正的 Diffusion 采样：从纯噪声开始，T 步去噪
+        改进的 Diffusion 采样：从 past_last 开始，而不是纯噪声
+        
+        这样模型可以基于历史位置进行去噪，避免完全静态的问题
         """
         self.eval()
         device = self.device
@@ -284,8 +282,16 @@ class LitDiffusion(pl.LightningModule):
 
         B, _, J, C = past_norm.shape
 
-        # 从纯噪声开始
-        x_t = torch.randn(B, future_len, J, C, device=device)
+        past_last = past_norm[:, -1:, :, :]  # [B, 1, J, C]
+        past_last_expanded = past_last.expand(-1, future_len, -1, -1)  # [B, T, J, C]
+        
+        # 加上对应 t=T-1 的噪声水平
+        alpha_bar_T = self.diffusion.alphas_cumprod[-1]
+        noise = torch.randn(B, future_len, J, C, device=device)
+        x_t = (
+            torch.sqrt(torch.tensor(alpha_bar_T, device=device)) * past_last_expanded
+            + torch.sqrt(torch.tensor(1 - alpha_bar_T, device=device)) * noise
+        )
 
         # T 步去噪（从 T-1 到 0）
         for i in reversed(range(self.diffusion_steps)):
@@ -319,7 +325,7 @@ class LitDiffusion(pl.LightningModule):
     @torch.no_grad()
     def sample_ddim(self, past_btjc, sign_img, future_len=20, ddim_steps=None):
         """
-        DDIM 采样（更快，可以用更少的步数）
+        改进的 DDIM 采样：从 past_last 开始
         """
         self.eval()
         device = self.device
@@ -329,16 +335,22 @@ class LitDiffusion(pl.LightningModule):
 
         B, _, J, C = past_norm.shape
 
-        # DDIM 可以用更少的步数
         if ddim_steps is None:
             ddim_steps = self.diffusion_steps
         
-        # 创建采样时间步（均匀分布）
         step_size = self.diffusion_steps // ddim_steps
         timesteps = list(range(0, self.diffusion_steps, step_size))[::-1]
 
-        # 从纯噪声开始
-        x_t = torch.randn(B, future_len, J, C, device=device)
+        # 改进：从 past_last 开始
+        past_last = past_norm[:, -1:, :, :]
+        past_last_expanded = past_last.expand(-1, future_len, -1, -1)
+        
+        alpha_bar_T = self.diffusion.alphas_cumprod[-1]
+        noise = torch.randn(B, future_len, J, C, device=device)
+        x_t = (
+            torch.sqrt(torch.tensor(alpha_bar_T, device=device)) * past_last_expanded
+            + torch.sqrt(torch.tensor(1 - alpha_bar_T, device=device)) * noise
+        )
 
         for i, t_cur in enumerate(timesteps):
             t = torch.full((B,), t_cur, device=device, dtype=torch.long)
@@ -393,5 +405,4 @@ class LitDiffusion(pl.LightningModule):
             print(f"[TRAIN CURVE] failed: {e}")
 
 
-# 保留原来的别名
 LitMinimal = LitDiffusion
