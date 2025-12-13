@@ -11,6 +11,7 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 
+
 def cosine_beta_schedule(timesteps, s=0.008):
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
@@ -44,6 +45,13 @@ def mean_frame_disp(x):
     return v.abs().mean().item()
 
 
+def compute_disp_tensor(x_bjct):
+    """计算 displacement (BJCT 格式)"""
+    # [B, J, C, T] -> velocity 在 T 维度
+    vel = x_bjct[:, :, :, 1:] - x_bjct[:, :, :, :-1]
+    return vel.abs().mean()
+
+
 class ConditionalWrapper(nn.Module):
     def __init__(self, model, past, sign):
         super().__init__()
@@ -55,17 +63,9 @@ class ConditionalWrapper(nn.Module):
         return self.model(x, t, self.past, self.sign)
 
 
-def compute_velocity_loss(pred_bjct, gt_bjct):
-    """计算 velocity loss (在 BJCT 格式下)"""
-    # BJCT: [B, J, C, T] -> velocity 在 T 维度
-    pred_vel = pred_bjct[:, :, :, 1:] - pred_bjct[:, :, :, :-1]
-    gt_vel = gt_bjct[:, :, :, 1:] - gt_bjct[:, :, :, :-1]
-    return F.mse_loss(pred_vel, gt_vel)
-
-
 def main():
     print("=" * 70)
-    print("修复 Diffusion：加入 Velocity Loss")
+    print("修复 Diffusion v2：强制 Displacement 匹配")
     print("=" * 70)
     
     pl.seed_everything(42)
@@ -102,9 +102,11 @@ def main():
     past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
     
     gt_disp = mean_frame_disp(gt_raw)
+    gt_disp_tensor = compute_disp_tensor(gt_bjct)
     
     print(f"\n数据:")
     print(f"  GT pixel disp: {gt_disp:.6f}")
+    print(f"  GT norm disp (tensor): {gt_disp_tensor.item():.6f}")
     
     # 创建 Diffusion
     DIFFUSION_STEPS = 8
@@ -128,12 +130,12 @@ def main():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     
-    # ========== 训练（带 Velocity Loss）==========
+    # ========== 训练（强制 Displacement 匹配）==========
     print("\n" + "=" * 70)
-    print("训练 (3000 步, MSE + Velocity Loss)")
+    print("训练 (3000 步, MSE + Displacement Ratio Loss)")
     print("=" * 70)
     
-    VEL_WEIGHT = 1.0  # velocity loss 权重
+    DISP_WEIGHT = 100.0  # 大权重！
     
     model.train()
     for step in range(3000):
@@ -149,11 +151,15 @@ def main():
         # MSE Loss
         loss_mse = F.mse_loss(pred_x0, gt_bjct)
         
-        # Velocity Loss
-        loss_vel = compute_velocity_loss(pred_x0, gt_bjct)
+        # Displacement Ratio Loss: |pred_disp - gt_disp|
+        pred_disp = compute_disp_tensor(pred_x0)
+        loss_disp = torch.abs(pred_disp - gt_disp_tensor)
+        
+        # 或者用 relative loss: |pred_disp/gt_disp - 1|
+        # loss_disp = torch.abs(pred_disp / (gt_disp_tensor + 1e-8) - 1.0)
         
         # 总 Loss
-        loss = loss_mse + VEL_WEIGHT * loss_vel
+        loss = loss_mse + DISP_WEIGHT * loss_disp
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -164,21 +170,21 @@ def main():
             pred_unnorm = pred_btjc * std_pose + mean_pose
             disp = mean_frame_disp(pred_unnorm)
             ratio = disp / (gt_disp + 1e-8)
-            print(f"  Step {step}: mse={loss_mse.item():.6f}, vel={loss_vel.item():.6f}, "
-                  f"disp={disp:.6f}, ratio={ratio:.4f}, t={t.item()}")
+            print(f"  Step {step}: mse={loss_mse.item():.6f}, disp_loss={loss_disp.item():.6f}, "
+                  f"pred_disp={pred_disp.item():.6f}, ratio={ratio:.4f}, t={t.item()}")
     
     print(f"\n训练完成!")
     
     # ========== 测试 ==========
     print("\n" + "=" * 70)
-    print("测试：模型在不同输入下的预测")
+    print("测试")
     print("=" * 70)
     
     model.eval()
     with torch.no_grad():
         target_shape = (1, gt_raw.shape[2], gt_raw.shape[3], gt_raw.shape[1])
         
-        # 测试 1: 从 GT+noise 预测
+        # 从 GT+noise 预测
         print("\n从 GT+noise 预测:")
         for t_val in [0, 4, 7]:
             t = torch.tensor([t_val], device=device)
@@ -195,22 +201,7 @@ def main():
             
             print(f"  t={t_val}: disp={disp:.6f}, ratio={ratio:.4f}")
         
-        # 测试 2: 从纯噪声预测
-        print("\n从纯噪声预测:")
-        x_noise = torch.randn(target_shape, device=device)
-        for t_val in [7, 4, 0]:
-            t = torch.tensor([t_val], device=device)
-            t_scaled = diffusion._scale_timesteps(t)
-            pred_x0 = model(x_noise, t_scaled, past_bjct, sign)
-            
-            pred_btjc = pred_x0.permute(0, 3, 1, 2)
-            pred_unnorm = pred_btjc * std_pose + mean_pose
-            disp = mean_frame_disp(pred_unnorm)
-            ratio = disp / (gt_disp + 1e-8)
-            
-            print(f"  t={t_val}: disp={disp:.6f}, ratio={ratio:.4f}")
-        
-        # 测试 3: p_sample_loop
+        # p_sample_loop
         print("\np_sample_loop:")
         wrapped = ConditionalWrapper(model, past_bjct, sign)
         
@@ -261,15 +252,14 @@ def main():
     
     if final_ratio > 0.5:
         print(f"\n✅ 成功! disp_ratio={final_ratio:.4f}")
-        print("   Velocity loss 解决了问题!")
     elif final_ratio > 0.3:
         print(f"\n⚠️ 部分成功: disp_ratio={final_ratio:.4f}")
-        print("   可能需要调整 velocity loss 权重")
     else:
         print(f"\n❌ 仍然失败: disp_ratio={final_ratio:.4f}")
-        print("   需要其他方案")
-    
-    print("\n" + "=" * 70)
+        print("\n可能需要:")
+        print("  1. 更大的 DISP_WEIGHT")
+        print("  2. 换用 relative loss")
+        print("  3. 考虑用 Regression 代替 Diffusion")
 
 
 if __name__ == "__main__":
