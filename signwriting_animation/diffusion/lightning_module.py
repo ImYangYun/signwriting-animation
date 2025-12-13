@@ -88,6 +88,12 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 class _ConditionalWrapper(nn.Module):
+    """
+    包装模型，固定条件输入，只接受 (x, t) 参数
+    这样可以兼容 GaussianDiffusion.p_sample_loop 的接口
+    
+    参考师姐的实现
+    """
     def __init__(self, base_model: nn.Module, past_bjct: torch.Tensor, sign_img: torch.Tensor):
         super().__init__()
         self.base_model = base_model
@@ -137,7 +143,7 @@ class LitDiffusion(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # 模型
+        # model
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
@@ -146,11 +152,10 @@ class LitDiffusion(pl.LightningModule):
 
         # Cosine beta schedule
         betas = cosine_beta_schedule(diffusion_steps).numpy()
-        
-        # 使用 GaussianDiffusion（和师姐一样）
+
         self.diffusion = GaussianDiffusion(
             betas=betas,
-            model_mean_type=ModelMeanType.START_X,  # 预测 x0
+            model_mean_type=ModelMeanType.START_X,  # predict x0
             model_var_type=ModelVarType.FIXED_SMALL,
             loss_type=LossType.MSE,
             rescale_timesteps=False,
@@ -193,7 +198,6 @@ class LitDiffusion(pl.LightningModule):
         B, T_future, J, C = gt_norm.shape
         device = gt_norm.device
 
-        # 转换为 BJCT 格式（GaussianDiffusion 期望的）
         gt_bjct = self.btjc_to_bjct(gt_norm)  # [B, J, C, T]
         past_bjct = self.btjc_to_bjct(past_norm)  # [B, J, C, T_past]
 
@@ -283,11 +287,12 @@ class LitDiffusion(pl.LightningModule):
         wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
         
         # 使用 GaussianDiffusion 的 p_sample_loop（正确的采样！）
+        # 注意：CAMDM 需要 model_kwargs 包含 'y' 键
         pred_bjct = self.diffusion.p_sample_loop(
             model=wrapped_model,
             shape=target_shape,
             clip_denoised=False,
-            model_kwargs={},
+            model_kwargs={"y": {}},  # CAMDM 需要这个键
             progress=False,
         )
         
@@ -320,7 +325,7 @@ class LitDiffusion(pl.LightningModule):
             model=wrapped_model_cond,
             shape=target_shape,
             clip_denoised=False,
-            model_kwargs={},
+            model_kwargs={"y": {}},
             progress=False,
         )
         
@@ -332,7 +337,7 @@ class LitDiffusion(pl.LightningModule):
             model=wrapped_model_uncond,
             shape=target_shape,
             clip_denoised=False,
-            model_kwargs={},
+            model_kwargs={"y": {}},
             progress=False,
         )
         
@@ -366,7 +371,7 @@ class LitDiffusion(pl.LightningModule):
                 model=wrapped_model,
                 shape=target_shape,
                 clip_denoised=False,
-                model_kwargs={},
+                model_kwargs={"y": {}},
                 progress=False,
             )
         else:
@@ -375,7 +380,7 @@ class LitDiffusion(pl.LightningModule):
                 model=wrapped_model,
                 shape=target_shape,
                 clip_denoised=False,
-                model_kwargs={},
+                model_kwargs={"y": {}},
                 progress=False,
             )
         

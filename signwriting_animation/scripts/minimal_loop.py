@@ -175,6 +175,9 @@ def find_good_samples(dataset, data_dir, num_to_check=200, top_k=10):
     return recommended, good_samples
 
 
+# ============================================================
+# tensor_to_pose
+# ============================================================
 
 def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     """转换 tensor 到 pose 格式"""
@@ -208,7 +211,9 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     
     T_pred = pose_obj.body.data.shape[0]
     T_ref_total = ref_pose.body.data.shape[0]
-
+    
+    # 关键修复：gt/pred 是 future 部分，对应原始文件的后 T_pred 帧
+    # 不是前 T_pred 帧！
     future_start = max(0, T_ref_total - T_pred)
     ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
@@ -241,6 +246,10 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     return pose_obj
 
 
+# ============================================================
+# Main
+# ============================================================
+
 if __name__ == "__main__":
     pl.seed_everything(42)
 
@@ -260,12 +269,15 @@ if __name__ == "__main__":
     # ===== 配置 =====
     AUTO_SELECT_SAMPLE = True   # True: 自动筛选好样本, False: 使用 SAMPLE_IDX
     SAMPLE_IDX = 50             # 如果 AUTO_SELECT_SAMPLE=False，使用这个
+    NUM_SAMPLES = 8             # 训练样本数量（1=单样本overfit, 4-16=多样本）
     MAX_EPOCHS = 1000
-    DIFFUSION_STEPS = 8
+    DIFFUSION_STEPS = 8         # 师姐用 T=8
+    BATCH_SIZE = min(4, NUM_SAMPLES)  # batch size
     
     print(f"\n配置:")
     print(f"  AUTO_SELECT_SAMPLE: {AUTO_SELECT_SAMPLE}")
-    print(f"  SAMPLE_IDX: {SAMPLE_IDX}")
+    print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
+    print(f"  BATCH_SIZE: {BATCH_SIZE}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
     print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")
 
@@ -281,62 +293,66 @@ if __name__ == "__main__":
     
     print(f"\n数据集大小: {len(base_ds)}")
 
+    # ===== 样本选择 =====
     if AUTO_SELECT_SAMPLE:
-        recommended, good_samples = find_good_samples(base_ds, data_dir, num_to_check=200)
-        if recommended:
-            SAMPLE_IDX = recommended[0]
-            print(f"\n✓ 自动选择样本: {SAMPLE_IDX}")
+        recommended, good_samples = find_good_samples(base_ds, data_dir, num_to_check=300)
+        if len(recommended) >= NUM_SAMPLES:
+            selected_indices = recommended[:NUM_SAMPLES]
+            print(f"\n✓ 自动选择 {NUM_SAMPLES} 个好样本: {selected_indices}")
         else:
-            print(f"\n⚠ 没有找到理想样本，使用默认: {SAMPLE_IDX}")
-
-    record = base_ds.records[SAMPLE_IDX]
-    pose_path = record["pose"]
-    if not os.path.isabs(pose_path):
-        pose_path = os.path.join(data_dir, pose_path)
+            # 不够好样本，用所有好样本 + 一些其他样本
+            selected_indices = recommended + list(range(len(recommended), NUM_SAMPLES))
+            print(f"\n⚠ 好样本不足，选择: {selected_indices}")
+    else:
+        # 手动选择，从 SAMPLE_IDX 开始取 NUM_SAMPLES 个
+        selected_indices = list(range(SAMPLE_IDX, SAMPLE_IDX + NUM_SAMPLES))
+        print(f"\n手动选择样本: {selected_indices}")
     
-    is_good, issues, stats = check_pose_file_quality(pose_path)
-    
+    # 检查选中样本的质量
     print(f"\n" + "=" * 70)
-    print(f"选中样本 {SAMPLE_IDX} 的质量检查")
+    print(f"选中样本质量检查")
     print("=" * 70)
-    print(f"文件: {os.path.basename(pose_path)}")
-    print(f"质量: {'✓ 良好' if is_good else '✗ 有问题'}")
-    if issues:
-        print(f"问题: {issues}")
-    print(f"统计:")
-    print(f"  帧数: {stats.get('checked_frames', 0)}")
-    print(f"  平均帧间位移: {stats.get('mean_frame_disp', 0):.2f} px")
-    print(f"  最大帧间位移: {stats.get('max_frame_disp', 0):.2f} px")
-    print(f"  跳变比例 (max/mean): {stats.get('jump_ratio', 0):.1f}")
-    print(f"  零坐标帧: {stats.get('zero_frames', 0)}")
-    print(f"  异常跳变: {stats.get('large_jumps', 0)}")
+    
+    for idx in selected_indices[:5]:  # 只显示前5个
+        record = base_ds.records[idx]
+        pose_path = record["pose"]
+        if not os.path.isabs(pose_path):
+            pose_path = os.path.join(data_dir, pose_path)
+        
+        is_good, issues, stats = check_pose_file_quality(pose_path)
+        status = "✓" if is_good else "✗"
+        mean_disp = stats.get('mean_frame_disp', 0)
+        print(f"  {status} 样本 {idx}: mean_disp={mean_disp:.2f}px, issues={issues if issues else 'None'}")
 
     # 加载样本
     import random
     random.seed(12345)
     
-    best_sample = base_ds[SAMPLE_IDX]
-    print(f"\n样本 ID: {best_sample.get('id', 'unknown')}")
-    
-    # 单样本 Dataset
-    class FixedSampleDataset(torch.utils.data.Dataset):
-        def __init__(self, sample):
-            self.sample = sample
+    # 多样本 Dataset
+    class MultiSampleDataset(torch.utils.data.Dataset):
+        def __init__(self, base_dataset, indices):
+            self.base_dataset = base_dataset
+            self.indices = indices
+            self.samples = [base_dataset[i] for i in indices]
+        
         def __len__(self):
-            return 1
+            return len(self.samples)
+        
         def __getitem__(self, idx):
-            return self.sample
+            return self.samples[idx]
     
-    train_ds = FixedSampleDataset(best_sample)
+    train_ds = MultiSampleDataset(base_ds, selected_indices)
     train_loader = DataLoader(
         train_ds, 
-        batch_size=1, 
-        shuffle=False, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,  # 多样本时 shuffle
         collate_fn=zero_pad_collator,
     )
     
-    # 获取维度信息
-    sample_data = best_sample["data"]
+    print(f"\n训练集大小: {len(train_ds)}, Batch size: {BATCH_SIZE}")
+    
+    # 获取维度信息（用第一个样本）
+    sample_data = train_ds[0]["data"]
     if hasattr(sample_data, 'zero_filled'):
         sample_data = sample_data.zero_filled()
     if hasattr(sample_data, 'tensor'):
@@ -376,7 +392,7 @@ if __name__ == "__main__":
     
     trainer.fit(model, train_loader)
 
-    # Inference
+    # Inference - 用第一个样本测试
     print("\n" + "=" * 70)
     print("DIFFUSION INFERENCE (8 步去噪)")
     print("=" * 70)
@@ -384,13 +400,18 @@ if __name__ == "__main__":
     model = model.to(device)
     model.eval()
     
-    batch = next(iter(train_loader))
-    cond = batch["conditions"]
+    # 用第一个样本做测试
+    test_sample = train_ds[0]
+    test_batch = zero_pad_collator([test_sample])
+    
+    cond = test_batch["conditions"]
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
-    gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
+    gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
     
     future_len = gt_raw.size(1)
+    test_idx = selected_indices[0]
+    print(f"测试样本: {test_idx}")
     
     with torch.no_grad():
         # Baseline
@@ -484,7 +505,7 @@ if __name__ == "__main__":
     print("保存文件")
     print("=" * 70)
     
-    ref_path = base_ds.records[SAMPLE_IDX]["pose"]
+    ref_path = base_ds.records[test_idx]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
     
@@ -495,16 +516,21 @@ if __name__ == "__main__":
     ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     header = ref_pose.header
     
-    # GT
-    gt_pose = tensor_to_pose(gt_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-    out_gt = os.path.join(out_dir, f"gt_{SAMPLE_IDX}.pose")
+    # GT：直接从 ref_pose 取后 20 帧
+    T_total = ref_pose.body.data.shape[0]
+    gt_data = ref_pose.body.data[-20:]
+    gt_conf = ref_pose.body.confidence[-20:]
+    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_data, confidence=gt_conf)
+    gt_pose = Pose(header=header, body=gt_body)
+    
+    out_gt = os.path.join(out_dir, f"gt_{test_idx}.pose")
     with open(out_gt, "wb") as f:
         gt_pose.write(f)
     print(f"\n✓ GT saved: {out_gt}")
     
     # Pred
     pred_pose = tensor_to_pose(pred_raw, header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-    out_pred = os.path.join(out_dir, f"pred_{SAMPLE_IDX}.pose")
+    out_pred = os.path.join(out_dir, f"pred_{test_idx}.pose")
     with open(out_pred, "wb") as f:
         pred_pose.write(f)
     print(f"✓ PRED saved: {out_pred}")
