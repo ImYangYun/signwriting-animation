@@ -256,15 +256,19 @@ class LitDiffusion(pl.LightningModule):
                 loss_acc = F.mse_loss(a_pred, a_gt)
             
             # 关键：Displacement Ratio Loss
-            # 惩罚 disp_ratio 偏离 1.0
+            # 使用 log 空间，让 ratio < 1 受到更大惩罚
+            # log(0.01) ≈ -4.6, log(1) = 0, log(6) ≈ 1.8
             disp_pred = v_pred.abs().mean()
             disp_gt = v_gt.abs().mean()
             ratio = disp_pred / (disp_gt + 1e-8)
             
-            # 双向惩罚：偏离 1.0 + 低于某个值时额外惩罚
-            loss_disp = (ratio - 1.0) ** 2
-            # 使用 ReLU 实现平滑的下限惩罚
-            loss_disp = loss_disp + 10.0 * F.relu(0.5 - ratio)  # ratio < 0.5 时额外惩罚
+            # Log 空间惩罚：静态(ratio→0)惩罚比运动过多更大
+            log_ratio = torch.log(ratio + 0.01)  # +0.01 避免 log(0)
+            loss_disp = log_ratio ** 2
+            
+            # 额外惩罚：如果 disp_pred 太小，直接惩罚
+            # disp_gt ≈ 0.003672，我们希望 disp_pred 至少有这么多
+            loss_disp = loss_disp + 1000.0 * F.relu(disp_gt - disp_pred)
         
         # 权重配置
         mse_weight = 1.0   # 保持位置准确
@@ -275,6 +279,8 @@ class LitDiffusion(pl.LightningModule):
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
             disp_gt = mean_frame_disp(gt_btjc_unnorm)
             t_zero_count = (t == 0).sum().item()
+            ratio_val = disp_pred / (disp_gt + 1e-8)
+            log_ratio_val = float(torch.log(torch.tensor(ratio_val + 0.01)))
             print("\n" + "=" * 70)
             print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict x0)")
             print("=" * 70)
@@ -283,9 +289,9 @@ class LitDiffusion(pl.LightningModule):
             print(f"  loss_main (x0): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
-            print(f"  loss_disp: {loss_disp.item():.6f} (惩罚 ratio 偏离 1.0)")
+            print(f"  loss_disp: {loss_disp.item():.6f} (log空间惩罚)")
             print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
-            print(f"  disp_ratio: {disp_pred / (disp_gt + 1e-8):.4f} (目标=1.0)")
+            print(f"  disp_ratio: {ratio_val:.4f}, log_ratio: {log_ratio_val:.4f} (目标=0)")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
