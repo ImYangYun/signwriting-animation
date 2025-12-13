@@ -6,14 +6,8 @@ import torch.nn.functional as F
 import numpy as np
 import lightning as pl
 
-
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
-from CAMDM.diffusion.gaussian_diffusion import (
-    GaussianDiffusion,
-    ModelMeanType,
-    ModelVarType,
-    LossType,
-)
+from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
 
@@ -128,7 +122,7 @@ class LitDiffusion(pl.LightningModule):
         vel_weight: float = 0.5,
         acc_weight: float = 0.2,
         cond_drop_prob: float = 0.2,  # Condition dropout 概率，强迫模型学习 x_t
-        t_zero_prob: float = 0.3,
+        t_zero_prob: float = 0.3,     # t=0 的概率（直接重建）
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -198,7 +192,9 @@ class LitDiffusion(pl.LightningModule):
         gt_btjc = sanitize_btjc(batch["data"])
         past_btjc = sanitize_btjc(cond_raw["input_pose"])
         sign_img = cond_raw["sign_image"].float()
-
+        
+        # 获取 mask（关键修复！）
+        # zero_pad_collator 会产生 MaskedTensor，需要提取 mask
         gt_mask = None
         past_mask = None
         

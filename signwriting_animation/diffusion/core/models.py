@@ -99,7 +99,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
         """
-        直接预测 x0（不用残差）
+        Concat 版本 - 参考师姐实现
         
         输入：
             x: 带噪声的 motion [B, J, C, T]
@@ -109,13 +109,15 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             
         输出：
             预测的干净 x0 [B, J, C, T]
+            
+        序列结构: [time(1), sign(1), past(T_past), x_t(T_future)]
         """
         batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
         
         debug = (self._forward_count == 0) or (self._forward_count % 100 == 0)
         
         if debug:
-            print(f"\n[FORWARD #{self._forward_count}] (No Residual Mode)")
+            print(f"\n[FORWARD #{self._forward_count}] (Concat Mode)")
             print(f"  x: {x.shape}, range=[{x.min():.2f}, {x.max():.2f}]")
             print(f"  past_motion: {past_motion.shape}")
 
@@ -128,59 +130,48 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             else:
                 raise ValueError(f"Cannot interpret past_motion shape: {past_motion.shape}")
 
-        # 获取 past 的最后一帧作为残差基础
-        past_last = past_motion[..., -1]  # [B, J, C]
-        past_last_flat = past_last.reshape(batch_size, -1)  # [B, J*C]
-        
-        if debug:
-            print(f"  past_last mean: {past_last.mean().item():.4f}")
+        T_past = past_motion.shape[-1]
+        T_future = num_frames
 
         # Embeddings
-        time_emb = self.embed_timestep(timesteps)
-        signwriting_emb = self.embed_signwriting(signwriting_im_batch)
-        past_last_emb = self.past_last_encoder(past_last_flat)  # [B, D]
+        time_emb = self.embed_timestep(timesteps)  # [1, B, D]
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
         
         # 处理输入的带噪声 motion
-        future_motion_emb = self.future_motion_process(x)  # [T, B, D]
+        future_motion_emb = self.future_motion_process(x)  # [T_future, B, D]
         past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
 
-        Tf = future_motion_emb.size(0)
         B = future_motion_emb.size(1)
+        D = future_motion_emb.size(2)
         
         # Time encoding for future frames
-        t = torch.linspace(0, 1, steps=Tf, device=future_motion_emb.device).view(Tf, 1, 1)
+        t = torch.linspace(0, 1, steps=T_future, device=future_motion_emb.device).view(T_future, 1, 1)
         t_latent = self.future_time_proj(t).expand(-1, B, -1)
-
         future_motion_emb = future_motion_emb + 0.1 * t_latent
         future_motion_emb = self.future_after_time_ln(future_motion_emb)
 
-        # past_last_emb 作为条件
-        past_last_emb_expanded = past_last_emb.unsqueeze(0).expand(Tf, -1, -1)  # [Tf, B, D]
-
-        # Condition fusion - 大幅降低权重，让模型更依赖 x_t
-        time_cond = time_emb.repeat(Tf, 1, 1)
-        sign_cond = signwriting_emb.repeat(Tf, 1, 1)
-
-        # 条件权重极低，强迫模型从 x_t 获取信息
-        cond_sum = (0.1 * time_cond 
-                   + 0.1 * sign_cond 
-                   + 0.1 * past_last_emb_expanded)  # 总共 0.3，远小于 x_t 的 1.0
         
-        # x_t (future_motion_emb) 保持权重 1.0
-        xseq = future_motion_emb + cond_sum
+        # time_emb 和 signwriting_emb 已经是 [1, B, D]
+        xseq = torch.cat([
+            time_emb,           # [1, B, D]
+            signwriting_emb,    # [1, B, D]
+            past_motion_emb,    # [T_past, B, D]
+            future_motion_emb,  # [T_future, B, D]
+        ], dim=0)  # [1+1+T_past+T_future, B, D]
+        
+        if debug:
+            print(f"  Concat: time(1) + sign(1) + past({T_past}) + x_t({T_future}) = {xseq.shape[0]}")
+        
+        # Positional encoding
         xseq = self.sequence_pos_encoder(xseq)
 
-        # Cross-attention with past
-        for cross_attn, cross_ln in zip(self.cross_attn_layers, self.cross_lns):
-            attn_out, _ = cross_attn(
-                query=xseq,
-                key=past_motion_emb,
-                value=past_motion_emb
-            )
-            xseq = cross_ln(xseq + attn_out)
-
-        # Sequence encoding
-        output = self.seqEncoder(xseq)[-num_frames:]
+        # Sequence encoding (Transformer)
+        output = self.seqEncoder(xseq)
+        
+        # 取最后 T_future 帧（对应 x_t 的位置）
+        output = output[-T_future:]  # [T_future, B, D]
+        
+        # 直接预测 x0
         result = self.pose_projection(output)  # [T, B, J, C]
         result = result.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
