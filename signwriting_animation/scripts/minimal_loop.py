@@ -264,11 +264,9 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
 
     print("\n" + "=" * 70)
-    print("真正的 Diffusion 模型测试 (Epsilon 预测版本)")
+    print("真正的 Diffusion 模型测试 (x0 预测 + CFG 采样)")
     print("=" * 70)
-    print("关键改动：预测 Epsilon（噪声）而不是 x0")
-    print("  - 预测 x0：模型可能忽略 x_t，只根据条件预测静态结果")
-    print("  - 预测 Epsilon：模型必须关注 x_t 才能正确去噪")
+    print("使用 CFG (Classifier-Free Guidance) 采样")
     print("=" * 70)
 
     # ===== 配置 =====
@@ -423,24 +421,48 @@ if __name__ == "__main__":
         mse_base = torch.mean((baseline - gt_raw) ** 2).item()
         print(f"Baseline MSE: {mse_base:.4f}")
         
-        # 使用 p_sample_loop 采样（正确的方式）
-        print("\n使用 p_sample_loop 采样...")
+        # 1. 标准 p_sample_loop 采样
+        print("\n1. 使用 p_sample_loop 采样...")
         pred_raw = model.sample(past_raw, sign, future_len)
         mse_pred = torch.mean((pred_raw - gt_raw) ** 2).item()
         disp_pred = mean_frame_disp(pred_raw)
-        print(f"DDPM MSE: {mse_pred:.4f}, disp: {disp_pred:.6f}")
+        print(f"   MSE: {mse_pred:.4f}, disp: {disp_pred:.6f}")
         
-        # 也可以用 DDIM（如果支持）
-        print("\n使用 DDIM 采样...")
-        pred_raw_ddim = model.sample_ddim(past_raw, sign, future_len)
-        mse_ddim = torch.mean((pred_raw_ddim - gt_raw) ** 2).item()
-        disp_ddim = mean_frame_disp(pred_raw_ddim)
-        print(f"DDIM MSE: {mse_ddim:.4f}, disp: {disp_ddim:.6f}")
+        # 2. CFG 采样
+        print("\n2. 使用 CFG 采样 (guidance_scale=2.0)...")
+        pred_raw_cfg = model.sample_with_cfg(past_raw, sign, future_len, guidance_scale=2.0)
+        mse_cfg = torch.mean((pred_raw_cfg - gt_raw) ** 2).item()
+        disp_cfg = mean_frame_disp(pred_raw_cfg)
+        print(f"   MSE: {mse_cfg:.4f}, disp: {disp_cfg:.6f}")
+        
+        # 3. 从 GT 加噪声测试（验证去噪能力）
+        print("\n3. 从 GT+噪声 开始去噪（验证去噪能力）...")
+        gt_norm = model.normalize(gt_raw)
+        gt_bjct = model.btjc_to_bjct(gt_norm)
+        
+        # 加少量噪声 (t=2，较小的噪声)
+        t_test = torch.tensor([2], device=device)
+        noise = torch.randn_like(gt_bjct)
+        x_noisy = model.diffusion.q_sample(gt_bjct, t_test, noise=noise)
+        
+        # 用模型预测
+        past_norm = model.normalize(past_raw)
+        past_bjct = model.btjc_to_bjct(past_norm)
+        t_scaled = model.diffusion._scale_timesteps(t_test)
+        pred_x0 = model.model(x_noisy, t_scaled, past_bjct, sign)
+        
+        pred_btjc = model.bjct_to_btjc(pred_x0)
+        pred_denoise = model.unnormalize(pred_btjc)
+        
+        mse_denoise = torch.mean((pred_denoise - gt_raw) ** 2).item()
+        disp_denoise = mean_frame_disp(pred_denoise)
+        print(f"   MSE: {mse_denoise:.4f}, disp: {disp_denoise:.6f}")
         
         disp_gt = mean_frame_disp(gt_raw)
         print(f"\nGT disp: {disp_gt:.6f}")
-        print(f"disp_ratio (DDPM): {disp_pred / (disp_gt + 1e-8):.4f}")
-        print(f"disp_ratio (DDIM): {disp_ddim / (disp_gt + 1e-8):.4f}")
+        print(f"disp_ratio (标准): {disp_pred / (disp_gt + 1e-8):.4f}")
+        print(f"disp_ratio (CFG): {disp_cfg / (disp_gt + 1e-8):.4f}")
+        print(f"disp_ratio (去噪): {disp_denoise / (disp_gt + 1e-8):.4f}")
         
         # ===== 完整评估指标 =====
         print("\n" + "=" * 70)

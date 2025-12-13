@@ -154,12 +154,12 @@ class LitDiffusion(pl.LightningModule):
         # Cosine beta schedule
         betas = cosine_beta_schedule(diffusion_steps).numpy()
         
-        # 使用 GaussianDiffusion（和师姐一样）
-        # 改成预测 EPSILON 而不是 START_X
-        # 这样模型必须关注 x_t 输入，不能只靠条件预测
+        # 使用 GaussianDiffusion
+        # 回到预测 START_X（x0），因为预测 epsilon 需要更长的训练
+        # 增加 diffusion steps 让采样更稳定
         self.diffusion = GaussianDiffusion(
             betas=betas,
-            model_mean_type=ModelMeanType.EPSILON,  # 预测噪声！
+            model_mean_type=ModelMeanType.START_X,  # 预测 x0
             model_var_type=ModelVarType.FIXED_SMALL,
             loss_type=LossType.MSE,
             rescale_timesteps=False,
@@ -213,19 +213,12 @@ class LitDiffusion(pl.LightningModule):
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
-        # 模型预测 epsilon（噪声）
+        # 模型预测 x0
         t_scaled = self.diffusion._scale_timesteps(t)
-        pred_eps_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
+        pred_x0_bjct = self.model(x_t, t_scaled, past_bjct, sign_img)
         
-        # 主 Loss：预测的噪声 vs 真实噪声
-        loss_main = F.mse_loss(pred_eps_bjct, noise)
-        
-        # 从预测的噪声反推 x0，用于计算辅助 loss
-        # x0 = (x_t - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
-        # 注意：alphas_cumprod 是 numpy array，需要转成 tensor
-        alphas_cumprod = torch.tensor(self.diffusion.alphas_cumprod, device=device, dtype=torch.float32)
-        alpha_bar = alphas_cumprod[t].view(-1, 1, 1, 1)
-        pred_x0_bjct = (x_t - torch.sqrt(1 - alpha_bar) * pred_eps_bjct) / (torch.sqrt(alpha_bar) + 1e-8)
+        # 主 Loss：预测的 x0 vs 真实 x0
+        loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
         
         # 转回 BTJC 计算辅助 loss
         pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
@@ -251,13 +244,13 @@ class LitDiffusion(pl.LightningModule):
             disp_pred = mean_frame_disp(pred_btjc_unnorm)
             disp_gt = mean_frame_disp(gt_btjc_unnorm)
             print("\n" + "=" * 70)
-            print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict Epsilon)")
+            print(f"DIFFUSION TRAINING STEP {self._step_count} (Predict x0)")
             print("=" * 70)
             print(f"  t range: [{t.min().item()}, {t.max().item()}]")
-            print(f"  loss_main (eps): {loss_main.item():.6f}")
+            print(f"  loss_main (x0): {loss_main.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
-            print(f"  disp_pred (from x0): {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
+            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}")
             print(f"  TOTAL: {loss.item():.6f}")
             print("=" * 70)
 
