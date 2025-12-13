@@ -182,19 +182,12 @@ class SignWritingToPoseDiffusionV2(nn.Module):
 
         # Sequence encoding
         output = self.seqEncoder(xseq)[-num_frames:]
-        
-        # 预测修正量
-        correction = self.pose_projection(output)  # [T, B, J, C]
-        correction = correction.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
-        
-        # 最终输出 = 修正量 + past_last（从过去的最后一帧开始）
-        # 这样模型只需要预测相对于 past_last 的变化
-        past_last_expanded = past_last.unsqueeze(-1).expand_as(correction)  # [B, J, C, T]
-        result = correction + past_last_expanded
+
+        result = self.pose_projection(output)  # [T, B, J, C]
+        result = result.permute(1, 2, 3, 0).contiguous()  # [B, J, C, T]
 
         if debug:
             print(f"  result: {result.shape}, range=[{result.min():.4f}, {result.max():.4f}]")
-            print(f"  correction range: [{correction.min():.4f}, {correction.max():.4f}]")
             # 计算帧间差异
             if result.size(-1) > 1:
                 disp = (result[..., 1:] - result[..., :-1]).abs().mean().item()
