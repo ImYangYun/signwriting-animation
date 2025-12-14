@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-4-Sample Overfit Test - 修复版：GT 和 Pred 使用同一坐标空间
-"""
 import os
 import torch
 import torch.nn.functional as F
@@ -46,7 +43,7 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-
+    
     unshift_hands(pose_obj)
     print("  ✓ unshift 成功")
 
@@ -258,6 +255,110 @@ if __name__ == "__main__":
     for i in range(min(10, len(per_frame_diff))):
         print(f"    Frame {i}: {per_frame_diff[i]:.2f} 像素")
 
+    # ========================================================================
+    # 手部运动范围诊断
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("手部运动范围诊断")
+    print("=" * 70)
+    
+    # MediaPipe Holistic 关键点索引
+    # 0-32: Pose (33个点)
+    # 33-53: Face contour (21个点) 
+    # 54-86: Left hand (33个点)
+    # 87-119: Right hand (33个点)
+    LEFT_HAND_START = 54
+    LEFT_HAND_END = 87
+    RIGHT_HAND_START = 87
+    RIGHT_HAND_END = 120
+    
+    # 提取左右手
+    gt_left_hand = gt_data[:, LEFT_HAND_START:LEFT_HAND_END, :]
+    gt_right_hand = gt_data[:, RIGHT_HAND_START:RIGHT_HAND_END, :]
+    pred_left_hand = pred_data[:, LEFT_HAND_START:LEFT_HAND_END, :]
+    pred_right_hand = pred_data[:, RIGHT_HAND_START:RIGHT_HAND_END, :]
+    
+    def calc_movement_stats(hand_data, name):
+        """计算手部运动统计"""
+        # hand_data: [T, 33, 3]
+        center = hand_data.mean(axis=(0, 1))  # [3]
+        centered = hand_data - center
+        variance = (centered ** 2).mean()
+        std = np.sqrt(variance)
+        
+        # 计算每帧的最大位移
+        frame_disps = []
+        for t in range(1, len(hand_data)):
+            disp = np.sqrt(((hand_data[t] - hand_data[t-1]) ** 2).sum(axis=-1)).mean()
+            frame_disps.append(disp)
+        mean_disp = np.mean(frame_disps) if frame_disps else 0
+        
+        # X, Y, Z 方向的范围
+        x_range = hand_data[:, :, 0].max() - hand_data[:, :, 0].min()
+        y_range = hand_data[:, :, 1].max() - hand_data[:, :, 1].min()
+        z_range = hand_data[:, :, 2].max() - hand_data[:, :, 2].min()
+        
+        print(f"\n{name}:")
+        print(f"  中心位置: [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
+        print(f"  Variance: {variance:.2f}")
+        print(f"  Std: {std:.2f}")
+        print(f"  平均帧间位移: {mean_disp:.2f} 像素")
+        print(f"  X范围: {x_range:.2f} 像素")
+        print(f"  Y范围: {y_range:.2f} 像素")
+        print(f"  Z范围: {z_range:.2f}")
+        
+        return variance, mean_disp, (x_range, y_range, z_range)
+    
+    # 左手分析
+    print("\n左手运动范围:")
+    gt_var_l, gt_disp_l, gt_range_l = calc_movement_stats(gt_left_hand, "  GT 左手")
+    pred_var_l, pred_disp_l, pred_range_l = calc_movement_stats(pred_left_hand, "  Pred 左手")
+    
+    print(f"\n  左手对比:")
+    print(f"    Variance 比率 (Pred/GT): {pred_var_l / (gt_var_l + 1e-8):.4f}")
+    print(f"    位移比率 (Pred/GT): {pred_disp_l / (gt_disp_l + 1e-8):.4f}")
+    print(f"    X范围比率: {pred_range_l[0] / (gt_range_l[0] + 1e-8):.4f}")
+    print(f"    Y范围比率: {pred_range_l[1] / (gt_range_l[1] + 1e-8):.4f}")
+    
+    # 右手分析
+    print("\n右手运动范围:")
+    gt_var_r, gt_disp_r, gt_range_r = calc_movement_stats(gt_right_hand, "  GT 右手")
+    pred_var_r, pred_disp_r, pred_range_r = calc_movement_stats(pred_right_hand, "  Pred 右手")
+    
+    print(f"\n  右手对比:")
+    print(f"    Variance 比率 (Pred/GT): {pred_var_r / (gt_var_r + 1e-8):.4f}")
+    print(f"    位移比率 (Pred/GT): {pred_disp_r / (gt_disp_r + 1e-8):.4f}")
+    print(f"    X范围比率: {pred_range_r[0] / (gt_range_r[0] + 1e-8):.4f}")
+    print(f"    Y范围比率: {pred_range_r[1] / (gt_range_r[1] + 1e-8):.4f}")
+    
+    # 右手各手指运动分析
+    print("\n右手各手指运动分析:")
+    finger_names = ["手腕", "拇指", "食指", "中指", "无名指", "小指"]
+    finger_ranges = [(0, 1), (1, 5), (5, 9), (9, 13), (13, 17), (17, 21)]
+    
+    for finger_name, (start, end) in zip(finger_names, finger_ranges):
+        gt_finger = gt_right_hand[:, start:end, :]
+        pred_finger = pred_right_hand[:, start:end, :]
+        
+        gt_disp = np.sqrt(np.diff(gt_finger, axis=0) ** 2).sum(axis=-1).mean()
+        pred_disp = np.sqrt(np.diff(pred_finger, axis=0) ** 2).sum(axis=-1).mean()
+        
+        ratio = pred_disp / (gt_disp + 1e-8)
+        print(f"  {finger_name}: GT={gt_disp:.2f}px, Pred={pred_disp:.2f}px, 比率={ratio:.4f}")
+    
+    # 诊断结论
+    print("\n诊断结论:")
+    if pred_var_r / (gt_var_r + 1e-8) < 0.8:
+        print("  ⚠️ Pred 的手部运动方差明显小于 GT")
+        print("     → 模型学到的运动范围偏小，虽然位置准确但'活跃度'不够")
+        motion_issue = True
+    elif abs(pred_var_r / (gt_var_r + 1e-8) - 1.0) < 0.1:
+        print("  ✓ Pred 和 GT 的运动方差接近")
+        motion_issue = False
+    else:
+        print(f"  Pred 和 GT 方差比率: {pred_var_r / (gt_var_r + 1e-8):.4f}")
+        motion_issue = abs(pred_var_r / (gt_var_r + 1e-8) - 1.0) > 0.2
+
     # 结论
     print("\n" + "=" * 70)
     passed_normalized = disp_ratio > 0.5 and pck_01 > 50
@@ -267,6 +368,16 @@ if __name__ == "__main__":
         print("🎉 4-Sample Overfit 测试完美通过！")
         print(f"   归一化空间: MPJPE={mpjpe:.6f}, PCK@0.1={pck_01:.1f}%")
         print(f"   像素空间: MPJPE={pixel_mpjpe:.2f} 像素")
+        
+        if motion_issue:
+            print(f"\n   ⚠️ 但手部运动范围不匹配:")
+            print(f"      右手 Variance 比率: {pred_var_r / (gt_var_r + 1e-8):.4f}")
+            print(f"      建议:")
+            print(f"      1. 增加 vel_weight 到 5.0")
+            print(f"      2. 添加手部运动专门损失")
+            print(f"      3. 检查数据归一化是否过度压缩了手部运动")
+        else:
+            print(f"   ✓ 手部运动范围也匹配！")
     else:
         print("⚠️ 测试未通过")
         if not passed_normalized:
