@@ -2,7 +2,6 @@ import os
 import torch
 from torch import nn
 import torch.nn.functional as F
-import numpy
 import lightning as pl
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
@@ -99,7 +98,7 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     # Try to use DTW metric, fall back to MSE if unavailable
     try:
         dtw_metric = PE_DTW()
-    except:
+    except (ImportError, RuntimeError):  # Fixed: specific exceptions
         # Fallback: use simple MSE
         pred = sanitize_btjc(pred_btjc)
         tgt = sanitize_btjc(tgt_btjc)
@@ -112,7 +111,7 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
         # Skip sequences that are too short
         if p.size(0) < 2 or g.size(0) < 2:
             continue
-    
+
         # Convert to numpy and add person dimension for DTW metric
         pv = p.detach().cpu().numpy().astype("float32")[:, None, :, :]
         gv = g.detach().cpu().numpy().astype("float32")[:, None, :, :]
@@ -193,12 +192,12 @@ class _ConditionalWrapper(nn.Module):
         self.past_bjct = past_bjct
         self.sign_img = sign_img
 
-    def forward(self, x, t, **kwargs):
-        """Forward with fixed conditions."""
+    def forward(self, x, t, **kwargs):  # pylint: disable=unused-argument
+        """Forward with fixed conditions. kwargs for interface compatibility."""
         return self.base_model(x, t, self.past_bjct, self.sign_img)
 
 
-class LitDiffusion(pl.LightningModule):
+class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-attributes
     """
     PyTorch Lightning module for SignWriting-to-Pose diffusion training.
     
@@ -220,7 +219,7 @@ class LitDiffusion(pl.LightningModule):
         t_future: Number of future frames to predict
     """
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         num_keypoints=178,
         num_dims=3,
@@ -234,7 +233,7 @@ class LitDiffusion(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-    
+
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
@@ -288,7 +287,7 @@ class LitDiffusion(pl.LightningModule):
         """Convert [B,J,C,T] to [B,T,J,C] format."""
         return x.permute(0, 3, 1, 2).contiguous()
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, _batch_idx):  # pylint: disable=arguments-differ,too-many-locals
         """
         Single training step for diffusion model.
         
@@ -301,7 +300,7 @@ class LitDiffusion(pl.LightningModule):
         
         Args:
             batch: Dictionary with 'data' (GT) and 'conditions'
-            batch_idx: Batch index (unused)
+            _batch_idx: Batch index (unused, required by Lightning interface)
             
         Returns:
             Total loss (scalar tensor)
@@ -318,7 +317,8 @@ class LitDiffusion(pl.LightningModule):
         gt_norm = self.normalize(gt_btjc)
         past_norm = self.normalize(past_btjc)
 
-        B, T_future, J, C = gt_norm.shape
+        # Get batch size and device
+        batch_size = gt_norm.shape[0]
         device = gt_norm.device
 
         # Convert to BJCT format for model
@@ -326,17 +326,17 @@ class LitDiffusion(pl.LightningModule):
         past_bjct = self.btjc_to_bjct(past_norm)
 
         # Sample random diffusion timestep for each batch element
-        t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
+        timestep = torch.randint(0, self.diffusion_steps, (batch_size,), device=device, dtype=torch.long)
 
         # Forward diffusion: add noise to ground truth
         noise = torch.randn_like(gt_bjct)
-        x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
+        x_noisy = self.diffusion.q_sample(gt_bjct, timestep, noise=noise)
 
         # Model prediction: denoise x_t to predict x_0
-        pred_x0_bjct = self.model(x_t, t, past_bjct, sign_img)
+        pred_x0_bjct = self.model(x_noisy, timestep, past_bjct, sign_img)
 
         # === Loss Computation ===
-        
+
         # 1. MSE Loss: position accuracy
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
 
@@ -368,7 +368,7 @@ class LitDiffusion(pl.LightningModule):
             print("\n" + "=" * 70)
             print(f"TRAINING STEP {self._step_count}")
             print("=" * 70)
-            print(f"  t range: [{t.min().item()}, {t.max().item()}]")
+            print(f"  t range: [{timestep.min().item()}, {timestep.max().item()}]")
             print(f"  loss_mse: {loss_mse.item():.6f}")
             print(f"  loss_vel: {loss_vel.item():.6f}")
             print(f"  loss_acc: {loss_acc.item():.6f}")
@@ -438,7 +438,7 @@ class LitDiffusion(pl.LightningModule):
         return self.unnormalize(pred_btjc)
 
     @torch.no_grad()
-    def sample_with_cfg(self, past_btjc, sign_img, future_len=20, guidance_scale=2.0):
+    def sample_with_cfg(self, past_btjc, sign_img, future_len=20, guidance_scale=2.0):  # pylint: disable=too-many-locals
         """
         Generate with Classifier-Free Guidance for better conditioning.
         
@@ -546,8 +546,9 @@ class LitDiffusion(pl.LightningModule):
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
 
-    def on_train_start(self):
+    def on_train_start(self):  # pylint: disable=attribute-defined-outside-init
         """Move normalization buffers to correct device before training."""
+        # These buffers are already registered in __init__, just moving to GPU
         self.mean_pose = self.mean_pose.to(self.device)
         self.std_pose = self.std_pose.to(self.device)
 
@@ -555,7 +556,7 @@ class LitDiffusion(pl.LightningModule):
         """Configure AdamW optimizer."""
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
-    def on_train_end(self):
+    def on_train_end(self):  # pylint: disable=import-outside-toplevel
         """
         Save training curves after training completes.
         
@@ -571,7 +572,7 @@ class LitDiffusion(pl.LightningModule):
             os.makedirs(out_dir, exist_ok=True)
 
             # Create 2x2 subplot
-            fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+            _, axes = plt.subplots(2, 2, figsize=(10, 8))
 
             # Plot each metric
             axes[0, 0].plot(self.train_logs["loss"])
@@ -590,8 +591,9 @@ class LitDiffusion(pl.LightningModule):
             plt.tight_layout()
             plt.savefig(f"{out_dir}/train_curve.png")
             print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
-        except Exception as e:
-            print(f"[TRAIN CURVE] failed: {e}")
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            # Plotting failure should not crash training
+            print(f"[TRAIN CURVE] failed: {error}")
 
 
 # Alias for backward compatibility
