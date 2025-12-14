@@ -2,7 +2,7 @@ import os
 import torch
 from torch import nn
 import torch.nn.functional as F
-import numpy as np
+import numpy
 import lightning as pl
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
@@ -30,23 +30,23 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
         x = x.zero_filled()
     if hasattr(x, "tensor"):
         x = x.tensor
-    
+
     # Remove extra person dimension if present
     if x.dim() == 5:
         x = x[:, :, 0]
-    
+
     # Check dimensionality
     if x.dim() != 4:
         raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
-    
+
     # Swap dimensions if C and J are reversed
     if x.shape[-1] != 3 and x.shape[-2] == 3:
         x = x.permute(0, 1, 3, 2)
-    
+
     # Final validation
     if x.shape[-1] != 3:
         raise ValueError(f"sanitize_btjc: last dim must be C=3, got {x.shape}")
-    
+
     return x.contiguous().float()
 
 
@@ -66,7 +66,7 @@ def _btjc_to_tjc_list(x_btjc, mask_bt):
     x_btjc = sanitize_btjc(x_btjc)
     batch_size, seq_len, _, _ = x_btjc.shape
     mask_bt = (mask_bt > 0.5).float()
-    
+
     seqs = []
     for b in range(batch_size):
         # Get valid sequence length from mask
@@ -95,7 +95,7 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
     # Convert to variable-length sequences
     preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
     tgts = _btjc_to_tjc_list(tgt_btjc, mask_bt)
-    
+
     # Try to use DTW metric, fall back to MSE if unavailable
     try:
         dtw_metric = PE_DTW()
@@ -105,19 +105,19 @@ def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
         tgt = sanitize_btjc(tgt_btjc)
         t_max = min(pred.size(1), tgt.size(1))
         return torch.mean((pred[:, :t_max] - tgt[:, :t_max]) ** 2)
-    
+
     # Compute DTW for each sequence pair
     vals = []
     for p, g in zip(preds, tgts):
         # Skip sequences that are too short
         if p.size(0) < 2 or g.size(0) < 2:
             continue
-        
+    
         # Convert to numpy and add person dimension for DTW metric
         pv = p.detach().cpu().numpy().astype("float32")[:, None, :, :]
         gv = g.detach().cpu().numpy().astype("float32")[:, None, :, :]
         vals.append(float(dtw_metric.get_distance(pv, gv)))
-    
+
     # Return mean or zero if no valid sequences
     if not vals:
         return torch.tensor(0.0, device=pred_btjc.device)
@@ -140,7 +140,7 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     x = sanitize_btjc(x_btjc)
     if x.size(1) < 2:
         return 0.0
-    
+
     # Compute frame-to-frame differences
     v = x[:, 1:] - x[:, :-1]
     return v.abs().mean().item()
@@ -162,14 +162,14 @@ def cosine_beta_schedule(timesteps, s=0.008):
     """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
-    
+
     # Cosine schedule for alphas_cumprod
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    
+
     # Derive betas from alphas_cumprod
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    
+
     # Clip to valid range
     return torch.clip(betas, 0.0001, 0.9999)
 
@@ -177,7 +177,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 class _ConditionalWrapper(nn.Module):
     """
     Wrapper to fix conditions for GaussianDiffusion sampling.
-    
+
     GaussianDiffusion.p_sample_loop expects model(x, t), but our model needs
     additional conditions (past_motion, sign_image). This wrapper fixes those
     conditions so the model becomes compatible with the sampling loop.
@@ -192,7 +192,7 @@ class _ConditionalWrapper(nn.Module):
         self.base_model = base_model
         self.past_bjct = past_bjct
         self.sign_img = sign_img
-    
+
     def forward(self, x, t, **kwargs):
         """Forward with fixed conditions."""
         return self.base_model(x, t, self.past_bjct, self.sign_img)
@@ -234,7 +234,7 @@ class LitDiffusion(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        
+    
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
@@ -266,7 +266,7 @@ class LitDiffusion(pl.LightningModule):
         )
 
         self.lr = lr
-        
+
         # Training logs for visualization
         self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": [], "disp_ratio": []}
 
@@ -327,11 +327,11 @@ class LitDiffusion(pl.LightningModule):
 
         # Sample random diffusion timestep for each batch element
         t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
-        
+
         # Forward diffusion: add noise to ground truth
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
-        
+
         # Model prediction: denoise x_t to predict x_0
         pred_x0_bjct = self.model(x_t, t, past_bjct, sign_img)
 
@@ -339,19 +339,19 @@ class LitDiffusion(pl.LightningModule):
         
         # 1. MSE Loss: position accuracy
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
-        
+
         # 2. Velocity Loss: motion smoothness and magnitude
         pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
         gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
         loss_vel = F.mse_loss(pred_vel, gt_vel)
-        
+
         # 3. Acceleration Loss: motion dynamics
         loss_acc = torch.tensor(0.0, device=device)
         if pred_vel.size(-1) > 1:
             pred_acc = pred_vel[..., 1:] - pred_vel[..., :-1]
             gt_acc = gt_vel[..., 1:] - gt_vel[..., :-1]
             loss_acc = F.mse_loss(pred_acc, gt_acc)
-        
+
         # Total weighted loss
         loss = loss_mse + self.vel_weight * loss_vel + self.acc_weight * loss_acc
 
@@ -420,10 +420,10 @@ class LitDiffusion(pl.LightningModule):
 
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
-        
+
         # Wrap model with fixed conditions
         wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
-        
+
         # Run DDPM sampling loop
         pred_bjct = self.diffusion.p_sample_loop(
             model=wrapped_model,
@@ -432,7 +432,7 @@ class LitDiffusion(pl.LightningModule):
             model_kwargs={"y": {}},
             progress=False,
         )
-        
+
         # Convert back to BTJC and denormalize
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
@@ -464,7 +464,7 @@ class LitDiffusion(pl.LightningModule):
 
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
-        
+
         # Sample with conditions
         wrapped_cond = _ConditionalWrapper(self.model, past_bjct, sign_img)
         cond_pred = self.diffusion.p_sample_loop(
@@ -474,7 +474,7 @@ class LitDiffusion(pl.LightningModule):
             model_kwargs={"y": {}},
             progress=False,
         )
-        
+
         # Sample without conditions (zeros)
         uncond_past = torch.zeros_like(past_bjct)
         uncond_sign = torch.zeros_like(sign_img)
@@ -486,10 +486,10 @@ class LitDiffusion(pl.LightningModule):
             model_kwargs={"y": {}},
             progress=False,
         )
-        
+
         # Apply CFG formula
         pred_bjct = uncond_pred + guidance_scale * (cond_pred - uncond_pred)
-        
+
         # Convert and denormalize
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
@@ -520,10 +520,10 @@ class LitDiffusion(pl.LightningModule):
 
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
-        
+
         # Wrap model
         wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
-        
+
         # Try DDIM, fall back to DDPM if unavailable
         if hasattr(self.diffusion, 'ddim_sample_loop'):
             pred_bjct = self.diffusion.ddim_sample_loop(
@@ -541,7 +541,7 @@ class LitDiffusion(pl.LightningModule):
                 model_kwargs={"y": {}},
                 progress=False,
             )
-        
+
         # Convert and denormalize
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
@@ -572,21 +572,21 @@ class LitDiffusion(pl.LightningModule):
 
             # Create 2x2 subplot
             fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-            
+
             # Plot each metric
             axes[0, 0].plot(self.train_logs["loss"])
             axes[0, 0].set_title("Total Loss")
-            
+
             axes[0, 1].plot(self.train_logs["mse"])
             axes[0, 1].set_title("MSE Loss")
-            
+
             axes[1, 0].plot(self.train_logs["vel"])
             axes[1, 0].set_title("Velocity Loss")
-            
+
             axes[1, 1].plot(self.train_logs["disp_ratio"])
             axes[1, 1].set_title("Displacement Ratio")
             axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5)  # Ideal line
-            
+
             plt.tight_layout()
             plt.savefig(f"{out_dir}/train_curve.png")
             print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")

@@ -2,7 +2,6 @@ import os
 import math
 import random
 from typing import Literal, Optional
-import copy
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -173,7 +172,7 @@ def main():
         split="train",
         use_reduce_holistic=True,
     )
-    
+
 
     loader = DataLoader(
         dataset,
@@ -199,12 +198,12 @@ def main():
     print(f"  Max: {data.max().item():.4f}")
     print(f"  Mean: {data.mean().item():.4f}")
     print(f"  Std: {data.std().item():.4f}")
-    
+
     if abs(data.mean().item()) < 0.1 and abs(data.std().item() - 1.0) < 0.2:
         print("  ⚠️  Warning: Data appears normalized (should be raw)")
     else:
         print("  ✓ Data is in raw range (correct)")
-    
+
     if "metadata" in batch:
         for k, v in batch["metadata"].items():
             print(f"Metadata {k}:", v.shape)
