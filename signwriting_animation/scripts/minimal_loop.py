@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-4-Sample Overfit Test - 直接调用你的代码
+4-Sample Overfit Test - 修复版：GT 和 Pred 使用同一坐标空间
 """
 import os
 import torch
@@ -22,8 +22,6 @@ from signwriting_animation.diffusion.lightning_module import (
     masked_dtw, 
     mean_frame_disp,
 )
-
-
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
@@ -48,7 +46,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-    
 
     unshift_hands(pose_obj)
     print("  ✓ unshift 成功")
@@ -88,18 +85,17 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     return pose_obj
 
 
-
 if __name__ == "__main__":
     pl.seed_everything(42)
 
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/4sample_test"
+    out_dir = "logs/4sample_test_fixed"
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
-    print("4-Sample Overfit Test")
+    print("4-Sample Overfit Test (Fixed Version)")
     print("=" * 70)
 
     # 配置
@@ -140,7 +136,7 @@ if __name__ == "__main__":
     num_joints, num_dims, future_len = sample.shape[-2], sample.shape[-1], sample.shape[0]
     print(f"J={num_joints}, D={num_dims}, T_future={future_len}")
 
-    # 创建模型（直接用你的 LitDiffusion！）
+    # 创建模型
     model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -181,19 +177,19 @@ if __name__ == "__main__":
     with torch.no_grad():
         pred_raw = model.sample(past_raw, sign, future_len)
         
-        # 评估
+        # 评估（在归一化空间）
         mse = F.mse_loss(pred_raw, gt_raw).item()
         disp_pred = mean_frame_disp(pred_raw)
         disp_gt = mean_frame_disp(gt_raw)
         disp_ratio = disp_pred / (disp_gt + 1e-8)
         
-        # DTW（使用 lightning_module 里的 masked_dtw）
+        # DTW
         mask = torch.ones(1, future_len, device=device)
         dtw = masked_dtw(pred_raw, gt_raw, mask)
         if isinstance(dtw, torch.Tensor):
             dtw = dtw.item()
         
-        # MPJPE, PCK
+        # MPJPE, PCK（在归一化空间）
         pred_np = pred_raw[0].cpu().numpy()
         gt_np = gt_raw[0].cpu().numpy()
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
@@ -202,7 +198,7 @@ if __name__ == "__main__":
         pck_02 = (per_joint_err < 0.2).mean() * 100
 
     print(f"""
-结果:
+结果（归一化空间）:
   MSE: {mse:.6f}
   MPJPE: {mpjpe:.6f}
   PCK@0.1: {pck_01:.1f}%
@@ -213,8 +209,11 @@ if __name__ == "__main__":
   Disp Ratio: {disp_ratio:.4f}
 """)
 
-    # 保存 Pose
+    # 保存 Pose 文件
+    print("=" * 70)
     print("保存 Pose 文件...")
+    print("=" * 70)
+    
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -225,25 +224,53 @@ if __name__ == "__main__":
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # GT
-    gt_data = ref_pose.body.data[-future_len:]
-    gt_conf = ref_pose.body.confidence[-future_len:]
-    gt_pose = Pose(header=ref_pose.header, body=NumPyPoseBody(fps=ref_pose.body.fps, data=gt_data, confidence=gt_conf))
+    # ✅ 关键修改：GT 也经过 tensor_to_pose 转换
+    print("\n转换 GT (使用 tensor_to_pose):")
+    gt_pose = tensor_to_pose(gt_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
-    # Pred
-    pred_pose = tensor_to_pose(pred_raw, ref_pose.header, ref_pose, gt_raw)
+    print("\n转换 Pred (使用 tensor_to_pose):")
+    pred_pose = tensor_to_pose(pred_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
     
-    print(f"✓ 保存到 {out_dir}/")
+    print(f"\n✓ 保存到 {out_dir}/")
+
+    # 验证转换后的差异
+    print("\n" + "=" * 70)
+    print("验证像素空间的差异:")
+    print("=" * 70)
+    
+    gt_data = gt_pose.body.data[:, 0, :, :]
+    pred_data = pred_pose.body.data[:, 0, :, :]
+    
+    pixel_diff = np.abs(gt_data - pred_data)
+    pixel_mpjpe = np.sqrt(((gt_data - pred_data) ** 2).sum(-1)).mean()
+    
+    print(f"  像素空间 MPJPE: {pixel_mpjpe:.2f} 像素")
+    print(f"  平均差异: {pixel_diff.mean():.2f} 像素")
+    print(f"  最大差异: {pixel_diff.max():.2f} 像素")
+    
+    # 每帧差异
+    per_frame_diff = pixel_diff.mean(axis=(1, 2))
+    print(f"\n  每帧平均差异 (前10帧):")
+    for i in range(min(10, len(per_frame_diff))):
+        print(f"    Frame {i}: {per_frame_diff[i]:.2f} 像素")
 
     # 结论
     print("\n" + "=" * 70)
-    passed = disp_ratio > 0.5 and pck_01 > 50
-    if passed:
-        print("🎉 4-Sample Overfit 测试通过！")
+    passed_normalized = disp_ratio > 0.5 and pck_01 > 50
+    passed_pixel = pixel_mpjpe < 5.0  # 5像素以内认为是完美过拟合
+    
+    if passed_normalized and passed_pixel:
+        print("🎉 4-Sample Overfit 测试完美通过！")
+        print(f"   归一化空间: MPJPE={mpjpe:.6f}, PCK@0.1={pck_01:.1f}%")
+        print(f"   像素空间: MPJPE={pixel_mpjpe:.2f} 像素")
     else:
         print("⚠️ 测试未通过")
+        if not passed_normalized:
+            print("   归一化空间指标不达标")
+        if not passed_pixel:
+            print(f"   像素空间差异过大: {pixel_mpjpe:.2f} > 5.0 像素")
     print("=" * 70)
