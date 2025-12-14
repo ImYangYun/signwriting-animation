@@ -1,4 +1,7 @@
-# -*- coding: utf-8 -*-"
+# -*- coding: utf-8 -*-
+"""
+4-Sample Overfit Test - 直接调用你的代码
+"""
 import os
 import torch
 import torch.nn.functional as F
@@ -12,28 +15,12 @@ from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc
-from pose_evaluation.metrics.dtw import PE_DTW
-
-
-
-def mean_frame_disp(x_btjc):
-    x = sanitize_btjc(x_btjc)
-    if x.size(1) < 2:
-        return 0.0
-    return (x[:, 1:] - x[:, :-1]).abs().mean().item()
-
-
-def compute_dtw(pred, gt):
-    if not HAS_DTW:
-        return F.mse_loss(pred, gt).item()
-    try:
-        dtw_metric = PE_DTW()
-        p = pred[0].cpu().numpy().astype("float32")[:, None, :, :]
-        g = gt[0].cpu().numpy().astype("float32")[:, None, :, :]
-        return float(dtw_metric.get_distance(p, g))
-    except:
-        return F.mse_loss(pred, gt).item()
+from signwriting_animation.diffusion.lightning_module import (
+    LitDiffusion, 
+    sanitize_btjc, 
+    masked_dtw, 
+    mean_frame_disp,
+)
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None):
@@ -169,8 +156,14 @@ if __name__ == "__main__":
         disp_pred = mean_frame_disp(pred_raw)
         disp_gt = mean_frame_disp(gt_raw)
         disp_ratio = disp_pred / (disp_gt + 1e-8)
-        dtw = compute_dtw(pred_raw, gt_raw)
         
+        # DTW（使用 lightning_module 里的 masked_dtw）
+        mask = torch.ones(1, future_len, device=device)
+        dtw = masked_dtw(pred_raw, gt_raw, mask)
+        if isinstance(dtw, torch.Tensor):
+            dtw = dtw.item()
+        
+        # MPJPE, PCK
         pred_np = pred_raw[0].cpu().numpy()
         gt_np = gt_raw[0].cpu().numpy()
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
