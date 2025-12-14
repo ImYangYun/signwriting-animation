@@ -1,12 +1,9 @@
-# -*- coding: utf-8 -*-
 import os
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import lightning as pl
+import pytorch_lightning as pl
 
-from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 
@@ -28,17 +25,7 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().float()
 
 
-def mean_frame_disp(x_btjc: torch.Tensor) -> float:
-    """计算平均帧间位移"""
-    x = sanitize_btjc(x_btjc)
-    if x.size(1) < 2:
-        return 0.0
-    v = x[:, 1:] - x[:, :-1]
-    return v.abs().mean().item()
-
-
 def cosine_beta_schedule(timesteps, s=0.008):
-    """Cosine beta schedule"""
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
@@ -48,11 +35,8 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 class _ConditionalWrapper(nn.Module):
-    """
-    包装模型，固定条件输入，只接受 (x, t) 参数
-    兼容 GaussianDiffusion.p_sample_loop 的接口
-    """
-    def __init__(self, base_model: nn.Module, past_bjct: torch.Tensor, sign_img: torch.Tensor):
+    """包装模型，固定条件，兼容 GaussianDiffusion.p_sample_loop"""
+    def __init__(self, base_model, past_bjct, sign_img):
         super().__init__()
         self.base_model = base_model
         self.past_bjct = past_bjct
@@ -63,14 +47,6 @@ class _ConditionalWrapper(nn.Module):
 
 
 class LitDiffusion(pl.LightningModule):
-    """
-    Diffusion 训练模块
-    
-    关键改动：
-    1. 使用简化版模型（无 LayerNorm 的 OutputProcessMLP）
-    2. 使用 GaussianDiffusion.p_sample_loop 进行采样
-    """
-
     def __init__(
         self,
         num_keypoints=178,
@@ -79,15 +55,14 @@ class LitDiffusion(pl.LightningModule):
         stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
         diffusion_steps=8,
         vel_weight: float = 1.0,
-        acc_weight: float = 0.0,
-        use_mean_pool: bool = True,
+        t_past: int = 40,
+        t_future: int = 20,
     ):
         super().__init__()
         self.save_hyperparameters()
         
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
-        self.acc_weight = acc_weight
         self._step_count = 0
 
         # 加载统计信息
@@ -97,17 +72,16 @@ class LitDiffusion(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # 模型（使用修复后的版本）
+        # 模型
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
-            use_mean_pool=use_mean_pool,
+            t_past=t_past,
+            t_future=t_future,
         )
 
-        # Cosine beta schedule
+        # GaussianDiffusion
         betas = cosine_beta_schedule(diffusion_steps).numpy()
-        
-        # GaussianDiffusion - 预测 x0
         self.diffusion = GaussianDiffusion(
             betas=betas,
             model_mean_type=ModelMeanType.START_X,
@@ -127,16 +101,13 @@ class LitDiffusion(pl.LightningModule):
 
     @staticmethod
     def btjc_to_bjct(x):
-        """[B,T,J,C] -> [B,J,C,T]"""
         return x.permute(0, 2, 3, 1).contiguous()
 
     @staticmethod
     def bjct_to_btjc(x):
-        """[B,J,C,T] -> [B,T,J,C]"""
         return x.permute(0, 3, 1, 2).contiguous()
 
     def training_step(self, batch, batch_idx):
-        """Diffusion 训练步骤"""
         debug = self._step_count == 0 or self._step_count % 100 == 0
 
         cond_raw = batch["conditions"]
@@ -148,35 +119,33 @@ class LitDiffusion(pl.LightningModule):
         gt_norm = self.normalize(gt_btjc)
         past_norm = self.normalize(past_btjc)
 
-        B, T_future, J, C = gt_norm.shape
+        B = gt_norm.shape[0]
         device = gt_norm.device
 
-        # 转换为 BJCT 格式
+        # BJCT 格式
         gt_bjct = self.btjc_to_bjct(gt_norm)
         past_bjct = self.btjc_to_bjct(past_norm)
 
-        # 随机采样 timestep
+        # 随机 timestep
         t = torch.randint(0, self.diffusion_steps, (B,), device=device, dtype=torch.long)
         
-        # 给 GT 加噪声
+        # 加噪声
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
-        # 模型预测 x0
+        # 预测 x0
         pred_x0_bjct = self.model(x_t, t, past_bjct, sign_img)
         
-        # Loss: MSE
+        # Loss
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
         
-        # Velocity loss
         pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
         gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
         loss_vel = F.mse_loss(pred_vel, gt_vel)
         
-        # Total loss
         loss = loss_mse + self.vel_weight * loss_vel
 
-        # 计算 displacement ratio 用于监控
+        # 监控 displacement ratio
         with torch.no_grad():
             pred_disp = pred_vel.abs().mean().item()
             gt_disp = gt_vel.abs().mean().item()
@@ -203,7 +172,7 @@ class LitDiffusion(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, past_btjc, sign_img, future_len=20):
-        """使用 p_sample_loop 采样"""
+        """采样"""
         self.eval()
         device = self.device
 
@@ -214,10 +183,10 @@ class LitDiffusion(pl.LightningModule):
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
         
-        wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
+        wrapped = _ConditionalWrapper(self.model, past_bjct, sign_img.to(device))
         
         pred_bjct = self.diffusion.p_sample_loop(
-            model=wrapped_model,
+            model=wrapped,
             shape=target_shape,
             clip_denoised=False,
             model_kwargs={"y": {}},
@@ -257,5 +226,4 @@ class LitDiffusion(pl.LightningModule):
             print(f"[TRAIN CURVE] failed: {e}")
 
 
-# Alias
 LitMinimal = LitDiffusion
