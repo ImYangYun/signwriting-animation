@@ -52,13 +52,10 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None):
     
     delta = ref_arr.reshape(-1, 3).mean(0) - pred_arr.reshape(-1, 3).mean(0)
     pose_obj.body.data += delta
-    
-    if HAS_UNSHIFT:
-        try:
-            unshift_hands(pose_obj)
-            print("  ✓ unshift_hands 成功")
-        except Exception as e:
-            print(f"  ✗ unshift_hands 失败: {e}")
+
+    unshift_hands(pose_obj)
+    print("  ✓ unshift_hands 成功")
+
     
     return pose_obj
 
