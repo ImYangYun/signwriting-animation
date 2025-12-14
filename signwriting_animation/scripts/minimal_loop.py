@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
+"""
+诊断 train() vs eval() 差异
+
+现象：
+- model.train(): ratio ≈ 0.3-0.4
+- model.eval(): ratio = 0.0000
+
+可能原因：Dropout 在训练时引入随机性，eval 时关闭导致坍缩
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 print("=" * 70)
-print("自包含测试 - 内置修复后的模型")
+print("诊断 train() vs eval() 差异")
 print("=" * 70)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -15,17 +24,17 @@ from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType,
 from transformers import CLIPModel
 
 # ============================================================
-# 修复后的模型定义（直接写在这里，不依赖外部文件）
+# 模型定义（完全无 Dropout 版本）
 # ============================================================
 
-class ContextEncoder(nn.Module):
-    """MeanPool 上下文编码器"""
-    def __init__(self, input_feats, latent_dim, num_layers=2, num_heads=4, dropout=0.1):
+class ContextEncoderNoDropout(nn.Module):
+    def __init__(self, input_feats, latent_dim, num_layers=2, num_heads=4):
         super().__init__()
         self.pose_encoder = nn.Linear(input_feats, latent_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim, nhead=num_heads,
-            dim_feedforward=latent_dim * 4, dropout=dropout,
+            dim_feedforward=latent_dim * 4,
+            dropout=0.0,  # 无 Dropout!
             activation="gelu", batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -43,15 +52,10 @@ class ContextEncoder(nn.Module):
 
 
 class OutputProcessMLP(nn.Module):
-    """
-    ⚠️ 修复版：简单 MLP，无 LayerNorm！
-    """
     def __init__(self, num_latent_dims, num_keypoints, num_dims_per_keypoint, hidden_dim=512):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
-        
-        # 简单 3 层 MLP（师姐风格，无 LayerNorm！）
         self.net = nn.Sequential(
             nn.Linear(num_latent_dims, hidden_dim),
             nn.GELU(),
@@ -64,6 +68,23 @@ class OutputProcessMLP(nn.Module):
         T, B, D = x.shape
         y = self.net(x)
         return y.reshape(T, B, self.num_keypoints, self.num_dims_per_keypoint)
+
+
+class PositionalEncodingNoDropout(nn.Module):
+    """无 Dropout 的位置编码"""
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1)  # [max_len, 1, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [T, B, D]
+        return x + self.pe[:x.size(0)]
 
 
 class EmbedSignWriting(nn.Module):
@@ -81,41 +102,42 @@ class EmbedSignWriting(nn.Module):
         return embeddings_batch[None, ...]
 
 
-class FixedModel(nn.Module):
-    """
-    修复后的 Diffusion 模型
-    """
+class FixedModelNoDropout(nn.Module):
+    """完全无 Dropout 的模型"""
     def __init__(self, num_keypoints, num_dims_per_keypoint, num_latent_dims=256,
-                 ff_size=1024, num_layers=8, num_heads=4, dropout=0.2,
-                 use_mean_pool=True):
+                 ff_size=1024, num_layers=8, num_heads=4):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
-        self.use_mean_pool = use_mean_pool
 
         input_feats = num_keypoints * num_dims_per_keypoint
         
         self.future_motion_process = MotionProcess(input_feats, num_latent_dims)
         self.past_motion_process = MotionProcess(input_feats, num_latent_dims)
-        self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
+        
+        # 无 Dropout 的位置编码
+        self.sequence_pos_encoder = PositionalEncodingNoDropout(num_latent_dims)
 
         self.embed_signwriting = EmbedSignWriting(num_latent_dims)
-        self.embed_timestep = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
+        
+        # TimestepEmbedder 用原版（它内部也用 PositionalEncoding）
+        # 我们用简单的 embedding 替代
+        self.embed_timestep = nn.Embedding(1000, num_latent_dims)
 
-        if use_mean_pool:
-            self.past_context_encoder = ContextEncoder(input_feats, num_latent_dims)
-            print(f"✓ 使用 MeanPool 模式")
-        else:
-            self.past_context_encoder = None
-            print(f"✓ 使用 Concat 模式")
+        # 无 Dropout 的 ContextEncoder
+        self.past_context_encoder = ContextEncoderNoDropout(input_feats, num_latent_dims)
+        print(f"✓ 使用 MeanPool 模式 (无 Dropout)")
 
-        self.seqEncoder = seq_encoder_factory(
-            arch="trans_enc", latent_dim=num_latent_dims,
-            ff_size=ff_size, num_layers=num_layers,
-            num_heads=num_heads, dropout=dropout, activation="gelu"
+        # 无 Dropout 的 Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=num_latent_dims, nhead=num_heads,
+            dim_feedforward=ff_size,
+            dropout=0.0,  # 无 Dropout!
+            activation="gelu", batch_first=False,
         )
+        self.seqEncoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        print(f"✓ Transformer (无 Dropout)")
 
-        # ⚠️ 修复版 OutputProcessMLP（无 LayerNorm）
         self.pose_projection = OutputProcessMLP(
             num_latent_dims, num_keypoints, num_dims_per_keypoint
         )
@@ -139,7 +161,9 @@ class FixedModel(nn.Module):
         T_future = num_frames
         B = batch_size
 
-        time_emb = self.embed_timestep(timesteps)
+        # Timestep embedding (简化版)
+        time_emb = self.embed_timestep(timesteps.clamp(0, 999)).unsqueeze(0)  # [1, B, D]
+        
         signwriting_emb = self.embed_signwriting(signwriting_im_batch)
         future_motion_emb = self.future_motion_process(x)
 
@@ -147,13 +171,9 @@ class FixedModel(nn.Module):
         t_latent = self.future_time_proj(t).expand(-1, B, -1)
         future_motion_emb = future_motion_emb + 0.1 * t_latent
 
-        if self.use_mean_pool:
-            past_btjc = past_motion.permute(0, 3, 1, 2).contiguous()
-            past_context = self.past_context_encoder(past_btjc)
-            xseq = torch.cat([time_emb, signwriting_emb, past_context, future_motion_emb], dim=0)
-        else:
-            past_motion_emb = self.past_motion_process(past_motion)
-            xseq = torch.cat([time_emb, signwriting_emb, past_motion_emb, future_motion_emb], dim=0)
+        past_btjc = past_motion.permute(0, 3, 1, 2).contiguous()
+        past_context = self.past_context_encoder(past_btjc)
+        xseq = torch.cat([time_emb, signwriting_emb, past_context, future_motion_emb], dim=0)
         
         xseq = self.sequence_pos_encoder(xseq)
         output = self.seqEncoder(xseq)
@@ -166,30 +186,19 @@ class FixedModel(nn.Module):
 
 
 # ============================================================
-# 测试配置
+# 测试
 # ============================================================
 K = 178
 D = 3
 T_past = 40
 T_future = 20
-DIFFUSION_STEPS = 8
-
-def cosine_beta_schedule(timesteps, s=0.008):
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0.0001, 0.9999)
-
-print("\n创建测试数据...")
 
 gt_bjct = torch.zeros(1, K, D, T_future).to(device)
 for t_idx in range(T_future):
     gt_bjct[:, :, 0, t_idx] = t_idx * 0.5
 
 gt_disp = (gt_bjct[:, :, :, 1:] - gt_bjct[:, :, :, :-1]).abs().mean().item()
-print(f"GT displacement: {gt_disp:.4f}")
+print(f"\nGT displacement: {gt_disp:.4f}")
 
 past_bjct = torch.zeros(1, K, D, T_past).to(device)
 for t_idx in range(T_past):
@@ -199,24 +208,23 @@ sign_img = torch.randn(1, 3, 224, 224).to(device)
 
 # ============================================================
 print("\n" + "=" * 70)
-print("测试 1: Regression (修复后的模型)")
+print("测试: 无 Dropout 模型")
 print("=" * 70)
 
-model_reg = FixedModel(
+model = FixedModelNoDropout(
     num_keypoints=K,
     num_dims_per_keypoint=D,
-    use_mean_pool=True,
 ).to(device)
 
-optimizer_reg = torch.optim.AdamW(model_reg.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-print("\n训练 Regression...")
-model_reg.train()
+print("\n训练...")
+model.train()
 for step in range(2001):
-    optimizer_reg.zero_grad()
+    optimizer.zero_grad()
     
     t = torch.tensor([0]).to(device)
-    pred = model_reg(gt_bjct, t, past_bjct, sign_img)
+    pred = model(gt_bjct, t, past_bjct, sign_img)
     
     loss_mse = F.mse_loss(pred, gt_bjct)
     pred_vel = pred[:, :, :, 1:] - pred[:, :, :, :-1]
@@ -225,127 +233,43 @@ for step in range(2001):
     
     loss = loss_mse + loss_vel
     loss.backward()
-    optimizer_reg.step()
+    optimizer.step()
     
     if step % 400 == 0:
         pred_disp = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean().item()
         ratio = pred_disp / gt_disp
-        print(f"  Step {step}: loss={loss.item():.4f}, pred_disp={pred_disp:.4f}, ratio={ratio:.4f}")
+        print(f"  Step {step}: loss={loss.item():.4f}, ratio={ratio:.4f}")
 
-model_reg.eval()
+# 测试 train 模式
+print("\n测试 (train 模式):")
+model.train()
 with torch.no_grad():
     t = torch.tensor([0]).to(device)
-    pred = model_reg(gt_bjct, t, past_bjct, sign_img)
+    pred = model(gt_bjct, t, past_bjct, sign_img)
     pred_disp = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean().item()
-    ratio_reg = pred_disp / gt_disp
-    print(f"\n✓ Regression 最终: pred_disp={pred_disp:.4f}, ratio={ratio_reg:.4f}")
+    ratio_train = pred_disp / gt_disp
+    print(f"  ratio (train mode): {ratio_train:.4f}")
 
-# ============================================================
-print("\n" + "=" * 70)
-print("测试 2: Diffusion (修复后的模型)")
-print("=" * 70)
-
-betas = cosine_beta_schedule(DIFFUSION_STEPS).numpy()
-diffusion = GaussianDiffusion(
-    betas=betas,
-    model_mean_type=ModelMeanType.START_X,
-    model_var_type=ModelVarType.FIXED_SMALL,
-    loss_type=LossType.MSE,
-    rescale_timesteps=False,
-)
-
-model_diff = FixedModel(
-    num_keypoints=K,
-    num_dims_per_keypoint=D,
-    use_mean_pool=True,
-).to(device)
-
-optimizer_diff = torch.optim.AdamW(model_diff.parameters(), lr=1e-3)
-
-print("\n训练 Diffusion...")
-model_diff.train()
-for step in range(2001):
-    optimizer_diff.zero_grad()
-    
-    t = torch.randint(0, DIFFUSION_STEPS, (1,), device=device)
-    noise = torch.randn_like(gt_bjct)
-    x_t = diffusion.q_sample(gt_bjct, t, noise=noise)
-    
-    pred = model_diff(x_t, t, past_bjct, sign_img)
-    
-    loss_mse = F.mse_loss(pred, gt_bjct)
-    pred_vel = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-    gt_vel = gt_bjct[:, :, :, 1:] - gt_bjct[:, :, :, :-1]
-    loss_vel = F.mse_loss(pred_vel, gt_vel)
-    
-    loss = loss_mse + loss_vel
-    loss.backward()
-    optimizer_diff.step()
-    
-    if step % 400 == 0:
-        with torch.no_grad():
-            t_test = torch.tensor([0]).to(device)
-            x_t_test = diffusion.q_sample(gt_bjct, t_test, noise=torch.randn_like(gt_bjct))
-            pred_test = model_diff(x_t_test, t_test, past_bjct, sign_img)
-            pred_disp = (pred_test[:, :, :, 1:] - pred_test[:, :, :, :-1]).abs().mean().item()
-            ratio = pred_disp / gt_disp
-        print(f"  Step {step}: loss={loss.item():.4f}, pred_disp={pred_disp:.4f}, ratio={ratio:.4f}")
-
-model_diff.eval()
+# 测试 eval 模式
+print("\n测试 (eval 模式):")
+model.eval()
 with torch.no_grad():
     t = torch.tensor([0]).to(device)
-    x_t = diffusion.q_sample(gt_bjct, t, noise=torch.randn_like(gt_bjct))
-    pred = model_diff(x_t, t, past_bjct, sign_img)
+    pred = model(gt_bjct, t, past_bjct, sign_img)
     pred_disp = (pred[:, :, :, 1:] - pred[:, :, :, :-1]).abs().mean().item()
-    ratio_diff = pred_disp / gt_disp
-    print(f"\n✓ Diffusion 最终: pred_disp={pred_disp:.4f}, ratio={ratio_diff:.4f}")
+    ratio_eval = pred_disp / gt_disp
+    print(f"  ratio (eval mode): {ratio_eval:.4f}")
 
-# ============================================================
 print("\n" + "=" * 70)
-print("测试 3: p_sample_loop 采样")
+print("📊 结论")
 print("=" * 70)
 
-class ConditionalWrapper(nn.Module):
-    def __init__(self, model, past, sign):
-        super().__init__()
-        self.model = model
-        self.past = past
-        self.sign = sign
-    
-    def forward(self, x, t, **kwargs):
-        return self.model(x, t, self.past, self.sign)
-
-wrapped = ConditionalWrapper(model_diff, past_bjct, sign_img)
-
-print("\n使用 p_sample_loop 采样...")
-with torch.no_grad():
-    sampled = diffusion.p_sample_loop(
-        model=wrapped,
-        shape=(1, K, D, T_future),
-        clip_denoised=False,
-        model_kwargs={"y": {}},
-        progress=False,
-    )
-    
-    sampled_disp = (sampled[:, :, :, 1:] - sampled[:, :, :, :-1]).abs().mean().item()
-    ratio_sample = sampled_disp / gt_disp
-    print(f"✓ 采样结果: sampled_disp={sampled_disp:.4f}, ratio={ratio_sample:.4f}")
-
-# ============================================================
-print("\n" + "=" * 70)
-print("📊 结果汇总")
-print("=" * 70)
-
-print(f"""
-| 测试 | ratio | 结果 |
-|------|-------|------|
-| Regression | {ratio_reg:.4f} | {'✅ 成功' if ratio_reg > 0.5 else '❌ 失败'} |
-| Diffusion | {ratio_diff:.4f} | {'✅ 成功' if ratio_diff > 0.5 else '❌ 失败'} |
-| p_sample_loop | {ratio_sample:.4f} | {'✅ 成功' if ratio_sample > 0.5 else '❌ 失败'} |
-""")
-
-if ratio_reg > 0.5 and ratio_diff > 0.5:
-    print("🎉 修复成功！现在请替换你的 models.py 文件")
-    print("   cp models_fixed.py /path/to/signwriting_animation/diffusion/core/models.py")
+if abs(ratio_train - ratio_eval) < 0.1:
+    print(f"✅ train 和 eval 一致: train={ratio_train:.4f}, eval={ratio_eval:.4f}")
+    if ratio_eval > 0.5:
+        print("🎉 修复成功！")
+    else:
+        print("⚠️ 还有其他问题导致运动丢失")
 else:
-    print("⚠️ 还有问题，需要进一步调试")
+    print(f"❌ train 和 eval 不一致: train={ratio_train:.4f}, eval={ratio_eval:.4f}")
+    print("   问题确认是 Dropout 导致的！")
