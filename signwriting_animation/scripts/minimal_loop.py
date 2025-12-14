@@ -13,6 +13,7 @@ from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
+from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.lightning_module import (
@@ -21,43 +22,71 @@ from signwriting_animation.diffusion.lightning_module import (
     masked_dtw, 
     mean_frame_disp,
 )
-from pose_anonymization.data.normalization import unshift_hands
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None):
-    """转换 tensor 到 pose，包含 unshift_hands"""
-    t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc
-    t_np = t.detach().cpu().numpy().astype(np.float32)
+
+
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
+    """转换 tensor 到 pose 格式"""
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
     
+    t_np = t.detach().cpu().numpy().astype(np.float32)
+
+    gt_np = None
+    if gt_btjc is not None:
+        if gt_btjc.dim() == 4:
+            gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
+        else:
+            gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
+
     arr = t_np[:, None, :, :]
     conf = ref_pose.body.confidence[:len(t_np)].copy()
-    body = NumPyPoseBody(fps=ref_pose.body.fps, data=arr, confidence=conf)
+    fps = ref_pose.body.fps
+    
+    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
     
-    # Scale and translate
-    T_pred = len(t_np)
-    T_ref = ref_pose.body.data.shape[0]
-    future_start = max(0, T_ref - T_pred)
+
+    unshift_hands(pose_obj)
+    print("  ✓ unshift 成功")
+
+    T_pred = pose_obj.body.data.shape[0]
+    T_ref_total = ref_pose.body.data.shape[0]
+    
+    future_start = max(0, T_ref_total - T_pred)
     ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
     pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     
-    if gt_btjc is not None:
-        gt_np = gt_btjc[0].cpu().numpy() if gt_btjc.dim() == 4 else gt_btjc.cpu().numpy()
-        var_gt = ((gt_np - gt_np.mean(axis=1, keepdims=True)) ** 2).mean()
-        var_ref = ((ref_arr - ref_arr.mean(axis=1, keepdims=True)) ** 2).mean()
-        if var_gt > 1e-8:
-            scale = np.sqrt(var_ref / var_gt)
+    print(f"  [alignment] ref 用原始文件的帧 {future_start}-{future_start+T_pred-1}")
+    
+    if apply_scale and gt_np is not None:
+        def _var(a):
+            center = a.mean(axis=1, keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        var_gt_norm = _var(gt_np)
+        var_ref = _var(ref_arr)
+        
+        if var_gt_norm > 1e-8:
+            scale = np.sqrt(var_ref / var_gt_norm)
+            print(f"  [scale] var_ref={var_ref:.2f}, var_gt_norm={var_gt_norm:.6f}")
+            print(f"  [scale] normalized→pixel scale={scale:.2f}")
             pose_obj.body.data *= scale
             pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    
-    delta = ref_arr.reshape(-1, 3).mean(0) - pred_arr.reshape(-1, 3).mean(0)
+
+    ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
+    pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
+    delta = ref_c - pred_c
+    print(f"  [translate] delta={delta}")
     pose_obj.body.data += delta
-
-    unshift_hands(pose_obj)
-    print("  ✓ unshift_hands 成功")
-
+    
+    print(f"  [final] range=[{pose_obj.body.data.min():.2f}, {pose_obj.body.data.max():.2f}]")
     
     return pose_obj
+
 
 
 if __name__ == "__main__":
