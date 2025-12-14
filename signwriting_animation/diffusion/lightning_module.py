@@ -12,6 +12,7 @@ from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusi
 
 
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
+    """确保输入是 [B, T, J, C] 格式"""
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     if hasattr(x, "tensor"):
@@ -27,44 +28,8 @@ def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().float()
 
 
-def _btjc_to_tjc_list(x_btjc, mask_bt):
-    x_btjc = sanitize_btjc(x_btjc)
-    batch_size, seq_len, _, _ = x_btjc.shape
-    mask_bt = (mask_bt > 0.5).float()
-    seqs = []
-    for b in range(batch_size):
-        t = int(mask_bt[b].sum().item())
-        t = max(0, min(t, seq_len))
-        seqs.append(x_btjc[b, :t].contiguous())
-    return seqs
-
-
-@torch.no_grad()
-def masked_dtw(pred_btjc, tgt_btjc, mask_bt):
-    preds = _btjc_to_tjc_list(pred_btjc, mask_bt)
-    tgts = _btjc_to_tjc_list(tgt_btjc, mask_bt)
-    
-    try:
-        dtw_metric = PE_DTW()
-    except:
-        pred = sanitize_btjc(pred_btjc)
-        tgt = sanitize_btjc(tgt_btjc)
-        t_max = min(pred.size(1), tgt.size(1))
-        return torch.mean((pred[:, :t_max] - tgt[:, :t_max]) ** 2)
-    
-    vals = []
-    for p, g in zip(preds, tgts):
-        if p.size(0) < 2 or g.size(0) < 2:
-            continue
-        pv = p.detach().cpu().numpy().astype("float32")[:, None, :, :]
-        gv = g.detach().cpu().numpy().astype("float32")[:, None, :, :]
-        vals.append(float(dtw_metric.get_distance(pv, gv)))
-    if not vals:
-        return torch.tensor(0.0, device=pred_btjc.device)
-    return torch.tensor(vals, device=pred_btjc.device).mean()
-
-
 def mean_frame_disp(x_btjc: torch.Tensor) -> float:
+    """计算平均帧间位移"""
     x = sanitize_btjc(x_btjc)
     if x.size(1) < 2:
         return 0.0
@@ -73,6 +38,7 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
 
 
 def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine beta schedule"""
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
     alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
@@ -84,7 +50,7 @@ def cosine_beta_schedule(timesteps, s=0.008):
 class _ConditionalWrapper(nn.Module):
     """
     包装模型，固定条件输入，只接受 (x, t) 参数
-    这样可以兼容 GaussianDiffusion.p_sample_loop 的接口
+    兼容 GaussianDiffusion.p_sample_loop 的接口
     """
     def __init__(self, base_model: nn.Module, past_bjct: torch.Tensor, sign_img: torch.Tensor):
         super().__init__()
@@ -93,20 +59,16 @@ class _ConditionalWrapper(nn.Module):
         self.sign_img = sign_img
     
     def forward(self, x, t, **kwargs):
-        """
-        x: [B, J, C, T] (BJCT 格式，GaussianDiffusion 期望的)
-        t: [B] timesteps
-        """
         return self.base_model(x, t, self.past_bjct, self.sign_img)
 
 
 class LitDiffusion(pl.LightningModule):
     """
-    Diffusion Lightning Module - 支持 MeanPool 模式
+    Diffusion 训练模块
     
     关键改动：
-    1. 添加 use_mean_pool 参数
-    2. 传递给 SignWritingToPoseDiffusionV2
+    1. 使用简化版模型（无 LayerNorm 的 OutputProcessMLP）
+    2. 使用 GaussianDiffusion.p_sample_loop 进行采样
     """
 
     def __init__(
@@ -116,13 +78,9 @@ class LitDiffusion(pl.LightningModule):
         lr=1e-4,
         stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
         diffusion_steps=8,
-        guidance_scale=0.0,
-        residual_scale: float = 0.1,
-        vel_weight: float = 0.5,
-        acc_weight: float = 0.2,
-        cond_drop_prob: float = 0.0,  # 4-sample overfit 不用 dropout
-        t_zero_prob: float = 0.0,
-        use_mean_pool: bool = True,   # ✅ 新增：使用 MeanPool 模式（参考师姐）
+        vel_weight: float = 1.0,
+        acc_weight: float = 0.0,
+        use_mean_pool: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -130,10 +88,6 @@ class LitDiffusion(pl.LightningModule):
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
-        self.guidance_scale = guidance_scale
-        self.cond_drop_prob = cond_drop_prob
-        self.t_zero_prob = t_zero_prob
-        self.use_mean_pool = use_mean_pool
         self._step_count = 0
 
         # 加载统计信息
@@ -143,18 +97,17 @@ class LitDiffusion(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # 模型 - 传递 use_mean_pool 参数！
+        # 模型（使用修复后的版本）
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
-            residual_scale=residual_scale,
-            use_mean_pool=use_mean_pool,  # ✅ 传递参数
+            use_mean_pool=use_mean_pool,
         )
 
         # Cosine beta schedule
         betas = cosine_beta_schedule(diffusion_steps).numpy()
         
-        # 使用 GaussianDiffusion - 预测 x0
+        # GaussianDiffusion - 预测 x0
         self.diffusion = GaussianDiffusion(
             betas=betas,
             model_mean_type=ModelMeanType.START_X,
@@ -164,12 +117,7 @@ class LitDiffusion(pl.LightningModule):
         )
 
         self.lr = lr
-        self.train_logs = {"loss": [], "mse": [], "vel": [], "acc": [], "disp": []}
-        
-        print(f"\n✓ LitDiffusion 初始化:")
-        print(f"  use_mean_pool: {use_mean_pool}")
-        print(f"  diffusion_steps: {diffusion_steps}")
-        print(f"  cond_drop_prob: {cond_drop_prob}")
+        self.train_logs = {"loss": [], "mse": [], "vel": [], "disp_ratio": []}
 
     def normalize(self, x):
         return (x - self.mean_pose) / (self.std_pose + 1e-6)
@@ -188,9 +136,7 @@ class LitDiffusion(pl.LightningModule):
         return x.permute(0, 3, 1, 2).contiguous()
 
     def training_step(self, batch, batch_idx):
-        """
-        Diffusion 训练 - 4 sample overfit 版本
-        """
+        """Diffusion 训练步骤"""
         debug = self._step_count == 0 or self._step_count % 100 == 0
 
         cond_raw = batch["conditions"]
@@ -216,76 +162,48 @@ class LitDiffusion(pl.LightningModule):
         noise = torch.randn_like(gt_bjct)
         x_t = self.diffusion.q_sample(gt_bjct, t, noise=noise)
         
-        # Condition Dropout (4-sample overfit 时设为 0)
-        if self.cond_drop_prob > 0 and torch.rand(1).item() < self.cond_drop_prob:
-            past_input = torch.zeros_like(past_bjct)
-            sign_input = torch.zeros_like(sign_img)
-        else:
-            past_input = past_bjct
-            sign_input = sign_img
-        
         # 模型预测 x0
-        t_scaled = self.diffusion._scale_timesteps(t)
-        pred_x0_bjct = self.model(x_t, t_scaled, past_input, sign_input)
+        pred_x0_bjct = self.model(x_t, t, past_bjct, sign_img)
         
-        # 主 Loss
-        loss_main = F.mse_loss(pred_x0_bjct, gt_bjct)
+        # Loss: MSE
+        loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
         
-        # 转回 BTJC 计算辅助 loss
-        pred_x0_btjc = self.bjct_to_btjc(pred_x0_bjct)
-        gt_btjc_unnorm = self.unnormalize(gt_norm)
-        pred_btjc_unnorm = self.unnormalize(pred_x0_btjc)
-        
-        loss_vel = torch.tensor(0.0, device=device)
-        loss_acc = torch.tensor(0.0, device=device)
-        
-        if pred_btjc_unnorm.size(1) > 1:
-            v_pred = pred_btjc_unnorm[:, 1:] - pred_btjc_unnorm[:, :-1]
-            v_gt = gt_btjc_unnorm[:, 1:] - gt_btjc_unnorm[:, :-1]
-            loss_vel = F.mse_loss(v_pred, v_gt)
-            
-            if v_pred.size(1) > 1:
-                a_pred = v_pred[:, 1:] - v_pred[:, :-1]
-                a_gt = v_gt[:, 1:] - v_gt[:, :-1]
-                loss_acc = F.mse_loss(a_pred, a_gt)
+        # Velocity loss
+        pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
+        gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
+        loss_vel = F.mse_loss(pred_vel, gt_vel)
         
         # Total loss
-        loss = loss_main + self.vel_weight * loss_vel + self.acc_weight * loss_acc
+        loss = loss_mse + self.vel_weight * loss_vel
+
+        # 计算 displacement ratio 用于监控
+        with torch.no_grad():
+            pred_disp = pred_vel.abs().mean().item()
+            gt_disp = gt_vel.abs().mean().item()
+            disp_ratio = pred_disp / (gt_disp + 1e-8)
 
         if debug:
-            disp_pred = mean_frame_disp(pred_btjc_unnorm)
-            disp_gt = mean_frame_disp(gt_btjc_unnorm)
-            ratio_val = disp_pred / (disp_gt + 1e-8)
-            print("\n" + "=" * 70)
-            print(f"STEP {self._step_count} | MeanPool={self.use_mean_pool}")
-            print("=" * 70)
-            print(f"  t range: [{t.min().item()}, {t.max().item()}]")
-            print(f"  loss_main: {loss_main.item():.6f}")
-            print(f"  loss_vel: {loss_vel.item():.6f}, loss_acc: {loss_acc.item():.6f}")
-            print(f"  disp_pred: {disp_pred:.6f}, disp_gt: {disp_gt:.6f}, ratio: {ratio_val:.4f}")
-            print(f"  TOTAL: {loss.item():.6f}")
-            print("=" * 70)
+            print(f"\n[Step {self._step_count}] loss={loss.item():.4f}, mse={loss_mse.item():.4f}, "
+                  f"vel={loss_vel.item():.4f}, disp_ratio={disp_ratio:.4f}")
 
         self.log_dict({
             "train/loss": loss,
-            "train/mse": loss_main,
+            "train/mse": loss_mse,
             "train/vel": loss_vel,
-            "train/acc": loss_acc,
+            "train/disp_ratio": disp_ratio,
         }, prog_bar=True)
 
         self.train_logs["loss"].append(loss.item())
-        self.train_logs["mse"].append(loss_main.item())
+        self.train_logs["mse"].append(loss_mse.item())
         self.train_logs["vel"].append(loss_vel.item())
-        self.train_logs["acc"].append(loss_acc.item())
+        self.train_logs["disp_ratio"].append(disp_ratio)
 
         self._step_count += 1
         return loss
 
     @torch.no_grad()
     def sample(self, past_btjc, sign_img, future_len=20):
-        """
-        使用 GaussianDiffusion.p_sample_loop 进行采样
-        """
+        """使用 p_sample_loop 采样"""
         self.eval()
         device = self.device
 
@@ -309,75 +227,32 @@ class LitDiffusion(pl.LightningModule):
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
 
-    @torch.no_grad()
-    def sample_with_cfg(self, past_btjc, sign_img, future_len=20, guidance_scale=2.0):
-        """
-        使用 Classifier-Free Guidance 采样
-        """
-        self.eval()
-        device = self.device
-
-        past_raw = sanitize_btjc(past_btjc.to(device))
-        past_norm = self.normalize(past_raw)
-        past_bjct = self.btjc_to_bjct(past_norm)
-
-        B, J, C, _ = past_bjct.shape
-        target_shape = (B, J, C, future_len)
-        
-        # Conditional sampling
-        wrapped_model_cond = _ConditionalWrapper(self.model, past_bjct, sign_img)
-        cond_pred = self.diffusion.p_sample_loop(
-            model=wrapped_model_cond,
-            shape=target_shape,
-            clip_denoised=False,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        
-        # Unconditional sampling
-        uncond_past = torch.zeros_like(past_bjct)
-        uncond_sign = torch.zeros_like(sign_img)
-        wrapped_model_uncond = _ConditionalWrapper(self.model, uncond_past, uncond_sign)
-        uncond_pred = self.diffusion.p_sample_loop(
-            model=wrapped_model_uncond,
-            shape=target_shape,
-            clip_denoised=False,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        
-        # CFG combination
-        pred_bjct = uncond_pred + guidance_scale * (cond_pred - uncond_pred)
-        
-        pred_btjc = self.bjct_to_btjc(pred_bjct)
-        return self.unnormalize(pred_btjc)
-
     def on_train_start(self):
         self.mean_pose = self.mean_pose.to(self.device)
         self.std_pose = self.std_pose.to(self.device)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-        return {"optimizer": optimizer, "gradient_clip_val": 1.0}
+        return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
     def on_train_end(self):
         try:
             import matplotlib.pyplot as plt
-            out_dir = "logs/diffusion_real"
+            out_dir = "logs/diffusion"
             os.makedirs(out_dir, exist_ok=True)
 
-            fig, ax = plt.subplots(2, 2, figsize=(10, 8))
-            ax[0, 0].plot(self.train_logs["loss"])
-            ax[0, 0].set_title("loss")
-            ax[0, 1].plot(self.train_logs["mse"])
-            ax[0, 1].set_title("mse")
-            ax[1, 0].plot(self.train_logs["vel"])
-            ax[1, 0].set_title("vel")
-            ax[1, 1].plot(self.train_logs["acc"])
-            ax[1, 1].set_title("acc")
+            fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+            axes[0, 0].plot(self.train_logs["loss"])
+            axes[0, 0].set_title("Total Loss")
+            axes[0, 1].plot(self.train_logs["mse"])
+            axes[0, 1].set_title("MSE Loss")
+            axes[1, 0].plot(self.train_logs["vel"])
+            axes[1, 0].set_title("Velocity Loss")
+            axes[1, 1].plot(self.train_logs["disp_ratio"])
+            axes[1, 1].set_title("Displacement Ratio")
+            axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5)
             plt.tight_layout()
             plt.savefig(f"{out_dir}/train_curve.png")
-            print(f"[TRAIN CURVE] saved")
+            print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
         except Exception as e:
             print(f"[TRAIN CURVE] failed: {e}")
 
