@@ -21,10 +21,11 @@ from signwriting_animation.diffusion.lightning_module import (
     masked_dtw, 
     mean_frame_disp,
 )
+from pose_anonymization.data.normalization import unshift_hands
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None):
-    """转换 tensor 到 pose"""
+    """转换 tensor 到 pose，包含 unshift_hands"""
     t = t_btjc[0] if t_btjc.dim() == 4 else t_btjc
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
@@ -52,12 +53,15 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None):
     delta = ref_arr.reshape(-1, 3).mean(0) - pred_arr.reshape(-1, 3).mean(0)
     pose_obj.body.data += delta
     
+    if HAS_UNSHIFT:
+        try:
+            unshift_hands(pose_obj)
+            print("  ✓ unshift_hands 成功")
+        except Exception as e:
+            print(f"  ✗ unshift_hands 失败: {e}")
+    
     return pose_obj
 
-
-# ============================================================
-# Main
-# ============================================================
 
 if __name__ == "__main__":
     pl.seed_everything(42)
