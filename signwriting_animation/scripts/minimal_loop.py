@@ -1,14 +1,11 @@
 #!/usr/bin/env python
 """
-V2 Ablation Study - Direct Run Version
+V2 Ablation Study - Fully Automatic (No Interaction)
 
-Just run: python run_ablation.py
+Perfect for batch job submission!
+Just run: python run_ablation_auto.py
 
-No arguments needed! Will automatically test:
-- V2-baseline (frame-independent only)
-- V2-improved (frame-independent + both CAMDM components)
-
-Estimated time: ~1 hour
+No confirmation needed - starts immediately!
 """
 
 import os
@@ -247,7 +244,7 @@ def print_comparison_table(results_list):
 
 def main():
     print("=" * 70)
-    print("V2 ABLATION STUDY - AUTO RUN")
+    print("V2 ABLATION STUDY - FULLY AUTOMATIC")
     print("=" * 70)
     print()
     print("This script will automatically test:")
@@ -285,12 +282,11 @@ def main():
     
     print("✅ All prerequisites satisfied!")
     
-    # Ask for confirmation
+    # Auto start - NO CONFIRMATION NEEDED!
     print("\n" + "=" * 70)
-    response = input("Ready to start? This will take ~1 hour. (y/n): ")
-    if response.lower() != 'y':
-        print("Cancelled.")
-        return
+    print("🚀 Starting ablation study automatically...")
+    print("   (Perfect for batch job submission!)")
+    print("=" * 70)
     
     # Configuration
     pl.seed_everything(42)
