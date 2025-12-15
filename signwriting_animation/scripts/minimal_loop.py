@@ -200,7 +200,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         # For pose files, unnormalize to real space
         pred_raw_for_pose = lit_model.unnormalize(pred_norm)
 
-    # Save poses - use UNNORMALIZED data for visualization
+    # Save poses
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -211,14 +211,24 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # Unnormalize for pose files
-    gt_raw_for_pose = lit_model.unnormalize(gt_norm)
+    # GT: Use ORIGINAL ref pose directly (no normalize→unnormalize!)
+    # This preserves the true motion from the dataset
+    T_pred = future_len
+    T_ref_total = ref_pose.body.data.shape[0]
+    future_start = max(0, T_ref_total - T_pred)
     
-    gt_pose = tensor_to_pose(gt_raw_for_pose, ref_pose.header, ref_pose, gt_btjc=gt_raw_for_pose, apply_scale=True)
+    gt_pose_data = ref_pose.body.data[future_start:future_start+T_pred].copy()
+    gt_conf = ref_pose.body.confidence[future_start:future_start+T_pred].copy()
+    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_pose_data, confidence=gt_conf)
+    gt_pose = Pose(header=ref_pose.header, body=gt_body)
+    
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
-    pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, gt_btjc=gt_raw_for_pose, apply_scale=True)
+    # Pred: unnormalize then save
+    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
+    pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, 
+                               gt_btjc=None, apply_scale=False)
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
@@ -371,9 +381,9 @@ if __name__ == "__main__":
     print(f"Max epochs: {MAX_EPOCHS}")
 
     # ========================================
-    # AUTO TEST: baseline + improved
+    # AUTO TEST: all 4 versions for complete ablation
     # ========================================
-    versions = ['baseline', 'improved']
+    versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
     
     results_list = []
     for idx, version in enumerate(versions):
