@@ -1,8 +1,10 @@
 """
 Test V2 Ablation Study - AUTO MODE
 
-Automatically tests:
+Automatically tests all 4 V2 variants:
 - V2-baseline: Frame-independent only
+- V2-with_pos: Frame-independent + PositionalEncoding
+- V2-with_timestep: Frame-independent + TimestepEmbedder  
 - V2-improved: Frame-independent + both CAMDM components
 
 Just run: python test_v2_improved_FIXED.py
@@ -323,7 +325,7 @@ def print_comparison_table(results_list):
 if __name__ == "__main__":
     # ========================================
     # AUTO MODE - No arguments needed!
-    # Tests: baseline + improved
+    # Tests all 4 variants: baseline, with_pos, with_timestep, improved
     # ========================================
     
     pl.seed_everything(42)
@@ -340,9 +342,11 @@ if __name__ == "__main__":
     print("=" * 70)
     print("V2 ABLATION STUDY - AUTO MODE")
     print("=" * 70)
-    print("\nWill test:")
-    print("  1. V2-baseline (frame-independent only)")
-    print("  2. V2-improved (frame-independent + both CAMDM components)")
+    print("\nWill test all 4 V2 variants:")
+    print("  1. baseline (no CAMDM components)")
+    print("  2. with_pos (only PositionalEncoding)")
+    print("  3. with_timestep (only TimestepEmbedder)")
+    print("  4. improved (both components)")
     print(f"\nSettings: {NUM_SAMPLES} samples, {MAX_EPOCHS} epochs each")
     print("=" * 70)
 
@@ -385,6 +389,13 @@ if __name__ == "__main__":
     # ========================================
     versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
     
+    print("\n🔬 Testing all 4 V2 variants:")
+    print("   1. baseline (no CAMDM components)")
+    print("   2. with_pos (only PositionalEncoding)")
+    print("   3. with_timestep (only TimestepEmbedder)")
+    print("   4. improved (both components)")
+    print(f"\n⏱️  Estimated time: {MAX_EPOCHS * 4} epochs total")
+    
     results_list = []
     for idx, version in enumerate(versions):
         print(f"\n{'=' * 70}")
@@ -409,13 +420,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("🎉 ABLATION STUDY COMPLETE!")
     print("=" * 70)
-    print("\nComplete data:")
-    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (collapse)")
-    if len(results_list) > 0:
-        print(f"  ✓ V2-baseline: disp_ratio={results_list[0]['disp_ratio']:.4f}")
-    print("  ✓ V2-pos: disp_ratio=1.05")
-    if len(results_list) > 1:
-        print(f"  ✓ V2-improved: disp_ratio={results_list[1]['disp_ratio']:.4f}")
+    print("\n📊 Tested versions:")
+    for r in results_list:
+        print(f"  ✓ {r['version']}: disp_ratio={r['disp_ratio']:.4f}, MPJPE={r['mpjpe']:.6f}, PCK@0.1={r['pck_01']:.1f}%")
     print("\n💡 Next Steps:")
     print("  - Create ablation table for paper")
     print("  - Compare pose files visually")
