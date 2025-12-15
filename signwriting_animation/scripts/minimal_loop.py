@@ -148,27 +148,28 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
 
     with torch.no_grad():
-        # Sample in unnormalized space
+        # Get prediction in UNNORMALIZED space
         pred_raw = lit_model.sample(past_raw, sign, future_len)
         
-        # Normalize both for fair comparison
+        # CRITICAL: Re-normalize for fair comparison
+        # Different model configs may produce different scales after unnormalize
         pred_norm = lit_model.normalize(pred_raw)
         gt_norm = lit_model.normalize(gt_raw)
         
-        # Compute metrics in NORMALIZED space
+        # Compute ALL metrics in NORMALIZED space for consistency
         mse = F.mse_loss(pred_norm, gt_norm).item()
         disp_pred = mean_frame_disp(pred_norm)
         disp_gt = mean_frame_disp(gt_norm)
         disp_ratio = disp_pred / (disp_gt + 1e-8)
         
-        # Compute position metrics in unnormalized space
-        pred_np = pred_raw[0].cpu().numpy()
-        gt_np = gt_raw[0].cpu().numpy()
+        # Also compute position metrics in normalized space
+        pred_np = pred_norm[0].cpu().numpy()
+        gt_np = gt_norm[0].cpu().numpy()
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
         mpjpe = per_joint_err.mean()
         pck_01 = (per_joint_err < 0.1).mean() * 100
 
-    # Save poses - use NORMALIZED data to avoid scale issues
+    # Save poses - use NORMALIZED data for consistency
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -179,7 +180,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # Use NORMALIZED pred/gt for consistent scaling
+    # Use NORMALIZED data - this ensures consistent scaling across all model variants
     gt_pose = tensor_to_pose(gt_norm, ref_pose.header, ref_pose, gt_btjc=gt_norm, apply_scale=True)
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
