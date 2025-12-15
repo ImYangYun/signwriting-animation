@@ -1,32 +1,19 @@
 #!/usr/bin/env python
 """
-V2 Ablation Study - Complete Testing Script
+V2 Ablation Study - Direct Run Version
 
-This script can:
-1. Run single version test: python this_script.py --version baseline
-2. Run ablation study: python this_script.py --ablation
+Just run: python run_ablation.py
 
-Versions available:
-- baseline: V2 with frame-independent only (no CAMDM components)
-- with_pos: V2 with frame-independent + PositionalEncoding
-- with_timestep: V2 with frame-independent + TimestepEmbedder
-- improved: V2 with frame-independent + both CAMDM components
+No arguments needed! Will automatically test:
+- V2-baseline (frame-independent only)
+- V2-improved (frame-independent + both CAMDM components)
 
-Usage:
-    # Single test
-    python v2_complete_test.py --version baseline --epochs 500
-    
-    # Ablation study (tests baseline + improved)
-    python v2_complete_test.py --ablation --epochs 500
-    
-    # Test all versions
-    python v2_complete_test.py --all --epochs 500
+Estimated time: ~1 hour
 """
 
 import os
 import sys
 import time
-import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -105,10 +92,8 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     print("=" * 70)
     
     version_names = {
-        'baseline': 'V2-Baseline (Frame-Independent)',
-        'with_pos': 'V2+PositionalEncoding',
-        'with_timestep': 'V2+TimestepEmbedder',
-        'improved': 'V2+Both (Full Improved)'
+        'baseline': 'V2-Baseline (Frame-Independent Only)',
+        'improved': 'V2-Improved (Frame-Independent + Both CAMDM Components)'
     }
     print(f"Description: {version_names.get(version, version)}")
 
@@ -210,7 +195,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     print(f"  MSE: {mse:.6f}")
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
-    print(f"  Disp Ratio: {disp_ratio:.4f}")
+    print(f"  Disp Ratio: {disp_ratio:.4f} {'✅' if 0.7 < disp_ratio < 1.3 else '❌'}")
     print(f"  Pixel MPJPE: {pixel_mpjpe:.2f}px")
     print(f"  Saved to: {out_dir}/")
 
@@ -220,79 +205,89 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
 def print_comparison_table(results_list):
     """Print comparison table for all tested versions."""
     print("\n" + "=" * 80)
-    print("COMPARISON TABLE - V2 VARIANTS")
+    print("COMPARISON TABLE - ABLATION STUDY RESULTS")
     print("=" * 80)
     
     version_names = {
         'baseline': 'V2-Baseline',
-        'with_pos': 'V2+PosEnc',
-        'with_timestep': 'V2+TimeEmb',
-        'improved': 'V2+Both'
+        'improved': 'V2-Improved'
     }
     
-    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10}")
+    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10} {'Status':<10}")
     print("-" * 80)
     
     for r in results_list:
         vname = version_names.get(r['version'], r['version'])
-        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f}")
+        status = '✅ Good' if 0.7 < r['disp_ratio'] < 1.3 else '❌ Bad'
+        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f} {status}")
     
     print("\n" + "=" * 80)
     print("ANALYSIS")
     print("=" * 80)
     
     baseline = next((r for r in results_list if r['version'] == 'baseline'), None)
-    if baseline:
-        print(f"\nBaseline (V2 current):")
-        print(f"  Disp Ratio: {baseline['disp_ratio']:.4f}")
-        print(f"  MPJPE: {baseline['mpjpe']:.6f}")
-        print(f"  PCK@0.1: {baseline['pck_01']:.1f}%")
+    improved = next((r for r in results_list if r['version'] == 'improved'), None)
+    
+    if baseline and improved:
+        print("\nKey Findings:")
+        print(f"  V2-Baseline disp_ratio: {baseline['disp_ratio']:.4f}")
+        print(f"  V2-Improved disp_ratio: {improved['disp_ratio']:.4f}")
         
-        for r in results_list:
-            if r['version'] != 'baseline':
-                vname = version_names.get(r['version'], r['version'])
-                mpjpe_improve = (baseline['mpjpe'] - r['mpjpe']) / baseline['mpjpe'] * 100
-                pck_improve = r['pck_01'] - baseline['pck_01']
-                
-                print(f"\n{vname}:")
-                print(f"  MPJPE: {mpjpe_improve:+.1f}% change")
-                print(f"  PCK@0.1: {pck_improve:+.1f}% change")
-                print(f"  Disp Ratio: {r['disp_ratio']:.4f} (should stay ~1.0)")
-    
-    print("\n" + "=" * 80)
-    print("RECOMMENDATIONS")
-    print("=" * 80)
-    
-    best_mpjpe = min(results_list, key=lambda x: x['mpjpe'])
-    best_pck = max(results_list, key=lambda x: x['pck_01'])
-    
-    print(f"\nBest MPJPE: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
-    print(f"Best PCK@0.1: {version_names.get(best_pck['version'], best_pck['version'])}")
-    
-    if best_mpjpe['version'] == best_pck['version']:
-        print(f"\n✅ Clear winner: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
-    else:
-        print(f"\n💡 Trade-off between MPJPE and PCK - test on larger dataset")
+        if baseline['disp_ratio'] > 0.7:
+            print("\n  ✅ Frame-independent decoding successfully prevents motion collapse!")
+            print("     (V1 had disp_ratio=0.00, V2-baseline has ~1.0)")
+        
+        mpjpe_change = (baseline['mpjpe'] - improved['mpjpe']) / baseline['mpjpe'] * 100
+        pck_change = improved['pck_01'] - baseline['pck_01']
+        
+        print(f"\n  CAMDM components contribution:")
+        print(f"    MPJPE: {mpjpe_change:+.1f}% change")
+        print(f"    PCK@0.1: {pck_change:+.1f}% change")
 
 
-def run_ablation_study(max_epochs=500):
-    """Run ablation study (baseline + improved)."""
+def main():
     print("=" * 70)
-    print("V2 ABLATION STUDY")
+    print("V2 ABLATION STUDY - AUTO RUN")
     print("=" * 70)
     print()
-    print("Current status:")
-    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (collapse)")
+    print("This script will automatically test:")
+    print("  1. V2-baseline (frame-independent only)")
+    print("  2. V2-improved (frame-independent + CAMDM components)")
+    print()
+    print("Current known results:")
+    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (motion collapse)")
     print("  ✓ V2-pos: disp_ratio=1.05 (already tested)")
     print()
-    print("Will test:")
-    print("  → V2-baseline: frame-independent only")
-    print("  → V2-improved: frame-independent + both components")
-    print()
-    print(f"Total estimated time: ~1 hour ({max_epochs} epochs each)")
+    print("Settings:")
+    print("  - 4 samples overfitting test")
+    print("  - 500 epochs per version")
+    print("  - Estimated time: ~1 hour")
     print("=" * 70)
     
-    response = input("\nReady to start? (y/n): ")
+    # Check prerequisites
+    print("\nChecking prerequisites...")
+    
+    if not os.path.exists("signwriting_animation/diffusion/core/models.py"):
+        print("❌ ERROR: models.py not found!")
+        print("\nPlease run:")
+        print("  cp models_v2_improved.py signwriting_animation/diffusion/core/models.py")
+        sys.exit(1)
+    
+    # Check if create_v2_model exists
+    try:
+        from signwriting_animation.diffusion.core.models import create_v2_model
+        print("✅ Model file verified (create_v2_model found)")
+    except ImportError:
+        print("❌ ERROR: create_v2_model not found in models.py!")
+        print("\nPlease run:")
+        print("  cp models_v2_improved.py signwriting_animation/diffusion/core/models.py")
+        sys.exit(1)
+    
+    print("✅ All prerequisites satisfied!")
+    
+    # Ask for confirmation
+    print("\n" + "=" * 70)
+    response = input("Ready to start? This will take ~1 hour. (y/n): ")
     if response.lower() != 'y':
         print("Cancelled.")
         return
@@ -304,7 +299,12 @@ def run_ablation_study(max_epochs=500):
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     
     NUM_SAMPLES = 4
+    MAX_EPOCHS = 500
     BATCH_SIZE = 4
+
+    print("\n" + "=" * 70)
+    print("Loading dataset...")
+    print("=" * 70)
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -336,7 +336,7 @@ def run_ablation_study(max_epochs=500):
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
 
-    print(f"\nDataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Dataset loaded: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
     
     # Run tests
     versions = ['baseline', 'improved']
@@ -344,128 +344,11 @@ def run_ablation_study(max_epochs=500):
     
     total_start = time.time()
     
-    for version in versions:
-        try:
-            print(f"\n{'=' * 70}")
-            print(f"Testing {version.upper()} ({versions.index(version)+1}/{len(versions)})")
-            print(f"{'=' * 70}")
-            
-            result = test_v2_version(
-                version, train_ds, train_loader, num_joints, num_dims, future_len,
-                stats_path, data_dir, base_ds, max_epochs
-            )
-            results_list.append(result)
-        except Exception as e:
-            print(f"\n❌ Version {version} failed: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    total_elapsed = time.time() - total_start
-    
-    if len(results_list) > 1:
-        print_comparison_table(results_list)
-    
-    print("\n" + "=" * 70)
-    print("🎉 ABLATION STUDY COMPLETE!")
-    print("=" * 70)
-    print(f"\nTotal time: {total_elapsed/60:.1f} minutes")
-    print()
-    print("You now have complete data:")
-    print("  ✓ V1 (trans_enc): disp_ratio=0.00")
-    print(f"  ✓ V2-baseline: disp_ratio={results_list[0]['disp_ratio']:.4f}" if results_list else "")
-    print("  ✓ V2-pos: disp_ratio=1.05")
-    print(f"  ✓ V2-improved: disp_ratio={results_list[1]['disp_ratio']:.4f}" if len(results_list) > 1 else "")
-    print()
-    print("Next steps:")
-    print("  1. Create ablation table for paper")
-    print("  2. Compare pose files visually")
-    print("  3. Write up results")
-    print("=" * 70)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='V2 Complete Testing Script')
-    parser.add_argument('--version', type=str, default=None,
-                      choices=['baseline', 'with_pos', 'with_timestep', 'improved'],
-                      help='Which V2 variant to test')
-    parser.add_argument('--all', action='store_true',
-                      help='Test all versions')
-    parser.add_argument('--ablation', action='store_true',
-                      help='Run ablation study (baseline + improved)')
-    parser.add_argument('--epochs', type=int, default=500,
-                      help='Number of training epochs')
-    args = parser.parse_args()
-
-    # Check prerequisites
-    if not os.path.exists("signwriting_animation/diffusion/core/models.py"):
-        print("❌ ERROR: models.py not found!")
-        print("Please run:")
-        print("  cp models_v2_improved.py signwriting_animation/diffusion/core/models.py")
-        sys.exit(1)
-
-    # Run ablation study
-    if args.ablation:
-        run_ablation_study(args.epochs)
-        return
-
-    # Setup for single/all version tests
-    pl.seed_everything(42)
-
-    data_dir = "/home/yayun/data/pose_data/"
-    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    
-    NUM_SAMPLES = 4
-    MAX_EPOCHS = args.epochs
-    BATCH_SIZE = 4
-
-    print("=" * 70)
-    print("V2 Testing Script")
-    print("=" * 70)
-
-    base_ds = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
-    )
-
-    class SubsetDataset(torch.utils.data.Dataset):
-        def __init__(self, base, indices):
-            self.samples = [base[i] for i in indices]
-        def __len__(self):
-            return len(self.samples)
-        def __getitem__(self, idx):
-            return self.samples[idx]
-
-    train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=zero_pad_collator)
-
-    sample = train_ds[0]["data"]
-    if hasattr(sample, 'zero_filled'):
-        sample = sample.zero_filled()
-    if hasattr(sample, 'tensor'):
-        sample = sample.tensor
-    num_joints = sample.shape[-2]
-    num_dims = sample.shape[-1]
-    future_len = sample.shape[0]
-
-    print(f"Dataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
-    print(f"Max epochs: {MAX_EPOCHS}")
-
-    if args.all:
-        versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
-    elif args.version:
-        versions = [args.version]
-    else:
-        print("\n❌ ERROR: Please specify --version, --all, or --ablation")
-        parser.print_help()
-        sys.exit(1)
-    
-    results_list = []
-    for version in versions:
+    for idx, version in enumerate(versions):
+        print(f"\n{'=' * 70}")
+        print(f"TESTING {version.upper()} ({idx+1}/{len(versions)})")
+        print(f"{'=' * 70}")
+        
         try:
             result = test_v2_version(
                 version, train_ds, train_loader, num_joints, num_dims, future_len,
@@ -476,16 +359,34 @@ def main():
             print(f"\n❌ Version {version} failed: {e}")
             import traceback
             traceback.print_exc()
-
-    if len(results_list) > 1:
+    
+    total_elapsed = time.time() - total_start
+    
+    # Print results
+    if len(results_list) > 0:
         print_comparison_table(results_list)
     
     print("\n" + "=" * 70)
-    print("💡 Next Steps:")
-    if not args.all:
-        print("  - Run with --all to test all versions")
-    print("  - Compare pose files visually")
-    print("  - Scale to 100 samples for validation")
+    print("🎉 ABLATION STUDY COMPLETE!")
+    print("=" * 70)
+    print(f"\nTotal time: {total_elapsed/60:.1f} minutes")
+    print()
+    print("Complete ablation data:")
+    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (collapse)")
+    if len(results_list) > 0:
+        print(f"  ✓ V2-baseline: disp_ratio={results_list[0]['disp_ratio']:.4f}")
+    print("  ✓ V2-pos: disp_ratio=1.05")
+    if len(results_list) > 1:
+        print(f"  ✓ V2-improved: disp_ratio={results_list[1]['disp_ratio']:.4f}")
+    print()
+    print("Results saved in:")
+    print("  - logs/v2_improved_baseline/")
+    print("  - logs/v2_improved_improved/")
+    print()
+    print("Next steps:")
+    print("  1. Create ablation table for paper")
+    print("  2. Compare pose files visually")
+    print("  3. Write up analysis")
     print("=" * 70)
 
 
