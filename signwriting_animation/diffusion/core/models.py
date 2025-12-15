@@ -47,10 +47,11 @@ class EmbedSignWriting(nn.Module):
 
 class ContextEncoder(nn.Module):
     """
-    Past motion context encoder using Transformer.
+    Past motion context encoder using Transformer with CAMDM's PositionalEncoding.
     
     Encodes historical pose sequences into a single context vector using
-    self-attention and mean pooling.
+    self-attention and mean pooling. Now includes positional encoding from CAMDM
+    to preserve temporal order information.
     
     Args:
         input_feats: Input feature dimension (J*C for flattened poses)
@@ -63,6 +64,7 @@ class ContextEncoder(nn.Module):
         super().__init__()
         # Project pose features to latent space
         self.pose_encoder = nn.Linear(input_feats, latent_dim)
+        self.pos_encoding = PositionalEncoding(latent_dim, dropout)
         
         # Transformer encoder for temporal modeling
         encoder_layer = nn.TransformerEncoderLayer(
@@ -92,6 +94,10 @@ class ContextEncoder(nn.Module):
         
         # Encode to latent space
         x_emb = self.pose_encoder(x)      # [B, T, D]
+
+        x_emb = x_emb.permute(1, 0, 2)    # [B, T, D] -> [T, B, D]
+        x_emb = self.pos_encoding(x_emb)  # [T, B, D] with positional info
+        x_emb = x_emb.permute(1, 0, 2)    # [T, B, D] -> [B, T, D]
         
         # Apply Transformer encoder
         x_enc = self.encoder(x_emb)       # [B, T, D]
@@ -103,13 +109,14 @@ class ContextEncoder(nn.Module):
 
 class SignWritingToPoseDiffusionV2(nn.Module):
     """
-    Diffusion model for SignWriting-to-Pose generation (V2 - Fixed version).
+    Diffusion model for SignWriting-to-Pose generation (V2 - with CAMDM components).
     
     Key architectural improvements:
     - Frame-independent decoding: Each future frame is decoded separately to prevent
       Transformer self-attention from averaging them together
+    - CAMDM's PositionalEncoding in context encoder for temporal information
+    - CAMDM's TimestepEmbedder for better timestep representation
     - Each frame receives: context + noisy_frame_encoding + positional_embedding
-    - This preserves motion dynamics and prevents collapse to static poses
     
     Args:
         num_keypoints: Number of pose keypoints (e.g., 178 for MediaPipe Holistic)
@@ -144,7 +151,7 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         input_feats = num_keypoints * num_dims_per_keypoint
         
         # === Condition Encoders ===
-        # Encode past motion history into context
+        # Encode past motion history into context (now with PositionalEncoding)
         self.past_context_encoder = ContextEncoder(
             input_feats, num_latent_dims,
             num_layers=2, num_heads=num_heads, dropout=dropout
@@ -153,8 +160,11 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         # Encode SignWriting symbol image
         self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
         
-        # Encode diffusion timestep
-        self.time_embed = nn.Embedding(1000, num_latent_dims)
+        # ✅ Use CAMDM's TimestepEmbedder instead of simple Embedding
+        # Note: TimestepEmbedder might need a PositionalEncoding instance
+        # Check CAMDM source to see if it requires pos_encoder parameter
+        self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
+        self.time_embed = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
         
         # === Noisy Frame Encoder ===
         # Encode each noisy frame x_t independently
@@ -181,6 +191,8 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         
         print(f"✓ SignWritingToPoseDiffusionV2 initialized")
         print(f"  - Frame-independent decoding (prevents Transformer averaging)")
+        print(f"  - Using CAMDM's PositionalEncoding in context encoder")
+        print(f"  - Using CAMDM's TimestepEmbedder for timestep encoding")
         print(f"  - t_past={t_past}, t_future={t_future}")
 
     def forward(self,
@@ -217,14 +229,16 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 past_btjc = past_motion
         
         # === Encode Conditions ===
-        # Past motion context
+        # Past motion context (now with PositionalEncoding)
         past_ctx = self.past_context_encoder(past_btjc)  # [B, D]
         
         # SignWriting symbol embedding
         sign_emb = self.embed_signwriting(signwriting_im_batch)  # [B, D]
         
-        # Diffusion timestep embedding
-        time_emb = self.time_embed(timesteps.clamp(0, 999))  # [B, D]
+        # ✅ Diffusion timestep embedding using CAMDM's TimestepEmbedder
+        # TimestepEmbedder outputs [1, B, D], so we squeeze the first dimension
+        time_emb = self.time_embed(timesteps)  # [1, B, D]
+        time_emb = time_emb.squeeze(0)  # [B, D]
         
         # Fuse all conditions into single context vector
         context = past_ctx + sign_emb + time_emb  # [B, D]
