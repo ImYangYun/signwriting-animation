@@ -1,16 +1,22 @@
-#!/usr/bin/env python
 """
-V2 Ablation Study - Fully Automatic (No Interaction)
+Test V2 Improved Versions
 
-Perfect for batch job submission!
-Just run: python run_ablation_auto.py
+This script tests different V2 variants with CAMDM components:
+- V2-baseline: Frame-independent only (current V2)
+- V2-pos: Frame-independent + PositionalEncoding
+- V2-timestep: Frame-independent + TimestepEmbedder  
+- V2-full: Frame-independent + both components
 
-No confirmation needed - starts immediately!
+Usage:
+    # Test specific version
+    python test_v2_improved.py --version with_pos
+    
+    # Test all versions
+    python test_v2_improved.py --all
 """
 
 import os
-import sys
-import time
+import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -79,9 +85,10 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
 def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, future_len,
                     stats_path, data_dir, base_ds, max_epochs=500):
     """Test a specific V2 version."""
+    # Import V2's Lightning module (NOT V1's!)
     from signwriting_animation.diffusion.core.models import create_v2_model
     from signwriting_animation.diffusion.lightning_module import (
-        LitDiffusion, sanitize_btjc, mean_frame_disp
+        LitDiffusion, sanitize_btjc, mean_frame_disp  # ✅ V2的Lightning
     )
     
     print("\n" + "=" * 70)
@@ -89,14 +96,17 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     print("=" * 70)
     
     version_names = {
-        'baseline': 'V2-Baseline (Frame-Independent Only)',
-        'improved': 'V2-Improved (Frame-Independent + Both CAMDM Components)'
+        'baseline': 'V2-Baseline (Frame-Independent)',
+        'with_pos': 'V2+PositionalEncoding',
+        'with_timestep': 'V2+TimestepEmbedder',
+        'improved': 'V2+Both (Full Improved)'
     }
     print(f"Description: {version_names.get(version, version)}")
 
     out_dir = f"logs/v2_improved_{version}"
     os.makedirs(out_dir, exist_ok=True)
 
+    # Create custom model with specific configuration
     model_kwargs = {
         'num_keypoints': num_joints,
         'num_dims_per_keypoint': num_dims,
@@ -106,17 +116,19 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     
     custom_model = create_v2_model(version, **model_kwargs)
     
-    lit_model = LitDiffusion(
+    # Create V2 Lightning module (✅ 这次是对的)
+    lit_model = LitDiffusion(  # ✅ 用V2的LitDiffusion
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-3,
         diffusion_steps=8,
         vel_weight=1.0,
-        t_past=40,
-        t_future=future_len,
+        t_past=40,           # ✅ V2接受这个参数
+        t_future=future_len, # ✅ V2接受这个参数
     )
     
+    # Replace the model with our custom version
     lit_model.model = custom_model
     
     print(f"\nTraining {version}...")
@@ -130,6 +142,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     )
     trainer.fit(lit_model, train_loader)
 
+    # Inference
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lit_model = lit_model.to(device)
     lit_model.eval()
@@ -154,6 +167,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         mpjpe = per_joint_err.mean()
         pck_01 = (per_joint_err < 0.1).mean() * 100
 
+    # Save poses
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -172,6 +186,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
+    # Pixel space metrics
     gt_data = gt_pose.body.data[:, 0, :, :]
     pred_data = pred_pose.body.data[:, 0, :, :]
     pixel_mpjpe = np.sqrt(((gt_data - pred_data) ** 2).sum(-1)).mean()
@@ -192,7 +207,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     print(f"  MSE: {mse:.6f}")
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
-    print(f"  Disp Ratio: {disp_ratio:.4f} {'✅' if 0.7 < disp_ratio < 1.3 else '❌'}")
+    print(f"  Disp Ratio: {disp_ratio:.4f}")
     print(f"  Pixel MPJPE: {pixel_mpjpe:.2f}px")
     print(f"  Saved to: {out_dir}/")
 
@@ -202,104 +217,87 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
 def print_comparison_table(results_list):
     """Print comparison table for all tested versions."""
     print("\n" + "=" * 80)
-    print("COMPARISON TABLE - ABLATION STUDY RESULTS")
+    print("COMPARISON TABLE - V2 VARIANTS")
     print("=" * 80)
     
     version_names = {
         'baseline': 'V2-Baseline',
-        'improved': 'V2-Improved'
+        'with_pos': 'V2+PosEnc',
+        'with_timestep': 'V2+TimeEmb',
+        'improved': 'V2+Both'
     }
     
-    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10} {'Status':<10}")
+    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10}")
     print("-" * 80)
     
     for r in results_list:
         vname = version_names.get(r['version'], r['version'])
-        status = '✅ Good' if 0.7 < r['disp_ratio'] < 1.3 else '❌ Bad'
-        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f} {status}")
+        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f}")
     
+    # Analysis
     print("\n" + "=" * 80)
     print("ANALYSIS")
     print("=" * 80)
     
     baseline = next((r for r in results_list if r['version'] == 'baseline'), None)
-    improved = next((r for r in results_list if r['version'] == 'improved'), None)
+    if baseline:
+        print(f"\nBaseline (V2 current):")
+        print(f"  Disp Ratio: {baseline['disp_ratio']:.4f}")
+        print(f"  MPJPE: {baseline['mpjpe']:.6f}")
+        print(f"  PCK@0.1: {baseline['pck_01']:.1f}%")
+        
+        for r in results_list:
+            if r['version'] != 'baseline':
+                vname = version_names.get(r['version'], r['version'])
+                mpjpe_improve = (baseline['mpjpe'] - r['mpjpe']) / baseline['mpjpe'] * 100
+                pck_improve = r['pck_01'] - baseline['pck_01']
+                
+                print(f"\n{vname}:")
+                print(f"  MPJPE: {mpjpe_improve:+.1f}% change")
+                print(f"  PCK@0.1: {pck_improve:+.1f}% change")
+                print(f"  Disp Ratio: {r['disp_ratio']:.4f} (should stay ~1.0)")
     
-    if baseline and improved:
-        print("\nKey Findings:")
-        print(f"  V2-Baseline disp_ratio: {baseline['disp_ratio']:.4f}")
-        print(f"  V2-Improved disp_ratio: {improved['disp_ratio']:.4f}")
-        
-        if baseline['disp_ratio'] > 0.7:
-            print("\n  ✅ Frame-independent decoding successfully prevents motion collapse!")
-            print("     (V1 had disp_ratio=0.00, V2-baseline has ~1.0)")
-        
-        mpjpe_change = (baseline['mpjpe'] - improved['mpjpe']) / baseline['mpjpe'] * 100
-        pck_change = improved['pck_01'] - baseline['pck_01']
-        
-        print(f"\n  CAMDM components contribution:")
-        print(f"    MPJPE: {mpjpe_change:+.1f}% change")
-        print(f"    PCK@0.1: {pck_change:+.1f}% change")
+    # Recommendations
+    print("\n" + "=" * 80)
+    print("RECOMMENDATIONS")
+    print("=" * 80)
+    
+    best_mpjpe = min(results_list, key=lambda x: x['mpjpe'])
+    best_pck = max(results_list, key=lambda x: x['pck_01'])
+    
+    print(f"\nBest MPJPE: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
+    print(f"Best PCK@0.1: {version_names.get(best_pck['version'], best_pck['version'])}")
+    
+    if best_mpjpe['version'] == best_pck['version']:
+        print(f"\n✅ Clear winner: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
+    else:
+        print(f"\n💡 Trade-off between MPJPE and PCK - test on larger dataset")
 
 
-def main():
-    print("=" * 70)
-    print("V2 ABLATION STUDY - FULLY AUTOMATIC")
-    print("=" * 70)
-    print()
-    print("This script will automatically test:")
-    print("  1. V2-baseline (frame-independent only)")
-    print("  2. V2-improved (frame-independent + CAMDM components)")
-    print()
-    print("Current known results:")
-    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (motion collapse)")
-    print("  ✓ V2-pos: disp_ratio=1.05 (already tested)")
-    print()
-    print("Settings:")
-    print("  - 4 samples overfitting test")
-    print("  - 500 epochs per version")
-    print("  - Estimated time: ~1 hour")
-    print("=" * 70)
-    
-    # Check prerequisites
-    print("\nChecking prerequisites...")
-    
-    if not os.path.exists("signwriting_animation/diffusion/core/models.py"):
-        print("❌ ERROR: models.py not found!")
-        print("\nPlease run:")
-        print("  cp models_v2_improved.py signwriting_animation/diffusion/core/models.py")
-        sys.exit(1)
-    
-    # Check if create_v2_model exists
-    try:
-        from signwriting_animation.diffusion.core.models import create_v2_model
-        print("✅ Model file verified (create_v2_model found)")
-    except ImportError:
-        print("❌ ERROR: create_v2_model not found in models.py!")
-        print("\nPlease run:")
-        print("  cp models_v2_improved.py signwriting_animation/diffusion/core/models.py")
-        sys.exit(1)
-    
-    print("✅ All prerequisites satisfied!")
-    
-    # Auto start - NO CONFIRMATION NEEDED!
-    print("\n" + "=" * 70)
-    print("🚀 Starting ablation study automatically...")
-    print("   (Perfect for batch job submission!)")
-    print("=" * 70)
-    
-    # Configuration
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Test V2 Improved Versions')
+    parser.add_argument('--version', type=str, default='with_pos',
+                      choices=['baseline', 'with_pos', 'with_timestep', 'improved'],
+                      help='Which V2 variant to test')
+    parser.add_argument('--all', action='store_true',
+                      help='Test all versions')
+    parser.add_argument('--epochs', type=int, default=500,
+                      help='Number of training epochs')
+    args = parser.parse_args()
+
     pl.seed_everything(42)
+
+    # Configuration
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     
     NUM_SAMPLES = 4
-    MAX_EPOCHS = 500
+    MAX_EPOCHS = args.epochs
     BATCH_SIZE = 4
 
-    print("\n" + "=" * 70)
-    print("Loading dataset...")
+    print("=" * 70)
+    print("V2 Improved Versions Testing")
     print("=" * 70)
 
     # Dataset
@@ -323,6 +321,7 @@ def main():
     train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=zero_pad_collator)
 
+    # Get dimensions
     sample = train_ds[0]["data"]
     if hasattr(sample, 'zero_filled'):
         sample = sample.zero_filled()
@@ -332,19 +331,17 @@ def main():
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
 
-    print(f"Dataset loaded: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Dataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Max epochs: {MAX_EPOCHS}")
+
+    # Test versions
+    if args.all:
+        versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
+    else:
+        versions = [args.version]
     
-    # Run tests
-    versions = ['baseline', 'improved']
     results_list = []
-    
-    total_start = time.time()
-    
-    for idx, version in enumerate(versions):
-        print(f"\n{'=' * 70}")
-        print(f"TESTING {version.upper()} ({idx+1}/{len(versions)})")
-        print(f"{'=' * 70}")
-        
+    for version in versions:
         try:
             result = test_v2_version(
                 version, train_ds, train_loader, num_joints, num_dims, future_len,
@@ -355,36 +352,15 @@ def main():
             print(f"\n❌ Version {version} failed: {e}")
             import traceback
             traceback.print_exc()
-    
-    total_elapsed = time.time() - total_start
-    
-    # Print results
-    if len(results_list) > 0:
+
+    # Print comparison if testing multiple versions
+    if len(results_list) > 1:
         print_comparison_table(results_list)
     
     print("\n" + "=" * 70)
-    print("🎉 ABLATION STUDY COMPLETE!")
+    print("💡 Next Steps:")
+    if not args.all:
+        print("  - Run with --all to test all versions")
+    print("  - Compare pose files visually")
+    print("  - Scale to 100 samples for validation")
     print("=" * 70)
-    print(f"\nTotal time: {total_elapsed/60:.1f} minutes")
-    print()
-    print("Complete ablation data:")
-    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (collapse)")
-    if len(results_list) > 0:
-        print(f"  ✓ V2-baseline: disp_ratio={results_list[0]['disp_ratio']:.4f}")
-    print("  ✓ V2-pos: disp_ratio=1.05")
-    if len(results_list) > 1:
-        print(f"  ✓ V2-improved: disp_ratio={results_list[1]['disp_ratio']:.4f}")
-    print()
-    print("Results saved in:")
-    print("  - logs/v2_improved_baseline/")
-    print("  - logs/v2_improved_improved/")
-    print()
-    print("Next steps:")
-    print("  1. Create ablation table for paper")
-    print("  2. Compare pose files visually")
-    print("  3. Write up analysis")
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()
