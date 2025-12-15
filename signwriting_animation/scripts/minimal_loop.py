@@ -85,10 +85,10 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
 def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, future_len,
                     stats_path, data_dir, base_ds, max_epochs=500):
     """Test a specific V2 version."""
-    # Import here to allow for different model versions
+    # Import V2's Lightning module (NOT V1's!)
     from signwriting_animation.diffusion.core.models import create_v2_model
     from signwriting_animation.diffusion.lightning_module import (
-        LitDiffusionV1, sanitize_btjc, mean_frame_disp
+        LitDiffusion, sanitize_btjc, mean_frame_disp  # ✅ V2的Lightning
     )
     
     print("\n" + "=" * 70)
@@ -106,10 +106,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     out_dir = f"logs/v2_improved_{version}"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Create model with specific configuration
-    # Note: We need to modify LitDiffusion to accept custom model
-    # For now, create model separately and use in training
-    
+    # Create custom model with specific configuration
     model_kwargs = {
         'num_keypoints': num_joints,
         'num_dims_per_keypoint': num_dims,
@@ -117,25 +114,18 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         't_future': future_len,
     }
     
-    # Create custom model
     custom_model = create_v2_model(version, **model_kwargs)
     
-    # Create Lightning module
-    # NOTE: This requires a small modification to LitDiffusion to accept model
-    # For now, we'll use the standard LitDiffusion and it will create its own model
-    # The proper way would be to modify LitDiffusion.__init__ to accept optional model
-    
-    # TEMPORARY: Use standard LitDiffusion (will create baseline V2)
-    # TODO: Modify LitDiffusion to accept custom model
-    lit_model = LitDiffusionV1(
+    # Create V2 Lightning module (✅ 这次是对的)
+    lit_model = LitDiffusion(  # ✅ 用V2的LitDiffusion
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-3,
         diffusion_steps=8,
         vel_weight=1.0,
-        t_past=40,
-        t_future=future_len,
+        t_past=40,           # ✅ V2接受这个参数
+        t_future=future_len, # ✅ V2接受这个参数
     )
     
     # Replace the model with our custom version
