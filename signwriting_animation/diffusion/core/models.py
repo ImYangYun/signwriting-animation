@@ -317,28 +317,28 @@ def create_v2_model(version='improved', **kwargs):
     """
     if version == 'baseline':
         # V2 baseline: no CAMDM components
-        return SignWritingToPoseDiffusionV2Improved(
+        return SignWritingToPoseDiffusionV2(
             use_positional_encoding=False,
             use_timestep_embedder=False,
             **kwargs
         )
     elif version == 'with_pos':
         # V2 + PositionalEncoding only
-        return SignWritingToPoseDiffusionV2Improved(
+        return SignWritingToPoseDiffusionV2(
             use_positional_encoding=True,
             use_timestep_embedder=False,
             **kwargs
         )
     elif version == 'with_timestep':
         # V2 + TimestepEmbedder only
-        return SignWritingToPoseDiffusionV2Improved(
+        return SignWritingToPoseDiffusionV2(
             use_positional_encoding=False,
             use_timestep_embedder=True,
             **kwargs
         )
     elif version == 'improved':
         # V2 + both improvements
-        return SignWritingToPoseDiffusionV2Improved(
+        return SignWritingToPoseDiffusionV2(
             use_positional_encoding=True,
             use_timestep_embedder=True,
             **kwargs
