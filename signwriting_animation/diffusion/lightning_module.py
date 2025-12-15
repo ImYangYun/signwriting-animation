@@ -16,7 +16,7 @@ import lightning as pl
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import GaussianDiffusion, ModelMeanType, ModelVarType, LossType
-from signwriting_animation.diffusion.core.models_v1_original import SignWritingToPoseDiffusionV1
+from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV1
 
 
 def sanitize_btjc(x: torch.Tensor) -> torch.Tensor:

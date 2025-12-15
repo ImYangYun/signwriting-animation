@@ -30,7 +30,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module_v1 import (
+from signwriting_animation.diffusion.lightning_module import (
     LitDiffusionV1,
     sanitize_btjc,
     masked_dtw,
