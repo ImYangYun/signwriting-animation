@@ -1,22 +1,22 @@
 """
-4-Sample Overfit Test for V1 Model (Original CAMDM-based)
+Test V2 Improved Versions
 
-This script tests whether the original V1 model can successfully overfit
-to 4 samples. The goal is to determine if V1 had the same motion collapse
-issues as V2, or if it worked fine all along.
+This script tests different V2 variants with CAMDM components:
+- V2-baseline: Frame-independent only (current V2)
+- V2-pos: Frame-independent + PositionalEncoding
+- V2-timestep: Frame-independent + TimestepEmbedder  
+- V2-full: Frame-independent + both components
 
-Test procedure:
-1. Train V1 model on exactly 4 samples
-2. Test with different encoder architectures (trans_enc, trans_dec, gru)
-3. Compare displacement ratios and visual quality
-
-Critical questions to answer:
-- Does trans_enc in V1 also produce static poses?
-- Does trans_dec or gru in V1 avoid the problem?
-- Was V2's frame-independent decoding necessary, or over-engineering?
+Usage:
+    # Test specific version
+    python test_v2_improved.py --version with_pos
+    
+    # Test all versions
+    python test_v2_improved.py --all
 """
 
 import os
+import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -30,12 +30,6 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import (
-    LitDiffusionV1,
-    sanitize_btjc,
-    masked_dtw,
-    mean_frame_disp,
-)
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
@@ -46,7 +40,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-
     gt_np = None
     if gt_btjc is not None:
         if gt_btjc.dim() == 4:
@@ -62,16 +55,11 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     pose_obj = Pose(header=header, body=body)
     
     unshift_hands(pose_obj)
-    print("  ✓ unshift succeeded")
-
+    
     T_pred = pose_obj.body.data.shape[0]
     T_ref_total = ref_pose.body.data.shape[0]
-    
     future_start = max(0, T_ref_total - T_pred)
     ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-    pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    
-    print(f"  [alignment] using ref frames {future_start}-{future_start+T_pred-1}")
     
     if apply_scale and gt_np is not None:
         def _var(a):
@@ -83,45 +71,244 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
         
         if var_gt_norm > 1e-8:
             scale = np.sqrt(var_ref / var_gt_norm)
-            print(f"  [scale] var_ref={var_ref:.2f}, var_gt_norm={var_gt_norm:.6f}")
-            print(f"  [scale] normalized→pixel scale={scale:.2f}")
             pose_obj.body.data *= scale
-            pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
 
+    pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
     ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
     pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
     delta = ref_c - pred_c
-    print(f"  [translate] delta={delta}")
     pose_obj.body.data += delta
-    
-    print(f"  [final] range=[{pose_obj.body.data.min():.2f}, {pose_obj.body.data.max():.2f}]")
     
     return pose_obj
 
 
+def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, future_len,
+                    stats_path, data_dir, base_ds, max_epochs=500):
+    """Test a specific V2 version."""
+    # Import here to allow for different model versions
+    from signwriting_animation.diffusion.core.models import create_v2_model
+    from signwriting_animation.diffusion.lightning_module import (
+        LitDiffusion, sanitize_btjc, mean_frame_disp
+    )
+    
+    print("\n" + "=" * 70)
+    print(f"Testing V2 - Version: {version.upper()}")
+    print("=" * 70)
+    
+    version_names = {
+        'baseline': 'V2-Baseline (Frame-Independent)',
+        'with_pos': 'V2+PositionalEncoding',
+        'with_timestep': 'V2+TimestepEmbedder',
+        'improved': 'V2+Both (Full Improved)'
+    }
+    print(f"Description: {version_names.get(version, version)}")
+
+    out_dir = f"logs/v2_improved_{version}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Create model with specific configuration
+    # Note: We need to modify LitDiffusion to accept custom model
+    # For now, create model separately and use in training
+    
+    model_kwargs = {
+        'num_keypoints': num_joints,
+        'num_dims_per_keypoint': num_dims,
+        't_past': 40,
+        't_future': future_len,
+    }
+    
+    # Create custom model
+    custom_model = create_v2_model(version, **model_kwargs)
+    
+    # Create Lightning module
+    # NOTE: This requires a small modification to LitDiffusion to accept model
+    # For now, we'll use the standard LitDiffusion and it will create its own model
+    # The proper way would be to modify LitDiffusion.__init__ to accept optional model
+    
+    # TEMPORARY: Use standard LitDiffusion (will create baseline V2)
+    # TODO: Modify LitDiffusion to accept custom model
+    lit_model = LitDiffusion(
+        num_keypoints=num_joints,
+        num_dims=num_dims,
+        stats_path=stats_path,
+        lr=1e-3,
+        diffusion_steps=8,
+        vel_weight=1.0,
+        t_past=40,
+        t_future=future_len,
+    )
+    
+    # Replace the model with our custom version
+    lit_model.model = custom_model
+    
+    print(f"\nTraining {version}...")
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        enable_checkpointing=False,
+        log_every_n_steps=50,
+        enable_progress_bar=False,
+    )
+    trainer.fit(lit_model, train_loader)
+
+    # Inference
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lit_model = lit_model.to(device)
+    lit_model.eval()
+
+    test_batch = zero_pad_collator([train_ds[0]])
+    cond = test_batch["conditions"]
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
+
+    with torch.no_grad():
+        pred_raw = lit_model.sample(past_raw, sign, future_len)
+        
+        mse = F.mse_loss(pred_raw, gt_raw).item()
+        disp_pred = mean_frame_disp(pred_raw)
+        disp_gt = mean_frame_disp(gt_raw)
+        disp_ratio = disp_pred / (disp_gt + 1e-8)
+        
+        pred_np = pred_raw[0].cpu().numpy()
+        gt_np = gt_raw[0].cpu().numpy()
+        per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
+        mpjpe = per_joint_err.mean()
+        pck_01 = (per_joint_err < 0.1).mean() * 100
+
+    # Save poses
+    ref_path = base_ds.records[0]["pose"]
+    if not os.path.isabs(ref_path):
+        ref_path = os.path.join(data_dir, ref_path)
+    
+    with open(ref_path, "rb") as f:
+        ref_pose = Pose.read(f)
+    ref_pose = reduce_holistic(ref_pose)
+    if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+    
+    gt_pose = tensor_to_pose(gt_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    with open(f"{out_dir}/gt.pose", "wb") as f:
+        gt_pose.write(f)
+    
+    pred_pose = tensor_to_pose(pred_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    with open(f"{out_dir}/pred.pose", "wb") as f:
+        pred_pose.write(f)
+
+    # Pixel space metrics
+    gt_data = gt_pose.body.data[:, 0, :, :]
+    pred_data = pred_pose.body.data[:, 0, :, :]
+    pixel_mpjpe = np.sqrt(((gt_data - pred_data) ** 2).sum(-1)).mean()
+
+    results = {
+        'version': version,
+        'mse': mse,
+        'mpjpe': mpjpe,
+        'pck_01': pck_01,
+        'disp_ratio': disp_ratio,
+        'disp_pred': disp_pred,
+        'disp_gt': disp_gt,
+        'pixel_mpjpe': pixel_mpjpe,
+        'out_dir': out_dir,
+    }
+
+    print(f"\n{version_names.get(version, version)} Results:")
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MPJPE: {mpjpe:.6f}")
+    print(f"  PCK@0.1: {pck_01:.1f}%")
+    print(f"  Disp Ratio: {disp_ratio:.4f}")
+    print(f"  Pixel MPJPE: {pixel_mpjpe:.2f}px")
+    print(f"  Saved to: {out_dir}/")
+
+    return results
+
+
+def print_comparison_table(results_list):
+    """Print comparison table for all tested versions."""
+    print("\n" + "=" * 80)
+    print("COMPARISON TABLE - V2 VARIANTS")
+    print("=" * 80)
+    
+    version_names = {
+        'baseline': 'V2-Baseline',
+        'with_pos': 'V2+PosEnc',
+        'with_timestep': 'V2+TimeEmb',
+        'improved': 'V2+Both'
+    }
+    
+    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10}")
+    print("-" * 80)
+    
+    for r in results_list:
+        vname = version_names.get(r['version'], r['version'])
+        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f}")
+    
+    # Analysis
+    print("\n" + "=" * 80)
+    print("ANALYSIS")
+    print("=" * 80)
+    
+    baseline = next((r for r in results_list if r['version'] == 'baseline'), None)
+    if baseline:
+        print(f"\nBaseline (V2 current):")
+        print(f"  Disp Ratio: {baseline['disp_ratio']:.4f}")
+        print(f"  MPJPE: {baseline['mpjpe']:.6f}")
+        print(f"  PCK@0.1: {baseline['pck_01']:.1f}%")
+        
+        for r in results_list:
+            if r['version'] != 'baseline':
+                vname = version_names.get(r['version'], r['version'])
+                mpjpe_improve = (baseline['mpjpe'] - r['mpjpe']) / baseline['mpjpe'] * 100
+                pck_improve = r['pck_01'] - baseline['pck_01']
+                
+                print(f"\n{vname}:")
+                print(f"  MPJPE: {mpjpe_improve:+.1f}% change")
+                print(f"  PCK@0.1: {pck_improve:+.1f}% change")
+                print(f"  Disp Ratio: {r['disp_ratio']:.4f} (should stay ~1.0)")
+    
+    # Recommendations
+    print("\n" + "=" * 80)
+    print("RECOMMENDATIONS")
+    print("=" * 80)
+    
+    best_mpjpe = min(results_list, key=lambda x: x['mpjpe'])
+    best_pck = max(results_list, key=lambda x: x['pck_01'])
+    
+    print(f"\nBest MPJPE: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
+    print(f"Best PCK@0.1: {version_names.get(best_pck['version'], best_pck['version'])}")
+    
+    if best_mpjpe['version'] == best_pck['version']:
+        print(f"\n✅ Clear winner: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
+    else:
+        print(f"\n💡 Trade-off between MPJPE and PCK - test on larger dataset")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Test V2 Improved Versions')
+    parser.add_argument('--version', type=str, default='with_pos',
+                      choices=['baseline', 'with_pos', 'with_timestep', 'improved'],
+                      help='Which V2 variant to test')
+    parser.add_argument('--all', action='store_true',
+                      help='Test all versions')
+    parser.add_argument('--epochs', type=int, default=500,
+                      help='Number of training epochs')
+    args = parser.parse_args()
+
     pl.seed_everything(42)
 
-    # Paths
+    # Configuration
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-
-    print("=" * 70)
-    print("4-Sample Overfit Test - V1 (Original CAMDM-based)")
-    print("=" * 70)
-
-    # Configuration
+    
     NUM_SAMPLES = 4
-    MAX_EPOCHS = 500
+    MAX_EPOCHS = args.epochs
     BATCH_SIZE = 4
 
-    # Test different architectures
-    ARCHITECTURES = [
-        "trans_enc",  # Standard Transformer Encoder (may have averaging)
-        # "trans_dec",  # Transformer Decoder with causal mask (may be better)
-        # "gru",        # GRU (sequential, no averaging)
-    ]
+    print("=" * 70)
+    print("V2 Improved Versions Testing")
+    print("=" * 70)
 
     # Dataset
     base_ds = DynamicPosePredictionDataset(
@@ -132,7 +319,6 @@ if __name__ == "__main__":
         with_metadata=True,
         split="train",
     )
-    print(f"Total dataset size: {len(base_ds)}")
 
     class SubsetDataset(torch.utils.data.Dataset):
         def __init__(self, base, indices):
@@ -151,153 +337,40 @@ if __name__ == "__main__":
         sample = sample.zero_filled()
     if hasattr(sample, 'tensor'):
         sample = sample.tensor
+    num_joints = sample.shape[-2]
+    num_dims = sample.shape[-1]
+    future_len = sample.shape[0]
+
+    print(f"Dataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Max epochs: {MAX_EPOCHS}")
+
+    # Test versions
+    if args.all:
+        versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
+    else:
+        versions = [args.version]
     
-    num_joints, num_dims, future_len = sample.shape[-2], sample.shape[-1], sample.shape[0]
-    print(f"J={num_joints}, D={num_dims}, T_future={future_len}")
+    results_list = []
+    for version in versions:
+        try:
+            result = test_v2_version(
+                version, train_ds, train_loader, num_joints, num_dims, future_len,
+                stats_path, data_dir, base_ds, MAX_EPOCHS
+            )
+            results_list.append(result)
+        except Exception as e:
+            print(f"\n❌ Version {version} failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-    # Test each architecture
-    for arch in ARCHITECTURES:
-        print("\n" + "=" * 70)
-        print(f"Testing Architecture: {arch.upper()}")
-        print("=" * 70)
-
-        out_dir = f"logs/4sample_test_v1_{arch}"
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Create V1 model with specific architecture
-        model = LitDiffusionV1(
-            num_keypoints=num_joints,
-            num_dims=num_dims,
-            stats_path=stats_path,
-            lr=1e-3,
-            diffusion_steps=8,
-            vel_weight=1.0,
-            arch=arch,  # KEY: Test different architectures
-            num_layers=8,
-            ff_size=1024,
-        )
-
-        # Training
-        print(f"\nTraining with {arch}...")
-        trainer = pl.Trainer(
-            max_epochs=MAX_EPOCHS,
-            accelerator="gpu" if torch.cuda.is_available() else "cpu",
-            devices=1,
-            enable_checkpointing=False,
-            log_every_n_steps=50,
-        )
-        trainer.fit(model, train_loader)
-
-        # Inference
-        print("\n" + "=" * 70)
-        print(f"Inference - {arch}")
-        print("=" * 70)
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device)
-        model.eval()
-
-        test_batch = zero_pad_collator([train_ds[0]])
-        cond = test_batch["conditions"]
-        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign = cond["sign_image"][:1].float().to(device)
-        gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
-
-        with torch.no_grad():
-            pred_raw = model.sample(past_raw, sign, future_len)
-            
-            # Evaluate in normalized space
-            mse = F.mse_loss(pred_raw, gt_raw).item()
-            disp_pred = mean_frame_disp(pred_raw)
-            disp_gt = mean_frame_disp(gt_raw)
-            disp_ratio = disp_pred / (disp_gt + 1e-8)
-            
-            # DTW
-            mask = torch.ones(1, future_len, device=device)
-            dtw = masked_dtw(pred_raw, gt_raw, mask)
-            if isinstance(dtw, torch.Tensor):
-                dtw = dtw.item()
-            
-            # MPJPE, PCK
-            pred_np = pred_raw[0].cpu().numpy()
-            gt_np = gt_raw[0].cpu().numpy()
-            per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
-            mpjpe = per_joint_err.mean()
-            pck_01 = (per_joint_err < 0.1).mean() * 100
-            pck_02 = (per_joint_err < 0.2).mean() * 100
-
-        print(f"""
-Results ({arch} - Normalized Space):
-  MSE: {mse:.6f}
-  MPJPE: {mpjpe:.6f}
-  PCK@0.1: {pck_01:.1f}%
-  PCK@0.2: {pck_02:.1f}%
-  DTW: {dtw:.6f}
-  Disp GT: {disp_gt:.6f}
-  Disp Pred: {disp_pred:.6f}
-  Disp Ratio: {disp_ratio:.4f}
-""")
-
-        # Critical diagnosis
-        print("\n" + "=" * 70)
-        print(f"CRITICAL DIAGNOSIS - {arch}")
-        print("=" * 70)
-        
-        if disp_ratio < 0.3:
-            print(f"  ❌ SEVERE MOTION COLLAPSE (disp_ratio={disp_ratio:.4f})")
-            print(f"     → {arch} produces static poses")
-            print(f"     → V1 has the same problem as V2!")
-        elif disp_ratio < 0.7:
-            print(f"  ⚠️  MILD MOTION REDUCTION (disp_ratio={disp_ratio:.4f})")
-            print(f"     → {arch} reduces motion range")
-            print(f"     → May still have averaging issues")
-        else:
-            print(f"  ✓ GOOD MOTION PRESERVATION (disp_ratio={disp_ratio:.4f})")
-            print(f"     → {arch} preserves motion well")
-            print(f"     → V1 with {arch} may not need V2's fix!")
-
-        # Save pose files
-        print("\n" + "=" * 70)
-        print(f"Saving Pose Files - {arch}...")
-        print("=" * 70)
-        
-        ref_path = base_ds.records[0]["pose"]
-        if not os.path.isabs(ref_path):
-            ref_path = os.path.join(data_dir, ref_path)
-        
-        with open(ref_path, "rb") as f:
-            ref_pose = Pose.read(f)
-        ref_pose = reduce_holistic(ref_pose)
-        if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
-            ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-        
-        gt_pose = tensor_to_pose(gt_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-        with open(f"{out_dir}/gt.pose", "wb") as f:
-            gt_pose.write(f)
-        
-        pred_pose = tensor_to_pose(pred_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
-        with open(f"{out_dir}/pred.pose", "wb") as f:
-            pred_pose.write(f)
-        
-        print(f"\n✓ Saved to {out_dir}/")
-
-        # Pixel space verification
-        gt_data = gt_pose.body.data[:, 0, :, :]
-        pred_data = pred_pose.body.data[:, 0, :, :]
-        
-        pixel_mpjpe = np.sqrt(((gt_data - pred_data) ** 2).sum(-1)).mean()
-        print(f"\nPixel space MPJPE: {pixel_mpjpe:.2f} pixels")
-
-    # Final summary
+    # Print comparison if testing multiple versions
+    if len(results_list) > 1:
+        print_comparison_table(results_list)
+    
     print("\n" + "=" * 70)
-    print("EXPERIMENT SUMMARY")
-    print("=" * 70)
-    print("\nPlease check the displacement ratios for each architecture:")
-    print("- If trans_enc has low disp_ratio: V1 also has motion collapse")
-    print("- If trans_dec/gru have high disp_ratio: V1 was fine, just used wrong arch")
-    print("- If all have low disp_ratio: The problem is elsewhere (data/training)")
-    print("\nNext steps:")
-    print("1. Compare V1 vs V2 results")
-    print("2. Determine if V2's frame-independent decoding was necessary")
-    print("3. Decide whether to keep V2 or revert to V1 with better arch")
+    print("💡 Next Steps:")
+    if not args.all:
+        print("  - Run with --all to test all versions")
+    print("  - Compare pose files visually")
+    print("  - Scale to 100 samples for validation")
     print("=" * 70)
