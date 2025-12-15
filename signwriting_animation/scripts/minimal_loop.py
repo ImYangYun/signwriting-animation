@@ -148,20 +148,27 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
 
     with torch.no_grad():
+        # Sample in unnormalized space
         pred_raw = lit_model.sample(past_raw, sign, future_len)
         
-        mse = F.mse_loss(pred_raw, gt_raw).item()
-        disp_pred = mean_frame_disp(pred_raw)
-        disp_gt = mean_frame_disp(gt_raw)
+        # Normalize both for fair comparison
+        pred_norm = lit_model.normalize(pred_raw)
+        gt_norm = lit_model.normalize(gt_raw)
+        
+        # Compute metrics in NORMALIZED space
+        mse = F.mse_loss(pred_norm, gt_norm).item()
+        disp_pred = mean_frame_disp(pred_norm)
+        disp_gt = mean_frame_disp(gt_norm)
         disp_ratio = disp_pred / (disp_gt + 1e-8)
         
+        # Compute position metrics in unnormalized space
         pred_np = pred_raw[0].cpu().numpy()
         gt_np = gt_raw[0].cpu().numpy()
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
         mpjpe = per_joint_err.mean()
         pck_01 = (per_joint_err < 0.1).mean() * 100
 
-    # Save poses
+    # Save poses - use NORMALIZED data to avoid scale issues
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -172,11 +179,12 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    gt_pose = tensor_to_pose(gt_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    # Use NORMALIZED pred/gt for consistent scaling
+    gt_pose = tensor_to_pose(gt_norm, ref_pose.header, ref_pose, gt_btjc=gt_norm, apply_scale=True)
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
-    pred_pose = tensor_to_pose(pred_raw, ref_pose.header, ref_pose, gt_btjc=gt_raw, apply_scale=True)
+    pred_pose = tensor_to_pose(pred_norm, ref_pose.header, ref_pose, gt_btjc=gt_norm, apply_scale=True)
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
