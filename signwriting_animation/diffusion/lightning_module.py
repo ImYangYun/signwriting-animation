@@ -112,7 +112,7 @@ class _ConditionalWrapperV1(nn.Module):
         return output  # Only return pose, ignore length_dist
 
 
-class LitDiffusionV1(pl.LightningModule):  # pylint: disable=too-many-instance-attributes
+class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-attributes
     """
     PyTorch Lightning module for V1 (Original CAMDM-based) diffusion training.
     
