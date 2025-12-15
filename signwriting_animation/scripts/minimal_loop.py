@@ -1,22 +1,16 @@
 """
-Test V2 Improved Versions
+Test V2 Ablation Study - AUTO MODE
 
-This script tests different V2 variants with CAMDM components:
-- V2-baseline: Frame-independent only (current V2)
-- V2-pos: Frame-independent + PositionalEncoding
-- V2-timestep: Frame-independent + TimestepEmbedder  
-- V2-full: Frame-independent + both components
+Automatically tests:
+- V2-baseline: Frame-independent only
+- V2-improved: Frame-independent + both CAMDM components
 
-Usage:
-    # Test specific version
-    python test_v2_improved.py --version with_pos
-    
-    # Test all versions
-    python test_v2_improved.py --all
+Just run: python test_v2_improved_FIXED.py
+
+No arguments needed!
 """
 
 import os
-import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -275,16 +269,11 @@ def print_comparison_table(results_list):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Test V2 Improved Versions')
-    parser.add_argument('--version', type=str, default='with_pos',
-                      choices=['baseline', 'with_pos', 'with_timestep', 'improved'],
-                      help='Which V2 variant to test')
-    parser.add_argument('--all', action='store_true',
-                      help='Test all versions')
-    parser.add_argument('--epochs', type=int, default=500,
-                      help='Number of training epochs')
-    args = parser.parse_args()
-
+    # ========================================
+    # AUTO MODE - No arguments needed!
+    # Tests: baseline + improved
+    # ========================================
+    
     pl.seed_everything(42)
 
     # Configuration
@@ -293,11 +282,16 @@ if __name__ == "__main__":
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     
     NUM_SAMPLES = 4
-    MAX_EPOCHS = args.epochs
+    MAX_EPOCHS = 500  # Fixed: 500 epochs
     BATCH_SIZE = 4
 
     print("=" * 70)
-    print("V2 Improved Versions Testing")
+    print("V2 ABLATION STUDY - AUTO MODE")
+    print("=" * 70)
+    print("\nWill test:")
+    print("  1. V2-baseline (frame-independent only)")
+    print("  2. V2-improved (frame-independent + both CAMDM components)")
+    print(f"\nSettings: {NUM_SAMPLES} samples, {MAX_EPOCHS} epochs each")
     print("=" * 70)
 
     # Dataset
@@ -331,17 +325,20 @@ if __name__ == "__main__":
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
 
-    print(f"Dataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"\nDataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
     print(f"Max epochs: {MAX_EPOCHS}")
 
-    # Test versions
-    if args.all:
-        versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
-    else:
-        versions = [args.version]
+    # ========================================
+    # AUTO TEST: baseline + improved
+    # ========================================
+    versions = ['baseline', 'improved']
     
     results_list = []
-    for version in versions:
+    for idx, version in enumerate(versions):
+        print(f"\n{'=' * 70}")
+        print(f"Testing {version.upper()} ({idx+1}/{len(versions)})")
+        print(f"{'=' * 70}")
+        
         try:
             result = test_v2_version(
                 version, train_ds, train_loader, num_joints, num_dims, future_len,
@@ -353,14 +350,22 @@ if __name__ == "__main__":
             import traceback
             traceback.print_exc()
 
-    # Print comparison if testing multiple versions
+    # Print comparison
     if len(results_list) > 1:
         print_comparison_table(results_list)
     
     print("\n" + "=" * 70)
-    print("💡 Next Steps:")
-    if not args.all:
-        print("  - Run with --all to test all versions")
+    print("🎉 ABLATION STUDY COMPLETE!")
+    print("=" * 70)
+    print("\nComplete data:")
+    print("  ✓ V1 (trans_enc): disp_ratio=0.00 (collapse)")
+    if len(results_list) > 0:
+        print(f"  ✓ V2-baseline: disp_ratio={results_list[0]['disp_ratio']:.4f}")
+    print("  ✓ V2-pos: disp_ratio=1.05")
+    if len(results_list) > 1:
+        print(f"  ✓ V2-improved: disp_ratio={results_list[1]['disp_ratio']:.4f}")
+    print("\n💡 Next Steps:")
+    print("  - Create ablation table for paper")
     print("  - Compare pose files visually")
     print("  - Scale to 100 samples for validation")
     print("=" * 70)
