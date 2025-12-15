@@ -1,199 +1,188 @@
+"""
+SignWriting-to-Pose Diffusion Model V1 (Original CAMDM-based version)
+
+This is the original model architecture that uses all CAMDM components.
+"""
+
 import torch
 import torch.nn as nn
 from transformers import CLIPModel
 
-from CAMDM.network.models import PositionalEncoding, TimestepEmbedder
+from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess, seq_encoder_factory
+
+
+class DistributionPredictionModel(nn.Module):
+    """
+    Predicts a probability distribution (Gaussian) over sequence length.
+    
+    Used in the original model to predict future sequence length,
+    though this may not be needed if sequence length is fixed.
+    
+    Args:
+        input_size: Input feature dimension
+    """
+    def __init__(self, input_size: int):
+        super().__init__()
+        self.fc_mu = nn.Linear(input_size, 1)
+        self.fc_var = nn.Linear(input_size, 1)
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: Input tensor [B, D]
+            
+        Returns:
+            q: Normal distribution with predicted mean and std
+        """
+        mu = self.fc_mu(x)
+        log_var = self.fc_var(x)
+        std = torch.exp(0.5 * log_var)
+        q = torch.distributions.Normal(mu, std)
+        return q
 
 
 class EmbedSignWriting(nn.Module):
     """
-    SignWriting image encoder using CLIP vision model.
-    
-    Encodes SignWriting symbol images into latent embeddings that condition
-    the pose generation process.
-    
-    Args:
-        num_latent_dims: Dimension of output latent embeddings
-        embedding_arch: Pretrained CLIP model identifier
+    SignWriting image encoder using CLIP.
     """
     def __init__(self, num_latent_dims: int, embedding_arch: str = 'openai/clip-vit-base-patch32'):
         super().__init__()
-        # Load pretrained CLIP model for vision encoding
         self.model = CLIPModel.from_pretrained(embedding_arch)
         self.proj = None
-        
-        # Add projection layer if CLIP output dimension differs from target
+
         if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
             self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
 
     def forward(self, image_batch: torch.Tensor) -> torch.Tensor:
         """
-        Encode SignWriting images to latent embeddings.
-        
         Args:
-            image_batch: Batch of images [B, 3, H, W]
-            
+            image_batch: [batch_size, 3, 224, 224]
         Returns:
-            embeddings_batch: Latent embeddings [B, D]
+            embeddings_batch: [1, batch_size, num_latent_dims]
         """
-        # Extract image features using CLIP vision encoder
         embeddings_batch = self.model.get_image_features(pixel_values=image_batch)
-        
-        # Project to target dimension if needed
+
         if self.proj is not None:
             embeddings_batch = self.proj(embeddings_batch)
-        return embeddings_batch
+
+        return embeddings_batch[None, ...]
 
 
-class ContextEncoder(nn.Module):
+class OutputProcessMLP(nn.Module):
     """
-    Past motion context encoder using Transformer with CAMDM's PositionalEncoding.
+    Output process for the Sign Language Pose Diffusion model: project to pose space.
     
-    Encodes historical pose sequences into a single context vector using
-    self-attention and mean pooling. Now includes positional encoding from CAMDM
-    to preserve temporal order information.
-    
-    Args:
-        input_feats: Input feature dimension (J*C for flattened poses)
-        latent_dim: Latent dimension for Transformer
-        num_layers: Number of Transformer encoder layers
-        num_heads: Number of attention heads
-        dropout: Dropout probability
+    Obtained module from https://github.com/sign-language-processing/fluent-pose-synthesis
     """
-    def __init__(self, input_feats: int, latent_dim: int, num_layers: int = 2, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self,
+                 num_latent_dims: int,
+                 num_keypoints: int,
+                 num_dims_per_keypoint: int,
+                 hidden_dim: int = 512):
         super().__init__()
-        # Project pose features to latent space
-        self.pose_encoder = nn.Linear(input_feats, latent_dim)
-        self.pos_encoding = PositionalEncoding(latent_dim, dropout)
-        
-        # Transformer encoder for temporal modeling
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=latent_dim,
-            nhead=num_heads,
-            dim_feedforward=latent_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
+        self.num_keypoints = num_keypoints
+        self.num_dims_per_keypoint = num_dims_per_keypoint
+
+        # MLP layers
+        self.mlp = nn.Sequential(
+            nn.Linear(num_latent_dims, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, num_keypoints * num_dims_per_keypoint)
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Encode past motion sequence to context vector.
-        
+        Decodes a sequence of latent vectors into keypoint motion data using a multi-layer perceptron (MLP).
+
         Args:
-            x: Past poses [B, T, J, C] or [B, T, J*C]
-            
+            x (Tensor):
+                Input latent tensor.
+                Shape: [num_frames, batch_size, num_latent_dims].
+
         Returns:
-            context: Mean-pooled context vector [B, D]
+            Tensor:
+                Decoded keypoint motion.
+                Shape: [batch_size, num_keypoints, num_dims_per_keypoint, num_frames].
         """
-        # Reshape to [B, T, J*C] if needed
-        if x.dim() == 4:
-            B, T, J, C = x.shape
-            x = x.reshape(B, T, J * C)
-        
-        # Encode to latent space
-        x_emb = self.pose_encoder(x)      # [B, T, D]
-
-        x_emb = x_emb.permute(1, 0, 2)    # [B, T, D] -> [T, B, D]
-        x_emb = self.pos_encoding(x_emb)  # [T, B, D] with positional info
-        x_emb = x_emb.permute(1, 0, 2)    # [T, B, D] -> [B, T, D]
-        
-        # Apply Transformer encoder
-        x_enc = self.encoder(x_emb)       # [B, T, D]
-        
-        # Mean pooling over time to get single context vector
-        context = x_enc.mean(dim=1)       # [B, D]
-        return context
+        num_frames, batch_size, num_latent_dims = x.shape
+        x = self.mlp(x)  # use MLP instead of single linear layer
+        x = x.reshape(num_frames, batch_size, self.num_keypoints, self.num_dims_per_keypoint)
+        x = x.permute(1, 2, 3, 0)
+        return x
 
 
-class SignWritingToPoseDiffusionV2(nn.Module):
+class SignWritingToPoseDiffusionV1(nn.Module):
     """
-    Diffusion model for SignWriting-to-Pose generation (V2 - with CAMDM components).
+    Original SignWriting-to-Pose Diffusion Model (V1).
     
-    Key architectural improvements:
-    - Frame-independent decoding: Each future frame is decoded separately to prevent
-      Transformer self-attention from averaging them together
-    - CAMDM's PositionalEncoding in context encoder for temporal information
-    - CAMDM's TimestepEmbedder for better timestep representation
-    - Each frame receives: context + noisy_frame_encoding + positional_embedding
+    This version uses all CAMDM components:
+    - MotionProcess for motion encoding
+    - seq_encoder_factory for flexible encoder architecture
+    - PositionalEncoding for temporal information
+    - TimestepEmbedder for timestep conditioning
+    - DistributionPredictionModel for length prediction
     
     Args:
-        num_keypoints: Number of pose keypoints (e.g., 178 for MediaPipe Holistic)
+        num_keypoints: Number of pose keypoints
         num_dims_per_keypoint: Dimensions per keypoint (typically 3 for x,y,z)
-        embedding_arch: CLIP model architecture for SignWriting encoding
-        num_latent_dims: Latent dimension for all encoders/decoders
-        num_heads: Number of attention heads in context encoder
+        embedding_arch: CLIP model architecture
+        num_latent_dims: Latent dimension
+        ff_size: Feed-forward size in Transformer
+        num_layers: Number of Transformer layers
+        num_heads: Number of attention heads
         dropout: Dropout probability
-        cond_mask_prob: Probability of masking conditions during training (for CFG)
-        t_past: Number of past frames for context
-        t_future: Number of future frames to predict
+        activation: Activation function
+        arch: Encoder architecture ("trans_enc", "trans_dec", or "gru")
+        cond_mask_prob: Probability of masking conditions (for CFG)
     """
-    
     def __init__(self,
                  num_keypoints: int,
                  num_dims_per_keypoint: int,
                  embedding_arch: str = 'openai/clip-vit-base-patch32',
                  num_latent_dims: int = 256,
+                 ff_size: int = 1024,
+                 num_layers: int = 8,
                  num_heads: int = 4,
-                 dropout: float = 0.1,
-                 cond_mask_prob: float = 0,
-                 t_past: int = 40,
-                 t_future: int = 20):
+                 dropout: float = 0.2,
+                 activation: str = "gelu",
+                 arch: str = "trans_enc",
+                 cond_mask_prob: float = 0):
         super().__init__()
-        self.num_keypoints = num_keypoints
-        self.num_dims_per_keypoint = num_dims_per_keypoint
-        self.cond_mask_prob = cond_mask_prob
-        self.t_past = t_past
-        self.t_future = t_future
-        self._forward_count = 0
 
+        self.cond_mask_prob = cond_mask_prob
+        self.arch = arch
+
+        # Local conditions: process motion sequences
         input_feats = num_keypoints * num_dims_per_keypoint
-        
-        # === Condition Encoders ===
-        # Encode past motion history into context (now with PositionalEncoding)
-        self.past_context_encoder = ContextEncoder(
-            input_feats, num_latent_dims,
-            num_layers=2, num_heads=num_heads, dropout=dropout
-        )
-        
-        # Encode SignWriting symbol image
-        self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
-        
-        # ✅ Use CAMDM's TimestepEmbedder instead of simple Embedding
-        # Note: TimestepEmbedder might need a PositionalEncoding instance
-        # Check CAMDM source to see if it requires pos_encoder parameter
+        self.future_motion_process = MotionProcess(input_feats, num_latent_dims)
+        self.past_motion_process = MotionProcess(input_feats, num_latent_dims)
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
-        self.time_embed = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
-        
-        # === Noisy Frame Encoder ===
-        # Encode each noisy frame x_t independently
-        self.xt_frame_encoder = nn.Sequential(
-            nn.Linear(input_feats, num_latent_dims),
-            nn.GELU(),
-            nn.Linear(num_latent_dims, num_latent_dims),
-        )
-        
-        # === Output Positional Embeddings ===
-        # Distinguish different time steps in the output sequence
-        self.output_pos_embed = nn.Embedding(t_future, num_latent_dims)
-        
-        # === Frame Decoder ===
-        # Decode: context + x_t[t] + pos[t] -> predicted frame
-        decoder_input_dim = num_latent_dims * 3
-        self.decoder = nn.Sequential(
-            nn.Linear(decoder_input_dim, 512),
-            nn.GELU(),
-            nn.Linear(512, 512),
-            nn.GELU(),
-            nn.Linear(512, input_feats),
-        )
-        
-        print(f"✓ SignWritingToPoseDiffusionV2 initialized")
-        print(f"  - Frame-independent decoding (prevents Transformer averaging)")
-        print(f"  - Using CAMDM's PositionalEncoding in context encoder")
-        print(f"  - Using CAMDM's TimestepEmbedder for timestep encoding")
-        print(f"  - t_past={t_past}, t_future={t_future}")
+
+        # Global conditions: image and timestep
+        self.embed_signwriting = EmbedSignWriting(num_latent_dims, embedding_arch)
+        self.embed_timestep = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
+
+        # Sequence encoder (can be trans_enc, trans_dec, or gru)
+        self.seqEncoder = seq_encoder_factory(arch=arch,
+                                              latent_dim=num_latent_dims,
+                                              ff_size=ff_size,
+                                              num_layers=num_layers,
+                                              num_heads=num_heads,
+                                              dropout=dropout,
+                                              activation=activation)
+
+        # Output projection and length predictor
+        self.pose_projection = OutputProcessMLP(num_latent_dims, num_keypoints, num_dims_per_keypoint)
+        self.length_predictor = DistributionPredictionModel(num_latent_dims)
+        self.global_norm = nn.LayerNorm(num_latent_dims)
+
+        print(f"✓ SignWritingToPoseDiffusionV1 initialized")
+        print(f"  - Architecture: {arch}")
+        print(f"  - Using all CAMDM components")
+        print(f"  - MotionProcess for past/future motion")
+        print(f"  - {num_layers} layers, {num_heads} heads")
 
     def forward(self,
                 x: torch.Tensor,
@@ -201,82 +190,53 @@ class SignWritingToPoseDiffusionV2(nn.Module):
                 past_motion: torch.Tensor,
                 signwriting_im_batch: torch.Tensor):
         """
-        Forward pass for diffusion model.
-        
+        Forward pass for V1 model.
+
         Args:
-            x: Noisy motion [B, J, C, T_future] in BJCT format
-            timesteps: Diffusion timestep [B]
-            past_motion: Historical frames [B, J, C, T_past] in BJCT format
+            x: Noisy input tensor [B, J, C, T_future] (BJCT format)
+            timesteps: Diffusion timesteps [B]
+            past_motion: Historical frames [B, J, C, T_past] (BJCT format)
             signwriting_im_batch: Condition images [B, 3, H, W]
-            
+
         Returns:
-            Predicted x0 (denoised motion) [B, J, C, T_future]
+            output: Predicted denoised motion [B, J, C, T_future]
+            length_dist: Predicted length distribution (may be None if not used)
         """
-        B, J, C, T_future = x.shape
-        device = x.device
+        batch_size, num_keypoints, num_dims_per_keypoint, num_frames = x.shape
+
+        # Encode all conditions
+        time_emb = self.embed_timestep(timesteps)  # [1, B, D]
+        signwriting_emb = self.embed_signwriting(signwriting_im_batch)  # [1, B, D]
         
-        # Debug logging on first forward pass
-        debug = self._forward_count == 0
+        # MotionProcess expects [B, J, C, T] format
+        past_motion_emb = self.past_motion_process(past_motion)  # [T_past, B, D]
+        future_motion_emb = self.future_motion_process(x)  # [T_future, B, D]
+
+        # Concatenate all embeddings into one sequence
+        # Shape: [1 + 1 + T_past + T_future, B, D]
+        xseq = torch.cat((time_emb,
+                          signwriting_emb,
+                          past_motion_emb,
+                          future_motion_emb), axis=0)
+
+        # Add positional encoding
+        xseq = self.sequence_pos_encoder(xseq)
         
-        # === Handle past_motion format ===
-        # Support both BJCT and BTJC input formats
-        if past_motion.dim() == 4:
-            if past_motion.shape[1] == J and past_motion.shape[2] == C:
-                # BJCT -> BTJC conversion
-                past_btjc = past_motion.permute(0, 3, 1, 2).contiguous()
-            else:
-                # Already in BTJC format
-                past_btjc = past_motion
+        # Process through sequence encoder
+        output = self.seqEncoder(xseq)[-num_frames:]  # Take last T_future frames
         
-        # === Encode Conditions ===
-        # Past motion context (now with PositionalEncoding)
-        past_ctx = self.past_context_encoder(past_btjc)  # [B, D]
+        # Project to pose space
+        output = self.pose_projection(output)  # [B, J, C, T]
         
-        # SignWriting symbol embedding
-        sign_emb = self.embed_signwriting(signwriting_im_batch)  # [B, D]
+        # Predict sequence length (global context)
+        global_latent = self.global_norm(xseq.mean(0))  # [B, D]
+        length_dist = self.length_predictor(global_latent)
         
-        # ✅ Diffusion timestep embedding using CAMDM's TimestepEmbedder
-        # TimestepEmbedder outputs [1, B, D], so we squeeze the first dimension
-        time_emb = self.time_embed(timesteps)  # [1, B, D]
-        time_emb = time_emb.squeeze(0)  # [B, D]
-        
-        # Fuse all conditions into single context vector
-        context = past_ctx + sign_emb + time_emb  # [B, D]
-        
-        # === Frame-Independent Decoding ===
-        # Decode each future frame independently to preserve motion dynamics
-        outputs = []
-        for t in range(T_future):
-            # Extract frame t from noisy input: [B, J, C] -> [B, J*C]
-            xt_frame = x[:, :, :, t].reshape(B, -1)
-            xt_emb = self.xt_frame_encoder(xt_frame)  # [B, D]
-            
-            # Add positional embedding for temporal information
-            pos_idx = torch.tensor([t], device=device)
-            pos_emb = self.output_pos_embed(pos_idx).expand(B, -1)  # [B, D]
-            
-            # Concatenate and decode
-            dec_input = torch.cat([context, xt_emb, pos_emb], dim=-1)  # [B, D*3]
-            out = self.decoder(dec_input)  # [B, J*C]
-            outputs.append(out)
-        
-        # Stack outputs: [T, B, J*C] -> [B, J, C, T]
-        result = torch.stack(outputs, dim=0)  # [T, B, J*C]
-        result = result.permute(1, 0, 2)  # [B, T, J*C]
-        result = result.reshape(B, T_future, J, C)  # [B, T, J, C]
-        result = result.permute(0, 2, 3, 1).contiguous()  # [B, J, C, T]
-        
-        # Debug: Check if model produces motion (not static poses)
-        if debug:
-            disp = (result[:, :, :, 1:] - result[:, :, :, :-1]).abs().mean().item()
-            print(f"[FORWARD] result shape={result.shape}, disp={disp:.6f}")
-        
-        self._forward_count += 1
-        return result
+        return output, length_dist
 
     def interface(self, x, timesteps, y):
         """
-        Diffusion training interface (compatible with CAMDM framework).
+        Interface for diffusion training (compatible with CAMDM).
         
         Args:
             x: Noisy motion [B, J, C, T]
@@ -284,7 +244,8 @@ class SignWritingToPoseDiffusionV2(nn.Module):
             y: Dictionary with 'sign_image' and 'input_pose'
             
         Returns:
-            Predicted x0 [B, J, C, T]
+            output: Predicted x0 [B, J, C, T]
+            length_dist: Length distribution
         """
         batch_size = x.shape[0]
         signwriting_image = y['sign_image']
@@ -298,5 +259,5 @@ class SignWritingToPoseDiffusionV2(nn.Module):
         return self.forward(x, timesteps, past_motion, signwriting_image)
 
 
-# Alias for backward compatibility
-SignWritingToPoseDiffusion = SignWritingToPoseDiffusionV2
+# Alias
+SignWritingToPoseDiffusion = SignWritingToPoseDiffusionV1
