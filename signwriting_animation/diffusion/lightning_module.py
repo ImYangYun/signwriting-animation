@@ -1,8 +1,13 @@
 """
-PyTorch Lightning Module for V1 Model (Original CAMDM-based)
+PyTorch Lightning Module for V2 Model (Frame-Independent Decoding)
 
-This Lightning module is adapted for the original SignWritingToPoseDiffusionV1 model
-which returns (output, length_dist) tuple.
+This is your current working Lightning module for V2.
+NO CHANGES NEEDED - this works with the V2 model!
+
+Key differences from V1:
+- Model returns only output (not tuple)
+- Uses frame-independent decoder
+- Simpler architecture (no MotionProcess, seq_encoder_factory)
 """
 # pylint: disable=invalid-name
 # B, J, C, T are standard tensor dimension names in deep learning
@@ -92,13 +97,13 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return torch.clip(betas, 0.0001, 0.9999)
 
 
-class _ConditionalWrapperV1(nn.Module):
+class _ConditionalWrapper(nn.Module):
     """
-    Wrapper for V1 model that only returns the pose output (not length_dist).
+    Wrapper for V2 model to work with GaussianDiffusion.
     
     GaussianDiffusion expects model(x, t) -> output
-    But V1 model returns (output, length_dist)
-    This wrapper extracts only the output.
+    V2 model expects model(x, t, past, sign_img) -> output
+    This wrapper fixes conditions and provides the expected interface.
     """
     def __init__(self, base_model: nn.Module, past_bjct: torch.Tensor, sign_img: torch.Tensor):
         super().__init__()
@@ -107,18 +112,15 @@ class _ConditionalWrapperV1(nn.Module):
         self.sign_img = sign_img
     
     def forward(self, x, t, **kwargs):  # pylint: disable=unused-argument
-        """Forward with fixed conditions, return only pose output."""
-        output, _length_dist = self.base_model(x, t, self.past_bjct, self.sign_img)
-        return output  # Only return pose, ignore length_dist
+        """Forward with fixed conditions."""
+        return self.base_model(x, t, self.past_bjct, self.sign_img)
 
 
 class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-attributes
     """
-    PyTorch Lightning module for V1 (Original CAMDM-based) diffusion training.
+    PyTorch Lightning module for V2 diffusion training.
     
-    Differences from V2:
-    - Model returns (output, length_dist) tuple
-    - Uses all CAMDM components (MotionProcess, seq_encoder_factory, etc.)
+    This is the current working version that you've been using successfully!
     
     Args:
         num_keypoints: Number of pose keypoints
@@ -128,9 +130,8 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         diffusion_steps: Number of diffusion timesteps
         vel_weight: Weight for velocity loss
         acc_weight: Weight for acceleration loss
-        arch: Encoder architecture ("trans_enc", "trans_dec", or "gru")
-        num_layers: Number of encoder layers
-        ff_size: Feed-forward size
+        t_past: Number of past frames for context
+        t_future: Number of future frames to predict
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -142,9 +143,8 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         diffusion_steps=8,
         vel_weight: float = 1.0,
         acc_weight: float = 0.5,
-        arch: str = "trans_enc",
-        num_layers: int = 8,
-        ff_size: int = 1024,
+        t_past: int = 40,
+        t_future: int = 20,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -152,7 +152,6 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
-        self.arch = arch
         self._step_count = 0
 
         # Load normalization statistics
@@ -162,13 +161,12 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # Initialize V1 model (with all CAMDM components)
+        # Initialize V2 model (frame-independent decoder)
         self.model = SignWritingToPoseDiffusionV2(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
-            arch=arch,
-            num_layers=num_layers,
-            ff_size=ff_size,
+            t_past=t_past,
+            t_future=t_future,
         )
 
         # Create Gaussian diffusion process
@@ -203,7 +201,7 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         return x.permute(0, 3, 1, 2).contiguous()
 
     def training_step(self, batch, _batch_idx):  # pylint: disable=arguments-differ,too-many-locals
-        """Single training step for V1 diffusion model."""
+        """Single training step for V2 diffusion model."""
         debug = self._step_count == 0 or self._step_count % 100 == 0
 
         # Extract data from batch
@@ -230,8 +228,8 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         noise = torch.randn_like(gt_bjct)
         x_noisy = self.diffusion.q_sample(gt_bjct, timestep, noise=noise)
 
-        # Model prediction (V1 returns tuple)
-        pred_x0_bjct, _length_dist = self.model(x_noisy, timestep, past_bjct, sign_img)
+        # Model prediction (V2 returns only output, not tuple!)
+        pred_x0_bjct = self.model(x_noisy, timestep, past_bjct, sign_img)
 
         # === Loss Computation ===
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
@@ -248,7 +246,7 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
 
         loss = loss_mse + self.vel_weight * loss_vel + self.acc_weight * loss_acc
 
-        # Displacement ratio monitoring
+        # Displacement ratio monitoring (CRITICAL metric!)
         with torch.no_grad():
             pred_disp = pred_vel.abs().mean().item()
             gt_disp = gt_vel.abs().mean().item()
@@ -256,7 +254,7 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
 
         if debug:
             print("\n" + "=" * 70)
-            print(f"TRAINING STEP {self._step_count} (V1 - arch={self.arch})")
+            print(f"TRAINING STEP {self._step_count} (V2 - Frame-Independent)")
             print("=" * 70)
             print(f"  t range: [{timestep.min().item()}, {timestep.max().item()}]")
             print(f"  loss_mse: {loss_mse.item():.6f}")
@@ -285,7 +283,7 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
 
     @torch.no_grad()
     def sample(self, past_btjc, sign_img, future_len=20):
-        """Generate pose sequence using DDPM sampling (V1 version)."""
+        """Generate pose sequence using DDPM sampling."""
         self.eval()
         device = self.device
 
@@ -296,8 +294,8 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
 
-        # Wrap V1 model to only return pose output
-        wrapped_model = _ConditionalWrapperV1(self.model, past_bjct, sign_img)
+        # Wrap model for GaussianDiffusion interface
+        wrapped_model = _ConditionalWrapper(self.model, past_bjct, sign_img)
 
         pred_bjct = self.diffusion.p_sample_loop(
             model=wrapped_model,
@@ -323,13 +321,13 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
         """Save training curves after training completes."""
         try:
             import matplotlib.pyplot as plt
-            out_dir = "logs/diffusion_v1"
+            out_dir = "logs/diffusion_v2"
             os.makedirs(out_dir, exist_ok=True)
 
             _, axes = plt.subplots(2, 2, figsize=(10, 8))
 
             axes[0, 0].plot(self.train_logs["loss"])
-            axes[0, 0].set_title(f"Total Loss (V1 - {self.arch})")
+            axes[0, 0].set_title("Total Loss (V2 - Frame-Independent)")
 
             axes[0, 1].plot(self.train_logs["mse"])
             axes[0, 1].set_title("MSE Loss")
@@ -342,7 +340,7 @@ class LitDiffusion(pl.LightningModule):  # pylint: disable=too-many-instance-att
             axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5)
 
             plt.tight_layout()
-            plt.savefig(f"{out_dir}/train_curve_{self.arch}.png")
-            print(f"[TRAIN CURVE] saved to {out_dir}/train_curve_{self.arch}.png")
+            plt.savefig(f"{out_dir}/train_curve.png")
+            print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
         except Exception as error:  # pylint: disable=broad-exception-caught
             print(f"[TRAIN CURVE] failed: {error}")
