@@ -88,7 +88,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     # Import here to allow for different model versions
     from signwriting_animation.diffusion.core.models import create_v2_model
     from signwriting_animation.diffusion.lightning_module import (
-        LitDiffusion, sanitize_btjc, mean_frame_disp
+        LitDiffusionV1, sanitize_btjc, mean_frame_disp
     )
     
     print("\n" + "=" * 70)
@@ -127,7 +127,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     
     # TEMPORARY: Use standard LitDiffusion (will create baseline V2)
     # TODO: Modify LitDiffusion to accept custom model
-    lit_model = LitDiffusion(
+    lit_model = LitDiffusionV1(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
