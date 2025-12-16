@@ -219,7 +219,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         # For pose files, unnormalize to real space
         pred_raw_for_pose = lit_model.unnormalize(pred_norm)
 
-    # Save poses - GT and pred from same pipeline, only center alignment
+    # Save poses
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -230,21 +230,24 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # GT and pred: Same processing pipeline
-    # Both from dataloader → normalize → unnormalize
-    gt_raw_for_pose = lit_model.unnormalize(gt_norm)
-    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
+    # GT: Directly from ref pose (original pixel space, correct motion)
+    T_pred = future_len
+    T_ref_total = ref_pose.body.data.shape[0]
+    future_start = max(0, T_ref_total - T_pred)
     
-    # Only center alignment - NO scaling to preserve motion authenticity
-    gt_pose = tensor_to_pose(gt_raw_for_pose, ref_pose.header, ref_pose, 
-                             gt_btjc=None,
-                             align_mode='center_only')  # Only translate, no scale
+    gt_pose_data = ref_pose.body.data[future_start:future_start+T_pred].copy()
+    gt_conf = ref_pose.body.confidence[future_start:future_start+T_pred].copy()
+    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_pose_data, confidence=gt_conf)
+    gt_pose = Pose(header=ref_pose.header, body=gt_body)
+    
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
+    # Pred: unnormalize then scale to ref's variance for visualization
+    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
     pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, 
-                               gt_btjc=None,
-                               align_mode='center_only')  # Only translate, no scale
+                               gt_btjc=pred_raw_for_pose,  # Use pred itself for variance calc
+                               align_mode='scale_and_center')  # Scale to ref's variance
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
