@@ -46,11 +46,15 @@ def print_tensor_stats(name, t):
             print(f"    frame_disp: {disp:.4f}")
 
 
-def simple_tensor_to_pose(t_btjc, header, ref_pose):
+def simple_tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     """
-    最简单的tensor转pose，只做格式转换，不做任何scale或shift！
+    Tensor转pose，可选择是否scale到ref的variance。
     
-    这样可以保证数据不被扭曲。
+    Args:
+        t_btjc: Tensor [B, T, J, C]
+        header: Pose header
+        ref_pose: Reference pose
+        scale_to_ref: If True, scale data to match ref pose's variance
     """
     if t_btjc.dim() == 4:
         t = t_btjc[0]  # [T, J, C]
@@ -59,7 +63,33 @@ def simple_tensor_to_pose(t_btjc, header, ref_pose):
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
-    # 只做格式转换
+    # 获取ref pose的future部分作为参考
+    T_pred = t_np.shape[0]
+    T_ref_total = ref_pose.body.data.shape[0]
+    future_start = max(0, T_ref_total - T_pred)
+    ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
+    
+    if scale_to_ref:
+        # 计算variance
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        var_input = _var(t_np)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            t_np = t_np * scale
+            print(f"    Scale applied: {scale:.2f} (var_input={var_input:.4f}, var_ref={var_ref:.2f})")
+        
+        # Center alignment
+        input_center = t_np.reshape(-1, 3).mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        t_np = t_np + (ref_center - input_center)
+        print(f"    Center aligned to: {ref_center}")
+    
+    # 格式转换
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
     
     T = arr.shape[0]
@@ -268,8 +298,8 @@ def test_improved_clean():
     else:
         print("  ⚠️ WARNING: normalize/unnormalize has precision loss!")
     
-    # Step 7: Save poses (NO scaling, NO shifting - just format conversion)
-    print("\n[Step 7] Saving poses (minimal processing)...")
+    # Step 7: Save poses (scale to ref's pixel space for visualization)
+    print("\n[Step 7] Saving poses (scaling to ref's pixel space)...")
     
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
@@ -281,9 +311,11 @@ def test_improved_clean():
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # 使用最简单的转换，不做任何scale或shift
-    gt_pose = simple_tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
-    pred_pose = simple_tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
+    # 使用scale_to_ref=True，把normalized数据scale到pixel空间
+    print("  Processing GT:")
+    gt_pose = simple_tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose, scale_to_ref=True)
+    print("  Processing Pred:")
+    pred_pose = simple_tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose, scale_to_ref=True)
     
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
