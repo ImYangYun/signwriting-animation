@@ -227,10 +227,11 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
-    # Pred: unnormalize then save
+    # Pred: unnormalize then apply scale using itself as reference
     pred_raw_for_pose = lit_model.unnormalize(pred_norm)
     pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, 
-                               gt_btjc=None, apply_scale=False)
+                               gt_btjc=pred_raw_for_pose,  # Use pred itself
+                               apply_scale=True)            # Enable scaling
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
