@@ -1,15 +1,13 @@
 """
-Test V2 Ablation Study - AUTO MODE
+V2 Clean Test - 超级干净版本
 
-Automatically tests all 4 V2 variants:
-- V2-baseline: Frame-independent only
-- V2-with_pos: Frame-independent + PositionalEncoding
-- V2-with_timestep: Frame-independent + TimestepEmbedder  
-- V2-improved: Frame-independent + both CAMDM components
+目标：确保GT和pred来自完全相同的pipeline，没有任何隐藏的变换
 
-Just run: python test_v2_improved_FIXED.py
-
-No arguments needed!
+关键原则：
+1. GT和pred都从dataloader来（同样的帧区间）
+2. 两者经过完全相同的处理流程
+3. tensor_to_pose只做必要的格式转换，不做scale
+4. 打印每一步的数据统计，方便debug
 """
 
 import os
@@ -23,103 +21,116 @@ from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
-from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, align_mode='center_only'):
-    """
-    Convert tensor predictions to pose format.
+def print_tensor_stats(name, t):
+    """打印tensor的统计信息，用于debug"""
+    if isinstance(t, torch.Tensor):
+        t_np = t.detach().cpu().numpy()
+    else:
+        t_np = t
     
-    Args:
-        t_btjc: Tensor in BTJC format
-        header: Pose header
-        ref_pose: Reference pose for alignment
-        gt_btjc: Optional GT for scale reference
-        align_mode: How to align pred to ref space
-            - 'center_only': Only translate to ref center (preserves motion scale)
-            - 'scale_and_center': Scale to ref variance then center (may distort motion)
-            - 'none': No alignment
+    print(f"  {name}:")
+    print(f"    shape: {t_np.shape}")
+    print(f"    range: [{t_np.min():.4f}, {t_np.max():.4f}]")
+    print(f"    mean: {t_np.mean():.4f}")
+    print(f"    std: {t_np.std():.4f}")
+    if len(t_np.shape) >= 2:
+        # 计算帧间位移
+        if t_np.shape[0] > 1 or (len(t_np.shape) > 1 and t_np.shape[1] > 1):
+            # 假设第一个或第二个维度是时间
+            axis = 0 if t_np.shape[0] > 1 else 1
+            disp = np.abs(np.diff(t_np, axis=axis)).mean()
+            print(f"    frame_disp: {disp:.4f}")
+
+
+def simple_tensor_to_pose(t_btjc, header, ref_pose):
+    """
+    最简单的tensor转pose，只做格式转换，不做任何scale或shift！
+    
+    这样可以保证数据不被扭曲。
     """
     if t_btjc.dim() == 4:
-        t = t_btjc[0]
+        t = t_btjc[0]  # [T, J, C]
     else:
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-    gt_np = None
-    if gt_btjc is not None:
-        if gt_btjc.dim() == 4:
-            gt_np = gt_btjc[0].detach().cpu().numpy().astype(np.float32)
-        else:
-            gt_np = gt_btjc.detach().cpu().numpy().astype(np.float32)
-
-    arr = t_np[:, None, :, :]
-    conf = ref_pose.body.confidence[:len(t_np)].copy()
+    
+    # 只做格式转换
+    arr = t_np[:, None, :, :]  # [T, 1, J, C]
+    
+    T = arr.shape[0]
+    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
     fps = ref_pose.body.fps
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
     
-    unshift_hands(pose_obj)
-    
-    # Get reference for alignment
-    T_pred = pose_obj.body.data.shape[0]
-    T_ref_total = ref_pose.body.data.shape[0]
-    future_start = max(0, T_ref_total - T_pred)
-    ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-    
-    # Alignment based on mode
-    if align_mode == 'scale_and_center' and gt_np is not None:
-        # Original behavior: scale to match ref variance
-        def _var(a):
-            center = a.mean(axis=1, keepdims=True)
-            return float(((a - center) ** 2).mean())
-        
-        var_gt_norm = _var(gt_np)
-        var_ref = _var(ref_arr)
-        
-        if var_gt_norm > 1e-8:
-            scale = np.sqrt(var_ref / var_gt_norm)
-            pose_obj.body.data *= scale
-    
-    if align_mode in ['center_only', 'scale_and_center']:
-        # Center alignment: move to ref's center position
-        pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-        ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
-        pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
-        delta = ref_c - pred_c
-        pose_obj.body.data += delta
-    
     return pose_obj
 
 
-def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, future_len,
-                    stats_path, data_dir, base_ds, max_epochs=500):
-    """Test a specific V2 version."""
-    # Import V2's Lightning module (NOT V1's!)
+def test_improved_clean():
+    """干净的测试函数"""
+    
+    # Import
     from signwriting_animation.diffusion.core.models import create_v2_model
     from signwriting_animation.diffusion.lightning_module import (
-        LitDiffusion, sanitize_btjc, mean_frame_disp  # ✅ V2的Lightning
+        LitDiffusion, sanitize_btjc, mean_frame_disp
     )
     
-    print("\n" + "=" * 70)
-    print(f"Testing V2 - Version: {version.upper()}")
+    print("=" * 70)
+    print("V2 CLEAN TEST")
     print("=" * 70)
     
-    version_names = {
-        'baseline': 'V2-Baseline (Frame-Independent)',
-        'with_pos': 'V2+PositionalEncoding',
-        'with_timestep': 'V2+TimestepEmbedder',
-        'improved': 'V2+Both (Full Improved)'
-    }
-    print(f"Description: {version_names.get(version, version)}")
-
-    out_dir = f"logs/v2_improved_{version}"
+    # Config
+    data_dir = "/home/yayun/data/pose_data/"
+    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
+    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
+    
+    NUM_SAMPLES = 4
+    MAX_EPOCHS = 500
+    BATCH_SIZE = 4
+    
+    out_dir = "logs/v2_clean_test"
     os.makedirs(out_dir, exist_ok=True)
-
-    # Create custom model with specific configuration
+    
+    # Dataset
+    base_ds = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split="train",
+    )
+    
+    class SubsetDataset(torch.utils.data.Dataset):
+        def __init__(self, base, indices):
+            self.samples = [base[i] for i in indices]
+        def __len__(self):
+            return len(self.samples)
+        def __getitem__(self, idx):
+            return self.samples[idx]
+    
+    train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=zero_pad_collator)
+    
+    # Get dimensions
+    sample = train_ds[0]["data"]
+    if hasattr(sample, 'zero_filled'):
+        sample = sample.zero_filled()
+    if hasattr(sample, 'tensor'):
+        sample = sample.tensor
+    num_joints = sample.shape[-2]
+    num_dims = sample.shape[-1]
+    future_len = sample.shape[0]
+    
+    print(f"\nDataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
+    
+    # Create model (improved version)
     model_kwargs = {
         'num_keypoints': num_joints,
         'num_dims_per_keypoint': num_dims,
@@ -127,26 +138,24 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         't_future': future_len,
     }
     
-    custom_model = create_v2_model(version, **model_kwargs)
+    custom_model = create_v2_model('improved', **model_kwargs)
     
-    # Create V2 Lightning module (✅ 这次是对的)
-    lit_model = LitDiffusion(  # ✅ 用V2的LitDiffusion
+    lit_model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-3,
         diffusion_steps=8,
         vel_weight=1.0,
-        t_past=40,           # ✅ V2接受这个参数
-        t_future=future_len, # ✅ V2接受这个参数
+        t_past=40,
+        t_future=future_len,
     )
-    
-    # Replace the model with our custom version
     lit_model.model = custom_model
     
-    print(f"\nTraining {version}...")
+    # Train
+    print(f"\nTraining improved model for {MAX_EPOCHS} epochs...")
     trainer = pl.Trainer(
-        max_epochs=max_epochs,
+        max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         enable_checkpointing=False,
@@ -154,30 +163,48 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         enable_progress_bar=False,
     )
     trainer.fit(lit_model, train_loader)
-
+    
     # Inference
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lit_model = lit_model.to(device)
     lit_model.eval()
-
+    
+    # Get test batch
     test_batch = zero_pad_collator([train_ds[0]])
     cond = test_batch["conditions"]
+    
+    # ========================================
+    # 关键：跟踪每一步的数据
+    # ========================================
+    
+    print("\n" + "=" * 70)
+    print("DATA PIPELINE TRACKING")
+    print("=" * 70)
+    
+    # Step 1: 原始数据从dataloader
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
-
+    
+    print("\n[Step 1] Raw data from dataloader:")
+    print_tensor_stats("past_raw", past_raw)
+    print_tensor_stats("gt_raw", gt_raw)
+    
+    # Step 2: Normalize
+    past_norm = lit_model.normalize(past_raw)
+    gt_norm = lit_model.normalize(gt_raw)
+    
+    print("\n[Step 2] After normalize:")
+    print_tensor_stats("past_norm", past_norm)
+    print_tensor_stats("gt_norm", gt_norm)
+    
+    # Step 3: Model inference (in normalized space)
     with torch.no_grad():
-        # CRITICAL FIX: Get prediction in NORMALIZED space directly
-        # Don't go through unnormalize → normalize cycle
-        
-        # Prepare inputs (same as sample())
-        past_norm = lit_model.normalize(past_raw)
         past_bjct = lit_model.btjc_to_bjct(past_norm)
         
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
         
-        # Define wrapper class inline
         class _ConditionalWrapper(torch.nn.Module):
             def __init__(self, base_model, past_bjct, sign_img):
                 super().__init__()
@@ -188,10 +215,8 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
             def forward(self, x, t, **kwargs):
                 return self.base_model(x, t, self.past_bjct, self.sign_img)
         
-        # Wrap model
         wrapped_model = _ConditionalWrapper(lit_model.model, past_bjct, sign)
         
-        # Sample in NORMALIZED space (no unnormalize!)
         pred_bjct = lit_model.diffusion.p_sample_loop(
             model=wrapped_model,
             shape=target_shape,
@@ -200,26 +225,52 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
             progress=False,
         )
         
-        pred_norm = lit_model.bjct_to_btjc(pred_bjct)  # Still normalized!
-        gt_norm = lit_model.normalize(gt_raw)
-        
-        # Compute ALL metrics in NORMALIZED space
-        mse = F.mse_loss(pred_norm, gt_norm).item()
-        disp_pred = mean_frame_disp(pred_norm)
-        disp_gt = mean_frame_disp(gt_norm)
-        disp_ratio = disp_pred / (disp_gt + 1e-8)
-        
-        # Position metrics in normalized space
-        pred_np = pred_norm[0].cpu().numpy()
-        gt_np = gt_norm[0].cpu().numpy()
-        per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
-        mpjpe = per_joint_err.mean()
-        pck_01 = (per_joint_err < 0.1).mean() * 100
-        
-        # For pose files, unnormalize to real space
-        pred_raw_for_pose = lit_model.unnormalize(pred_norm)
-
-    # Save poses
+        pred_norm = lit_model.bjct_to_btjc(pred_bjct)
+    
+    print("\n[Step 3] Model prediction (normalized space):")
+    print_tensor_stats("pred_norm", pred_norm)
+    
+    # Step 4: Compute metrics in normalized space
+    print("\n[Step 4] Metrics in NORMALIZED space:")
+    mse = F.mse_loss(pred_norm, gt_norm).item()
+    disp_pred = mean_frame_disp(pred_norm)
+    disp_gt = mean_frame_disp(gt_norm)
+    disp_ratio = disp_pred / (disp_gt + 1e-8)
+    
+    pred_np = pred_norm[0].cpu().numpy()
+    gt_np = gt_norm[0].cpu().numpy()
+    per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
+    mpjpe = per_joint_err.mean()
+    pck_01 = (per_joint_err < 0.1).mean() * 100
+    
+    print(f"  MSE: {mse:.6f}")
+    print(f"  MPJPE: {mpjpe:.6f}")
+    print(f"  PCK@0.1: {pck_01:.1f}%")
+    print(f"  Disp GT: {disp_gt:.4f}")
+    print(f"  Disp Pred: {disp_pred:.4f}")
+    print(f"  Disp Ratio: {disp_ratio:.4f}")
+    
+    # Step 5: Unnormalize for visualization
+    gt_unnorm = lit_model.unnormalize(gt_norm)
+    pred_unnorm = lit_model.unnormalize(pred_norm)
+    
+    print("\n[Step 5] After unnormalize:")
+    print_tensor_stats("gt_unnorm", gt_unnorm)
+    print_tensor_stats("pred_unnorm", pred_unnorm)
+    
+    # Step 6: Verify unnormalize is reversible
+    gt_renorm = lit_model.normalize(gt_unnorm)
+    diff = (gt_norm - gt_renorm).abs().max().item()
+    print(f"\n[Step 6] Verify normalize/unnormalize reversible:")
+    print(f"  Max diff after round-trip: {diff:.10f}")
+    if diff < 1e-5:
+        print("  ✅ normalize/unnormalize is reversible!")
+    else:
+        print("  ⚠️ WARNING: normalize/unnormalize has precision loss!")
+    
+    # Step 7: Save poses (NO scaling, NO shifting - just format conversion)
+    print("\n[Step 7] Saving poses (minimal processing)...")
+    
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -230,214 +281,51 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # GT: Directly from ref pose (original pixel space, correct motion)
-    T_pred = future_len
-    T_ref_total = ref_pose.body.data.shape[0]
-    future_start = max(0, T_ref_total - T_pred)
-    
-    gt_pose_data = ref_pose.body.data[future_start:future_start+T_pred].copy()
-    gt_conf = ref_pose.body.confidence[future_start:future_start+T_pred].copy()
-    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_pose_data, confidence=gt_conf)
-    gt_pose = Pose(header=ref_pose.header, body=gt_body)
+    # 使用最简单的转换，不做任何scale或shift
+    gt_pose = simple_tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+    pred_pose = simple_tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
     
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
-    
-    # Pred: unnormalize then scale to ref's variance for visualization
-    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
-    pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, 
-                               gt_btjc=pred_raw_for_pose,  # Use pred itself for variance calc
-                               align_mode='scale_and_center')  # Scale to ref's variance
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
-
-    # Pixel space metrics
-    gt_data = gt_pose.body.data[:, 0, :, :]
-    pred_data = pred_pose.body.data[:, 0, :, :]
-    pixel_mpjpe = np.sqrt(((gt_data - pred_data) ** 2).sum(-1)).mean()
-
-    results = {
-        'version': version,
-        'mse': mse,
-        'mpjpe': mpjpe,
-        'pck_01': pck_01,
-        'disp_ratio': disp_ratio,
-        'disp_pred': disp_pred,
-        'disp_gt': disp_gt,
-        'pixel_mpjpe': pixel_mpjpe,
-        'out_dir': out_dir,
-    }
-
-    print(f"\n{version_names.get(version, version)} Results:")
-    print(f"  MSE: {mse:.6f}")
+    
+    # Step 8: Verify saved poses
+    print("\n[Step 8] Verify saved poses:")
+    gt_saved = gt_pose.body.data[:, 0, :, :]
+    pred_saved = pred_pose.body.data[:, 0, :, :]
+    
+    print_tensor_stats("gt_pose (saved)", gt_saved)
+    print_tensor_stats("pred_pose (saved)", pred_saved)
+    
+    # Compare GT and pred in pose file
+    pose_diff = np.abs(gt_saved - pred_saved).mean()
+    print(f"\n  Mean diff between gt and pred pose: {pose_diff:.4f}")
+    
+    # Final summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"\nNormalized space metrics (for paper):")
+    print(f"  Disp Ratio: {disp_ratio:.4f} (should be ~1.0)")
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
-    print(f"  Disp Ratio: {disp_ratio:.4f}")
-    print(f"  Pixel MPJPE: {pixel_mpjpe:.2f}px")
-    print(f"  Saved to: {out_dir}/")
-
-    return results
-
-
-def print_comparison_table(results_list):
-    """Print comparison table for all tested versions."""
-    print("\n" + "=" * 80)
-    print("COMPARISON TABLE - V2 VARIANTS")
-    print("=" * 80)
     
-    version_names = {
-        'baseline': 'V2-Baseline',
-        'with_pos': 'V2+PosEnc',
-        'with_timestep': 'V2+TimeEmb',
-        'improved': 'V2+Both'
+    print(f"\nPose files saved to: {out_dir}/")
+    print(f"  - gt.pose: GT from dataloader (帧区间由dataloader决定)")
+    print(f"  - pred.pose: Model prediction (同样的帧区间)")
+    
+    print("\n" + "=" * 70)
+    print("✅ CLEAN TEST COMPLETE!")
+    print("=" * 70)
+    
+    return {
+        'disp_ratio': disp_ratio,
+        'mpjpe': mpjpe,
+        'pck_01': pck_01,
     }
-    
-    print(f"\n{'Version':<20} {'Disp Ratio':<12} {'MPJPE':<10} {'PCK@0.1':<10}")
-    print("-" * 80)
-    
-    for r in results_list:
-        vname = version_names.get(r['version'], r['version'])
-        print(f"{vname:<20} {r['disp_ratio']:<12.4f} {r['mpjpe']:<10.6f} {r['pck_01']:<10.1f}")
-    
-    # Analysis
-    print("\n" + "=" * 80)
-    print("ANALYSIS")
-    print("=" * 80)
-    
-    baseline = next((r for r in results_list if r['version'] == 'baseline'), None)
-    if baseline:
-        print(f"\nBaseline (V2 current):")
-        print(f"  Disp Ratio: {baseline['disp_ratio']:.4f}")
-        print(f"  MPJPE: {baseline['mpjpe']:.6f}")
-        print(f"  PCK@0.1: {baseline['pck_01']:.1f}%")
-        
-        for r in results_list:
-            if r['version'] != 'baseline':
-                vname = version_names.get(r['version'], r['version'])
-                mpjpe_improve = (baseline['mpjpe'] - r['mpjpe']) / baseline['mpjpe'] * 100
-                pck_improve = r['pck_01'] - baseline['pck_01']
-                
-                print(f"\n{vname}:")
-                print(f"  MPJPE: {mpjpe_improve:+.1f}% change")
-                print(f"  PCK@0.1: {pck_improve:+.1f}% change")
-                print(f"  Disp Ratio: {r['disp_ratio']:.4f} (should stay ~1.0)")
-    
-    # Recommendations
-    print("\n" + "=" * 80)
-    print("RECOMMENDATIONS")
-    print("=" * 80)
-    
-    best_mpjpe = min(results_list, key=lambda x: x['mpjpe'])
-    best_pck = max(results_list, key=lambda x: x['pck_01'])
-    
-    print(f"\nBest MPJPE: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
-    print(f"Best PCK@0.1: {version_names.get(best_pck['version'], best_pck['version'])}")
-    
-    if best_mpjpe['version'] == best_pck['version']:
-        print(f"\n✅ Clear winner: {version_names.get(best_mpjpe['version'], best_mpjpe['version'])}")
-    else:
-        print(f"\n💡 Trade-off between MPJPE and PCK - test on larger dataset")
 
 
 if __name__ == "__main__":
-    # ========================================
-    # AUTO MODE - No arguments needed!
-    # Tests all 4 variants: baseline, with_pos, with_timestep, improved
-    # ========================================
-    
     pl.seed_everything(42)
-
-    # Configuration
-    data_dir = "/home/yayun/data/pose_data/"
-    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    
-    NUM_SAMPLES = 4
-    MAX_EPOCHS = 500  # Fixed: 500 epochs
-    BATCH_SIZE = 4
-
-    print("=" * 70)
-    print("V2 ABLATION STUDY - AUTO MODE")
-    print("=" * 70)
-    print("\nWill test all 4 V2 variants:")
-    print("  1. baseline (no CAMDM components)")
-    print("  2. with_pos (only PositionalEncoding)")
-    print("  3. with_timestep (only TimestepEmbedder)")
-    print("  4. improved (both components)")
-    print(f"\nSettings: {NUM_SAMPLES} samples, {MAX_EPOCHS} epochs each")
-    print("=" * 70)
-
-    # Dataset
-    base_ds = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
-    )
-
-    class SubsetDataset(torch.utils.data.Dataset):
-        def __init__(self, base, indices):
-            self.samples = [base[i] for i in indices]
-        def __len__(self):
-            return len(self.samples)
-        def __getitem__(self, idx):
-            return self.samples[idx]
-
-    train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=zero_pad_collator)
-
-    # Get dimensions
-    sample = train_ds[0]["data"]
-    if hasattr(sample, 'zero_filled'):
-        sample = sample.zero_filled()
-    if hasattr(sample, 'tensor'):
-        sample = sample.tensor
-    num_joints = sample.shape[-2]
-    num_dims = sample.shape[-1]
-    future_len = sample.shape[0]
-
-    print(f"\nDataset: {NUM_SAMPLES} samples, J={num_joints}, D={num_dims}, T={future_len}")
-    print(f"Max epochs: {MAX_EPOCHS}")
-
-    # ========================================
-    # QUICK TEST: only improved version
-    # ========================================
-    versions = ['improved']
-    
-    print("\n🔬 Quick test: improved version only")
-    print(f"\n⏱️  Estimated time: {MAX_EPOCHS} epochs")
-    
-    results_list = []
-    for idx, version in enumerate(versions):
-        print(f"\n{'=' * 70}")
-        print(f"Testing {version.upper()} ({idx+1}/{len(versions)})")
-        print(f"{'=' * 70}")
-        
-        try:
-            result = test_v2_version(
-                version, train_ds, train_loader, num_joints, num_dims, future_len,
-                stats_path, data_dir, base_ds, MAX_EPOCHS
-            )
-            results_list.append(result)
-        except Exception as e:
-            print(f"\n❌ Version {version} failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Print comparison
-    if len(results_list) > 1:
-        print_comparison_table(results_list)
-    
-    print("\n" + "=" * 70)
-    print("🎉 ABLATION STUDY COMPLETE!")
-    print("=" * 70)
-    print("\n📊 Tested versions:")
-    for r in results_list:
-        print(f"  ✓ {r['version']}: disp_ratio={r['disp_ratio']:.4f}, MPJPE={r['mpjpe']:.6f}, PCK@0.1={r['pck_01']:.1f}%")
-    print("\n💡 Next Steps:")
-    print("  - Create ablation table for paper")
-    print("  - Compare pose files visually")
-    print("  - Scale to 100 samples for validation")
-    print("=" * 70)
+    test_improved_clean()
