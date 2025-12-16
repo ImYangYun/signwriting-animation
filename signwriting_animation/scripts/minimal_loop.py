@@ -28,8 +28,20 @@ from pose_anonymization.data.normalization import unshift_hands
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 
 
-def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
-    """Convert normalized tensor predictions back to pose format."""
+def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, align_mode='center_only'):
+    """
+    Convert tensor predictions to pose format.
+    
+    Args:
+        t_btjc: Tensor in BTJC format
+        header: Pose header
+        ref_pose: Reference pose for alignment
+        gt_btjc: Optional GT for scale reference
+        align_mode: How to align pred to ref space
+            - 'center_only': Only translate to ref center (preserves motion scale)
+            - 'scale_and_center': Scale to ref variance then center (may distort motion)
+            - 'none': No alignment
+    """
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
@@ -52,12 +64,15 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
     
     unshift_hands(pose_obj)
     
+    # Get reference for alignment
     T_pred = pose_obj.body.data.shape[0]
     T_ref_total = ref_pose.body.data.shape[0]
     future_start = max(0, T_ref_total - T_pred)
     ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
     
-    if apply_scale and gt_np is not None:
+    # Alignment based on mode
+    if align_mode == 'scale_and_center' and gt_np is not None:
+        # Original behavior: scale to match ref variance
         def _var(a):
             center = a.mean(axis=1, keepdims=True)
             return float(((a - center) ** 2).mean())
@@ -68,12 +83,14 @@ def tensor_to_pose(t_btjc, header, ref_pose, gt_btjc=None, apply_scale=True):
         if var_gt_norm > 1e-8:
             scale = np.sqrt(var_ref / var_gt_norm)
             pose_obj.body.data *= scale
-
-    pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
-    ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
-    pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
-    delta = ref_c - pred_c
-    pose_obj.body.data += delta
+    
+    if align_mode in ['center_only', 'scale_and_center']:
+        # Center alignment: move to ref's center position
+        pred_arr = np.asarray(pose_obj.body.data[:T_pred, 0], dtype=np.float32)
+        ref_c = ref_arr.reshape(-1, 3).mean(axis=0)
+        pred_c = pred_arr.reshape(-1, 3).mean(axis=0)
+        delta = ref_c - pred_c
+        pose_obj.body.data += delta
     
     return pose_obj
 
@@ -202,7 +219,7 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
         # For pose files, unnormalize to real space
         pred_raw_for_pose = lit_model.unnormalize(pred_norm)
 
-    # Save poses
+    # Save poses - GT and pred from same pipeline, only center alignment
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
@@ -213,25 +230,21 @@ def test_v2_version(version, train_ds, train_loader, num_joints, num_dims, futur
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
     
-    # GT: Use ORIGINAL ref pose directly (no normalize→unnormalize!)
-    # This preserves the true motion from the dataset
-    T_pred = future_len
-    T_ref_total = ref_pose.body.data.shape[0]
-    future_start = max(0, T_ref_total - T_pred)
+    # GT and pred: Same processing pipeline
+    # Both from dataloader → normalize → unnormalize
+    gt_raw_for_pose = lit_model.unnormalize(gt_norm)
+    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
     
-    gt_pose_data = ref_pose.body.data[future_start:future_start+T_pred].copy()
-    gt_conf = ref_pose.body.confidence[future_start:future_start+T_pred].copy()
-    gt_body = NumPyPoseBody(fps=ref_pose.body.fps, data=gt_pose_data, confidence=gt_conf)
-    gt_pose = Pose(header=ref_pose.header, body=gt_body)
-    
+    # Only center alignment - NO scaling to preserve motion authenticity
+    gt_pose = tensor_to_pose(gt_raw_for_pose, ref_pose.header, ref_pose, 
+                             gt_btjc=None,
+                             align_mode='center_only')  # Only translate, no scale
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     
-    # Pred: unnormalize then apply scale using itself as reference
-    pred_raw_for_pose = lit_model.unnormalize(pred_norm)
     pred_pose = tensor_to_pose(pred_raw_for_pose, ref_pose.header, ref_pose, 
-                               gt_btjc=pred_raw_for_pose,  # Use pred itself
-                               apply_scale=True)            # Enable scaling
+                               gt_btjc=None,
+                               align_mode='center_only')  # Only translate, no scale
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
 
