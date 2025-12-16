@@ -402,16 +402,12 @@ if __name__ == "__main__":
     print(f"Max epochs: {MAX_EPOCHS}")
 
     # ========================================
-    # AUTO TEST: all 4 versions for complete ablation
+    # QUICK TEST: only improved version
     # ========================================
-    versions = ['baseline', 'with_pos', 'with_timestep', 'improved']
+    versions = ['improved']
     
-    print("\n🔬 Testing all 4 V2 variants:")
-    print("   1. baseline (no CAMDM components)")
-    print("   2. with_pos (only PositionalEncoding)")
-    print("   3. with_timestep (only TimestepEmbedder)")
-    print("   4. improved (both components)")
-    print(f"\n⏱️  Estimated time: {MAX_EPOCHS * 4} epochs total")
+    print("\n🔬 Quick test: improved version only")
+    print(f"\n⏱️  Estimated time: {MAX_EPOCHS} epochs")
     
     results_list = []
     for idx, version in enumerate(versions):
