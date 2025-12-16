@@ -56,6 +56,8 @@ def simple_tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
         ref_pose: Reference pose
         scale_to_ref: If True, scale data to match ref pose's variance
     """
+    from pose_anonymization.data.normalization import unshift_hands
+    
     if t_btjc.dim() == 4:
         t = t_btjc[0]  # [T, J, C]
     else:
@@ -63,41 +65,47 @@ def simple_tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
-    # 获取ref pose的future部分作为参考
-    T_pred = t_np.shape[0]
-    T_ref_total = ref_pose.body.data.shape[0]
-    future_start = max(0, T_ref_total - T_pred)
-    ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-    
-    if scale_to_ref:
-        # 计算variance
-        def _var(a):
-            center = a.mean(axis=(0, 1), keepdims=True)
-            return float(((a - center) ** 2).mean())
-        
-        var_input = _var(t_np)
-        var_ref = _var(ref_arr)
-        
-        if var_input > 1e-8:
-            scale = np.sqrt(var_ref / var_input)
-            t_np = t_np * scale
-            print(f"    Scale applied: {scale:.2f} (var_input={var_input:.4f}, var_ref={var_ref:.2f})")
-        
-        # Center alignment
-        input_center = t_np.reshape(-1, 3).mean(axis=0)
-        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
-        t_np = t_np + (ref_center - input_center)
-        print(f"    Center aligned to: {ref_center}")
-    
-    # 格式转换
+    # 先创建pose对象
     arr = t_np[:, None, :, :]  # [T, 1, J, C]
-    
     T = arr.shape[0]
     conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
     fps = ref_pose.body.fps
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
+    
+    # 先unshift手部（在scale之前！）
+    unshift_hands(pose_obj)
+    
+    # 然后再scale
+    if scale_to_ref:
+        # 获取ref pose的future部分作为参考
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
+        future_start = max(0, T_ref_total - T_pred)
+        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
+        
+        # 计算variance
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        # 用unshift后的数据计算variance
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+            print(f"    Scale applied: {scale:.2f} (var_input={var_input:.4f}, var_ref={var_ref:.2f})")
+        
+        # Center alignment
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+        print(f"    Center aligned to: {ref_center}")
     
     return pose_obj
 
