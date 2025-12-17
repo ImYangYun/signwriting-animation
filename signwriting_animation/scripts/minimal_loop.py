@@ -125,7 +125,7 @@ def train_full_dataset():
         shuffle=True, 
         collate_fn=zero_pad_collator,
         num_workers=4,      # ← Parallel data loading
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,  # ← Keep workers alive between epochs
     )
 
