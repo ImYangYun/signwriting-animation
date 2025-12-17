@@ -155,10 +155,10 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
 
 class _ConditionalWrapper(nn.Module):
     """
-    Wrapper to adapt V2 model interface for GaussianDiffusion.
+    Wrapper to adapt model interface for GaussianDiffusion.
     
     GaussianDiffusion expects: model(x, t) -> output
-    V2 model expects: model(x, t, past, sign_img) -> output
+    model expects: model(x, t, past, sign_img) -> output
     
     This wrapper fixes the conditions and provides the expected interface.
     """
@@ -176,14 +176,7 @@ class _ConditionalWrapper(nn.Module):
 
 class LitDiffusion(pl.LightningModule):
     """
-    PyTorch Lightning module for V2 diffusion training.
-    
-    Handles the complete training pipeline:
-    - Data normalization using precomputed statistics
-    - Diffusion forward process (adding noise)
-    - Model training with MSE + velocity + acceleration losses
-    - DDPM sampling for inference
-    - Comprehensive metrics logging
+    PyTorch Lightning module for diffusion training.
     
     Args:
         num_keypoints: Number of pose keypoints (default: 178 for holistic)
@@ -224,7 +217,6 @@ class LitDiffusion(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # Initialize V2 model (frame-independent decoder)
         self.model = SignWritingToPoseDiffusion(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
@@ -265,7 +257,7 @@ class LitDiffusion(pl.LightningModule):
 
     def training_step(self, batch: dict, _batch_idx: int) -> torch.Tensor:
         """
-        Single training step for V2 diffusion model.
+        Single training step for diffusion model.
         
         Implements the diffusion training objective:
         1. Sample random timestep t
@@ -335,7 +327,7 @@ class LitDiffusion(pl.LightningModule):
         # Debug logging
         if debug:
             print("\n" + "=" * 70)
-            print(f"TRAINING STEP {self._step_count} (V2 - Frame-Independent)")
+            print(f"TRAINING STEP {self._step_count} (Frame-Independent)")
             print("=" * 70)
             print(f"  t range: [{timestep.min().item()}, {timestep.max().item()}]")
             print(f"  loss_mse: {loss_mse.item():.6f}")
@@ -420,13 +412,13 @@ class LitDiffusion(pl.LightningModule):
         try:
             import matplotlib.pyplot as plt
 
-            out_dir = "logs/diffusion_v2"
+            out_dir = "logs/diffusion"
             os.makedirs(out_dir, exist_ok=True)
 
             _, axes = plt.subplots(2, 2, figsize=(10, 8))
 
             axes[0, 0].plot(self.train_logs["loss"])
-            axes[0, 0].set_title("Total Loss (V2 - Frame-Independent)")
+            axes[0, 0].set_title("Total Loss")
 
             axes[0, 1].plot(self.train_logs["mse"])
             axes[0, 1].set_title("MSE Loss")

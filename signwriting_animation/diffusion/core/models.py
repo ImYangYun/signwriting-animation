@@ -108,13 +108,7 @@ class ContextEncoder(nn.Module):
 
 class SignWritingToPoseDiffusion(nn.Module):
     """
-    V2 Diffusion Model: Frame-Independent Decoder with CAMDM Components.
-    
-    Key innovations:
-    1. Frame-independent decoding: Each output frame is decoded separately
-       using global context, avoiding error accumulation from autoregression.
-    2. PositionalEncoding: Better temporal modeling in context encoder.
-    3. TimestepEmbedder: Better diffusion timestep representation.
+    Diffusion Model: Frame-Independent Decoder with CAMDM Components.
     
     Architecture:
     - ContextEncoder: Encodes past motion with PositionalEncoding
@@ -189,11 +183,6 @@ class SignWritingToPoseDiffusion(nn.Module):
             nn.GELU(),
             nn.Linear(512, input_feats),
         )
-
-        print(f"✓ SignWritingToPoseDiffusionV2 initialized")
-        print(f"  - Frame-independent decoding")
-        print(f"  - PositionalEncoding in ContextEncoder")
-        print(f"  - CAMDM TimestepEmbedder")
 
     def forward(self,
                 x: torch.Tensor,
