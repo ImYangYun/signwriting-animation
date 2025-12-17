@@ -12,7 +12,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
+from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
 from signwriting_animation.diffusion.lightning_module import (
     LitDiffusion, sanitize_btjc, mean_frame_disp
 )
@@ -22,37 +22,26 @@ def tensor_to_pose(t_btjc: torch.Tensor,
                    header, 
                    ref_pose: Pose, 
                    scale_to_ref: bool = True) -> Pose:
-    """
-    Convert tensor prediction to Pose format for visualization.
-    
-    Args:
-        t_btjc: Tensor [B, T, J, C] in normalized space
-        header: Pose header with component definitions
-        ref_pose: Reference pose for scaling and alignment
-        scale_to_ref: Whether to scale to reference variance
-        
-    Returns:
-        Pose object ready for visualization
-    """
+    """Convert tensor prediction to Pose format for visualization."""
     if t_btjc.dim() == 4:
         t = t_btjc[0]
     else:
         t = t_btjc
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
-
+    
     # Create pose object
     arr = t_np[:, None, :, :]
     T = arr.shape[0]
     conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
     fps = ref_pose.body.fps
-
+    
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-
+    
     # Fix hand positions (must be before scaling!)
     unshift_hands(pose_obj)
-
+    
     if scale_to_ref:
         # Get reference data
         T_pred = t_np.shape[0]
@@ -62,51 +51,55 @@ def tensor_to_pose(t_btjc: torch.Tensor,
             ref_pose.body.data[future_start:future_start+T_pred, 0], 
             dtype=np.float32
         )
-
+        
         # Scale to reference variance
         def _var(a):
             center = a.mean(axis=(0, 1), keepdims=True)
             return float(((a - center) ** 2).mean())
-
+        
         pose_data = pose_obj.body.data[:, 0, :, :]
         var_input = _var(pose_data)
         var_ref = _var(ref_arr)
-
+        
         if var_input > 1e-8:
             scale = np.sqrt(var_ref / var_input)
             pose_obj.body.data = pose_obj.body.data * scale
-
+        
         # Align center
         pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
         input_center = pose_data.mean(axis=0)
         ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
         pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
-
+    
     return pose_obj
 
 
-def train_minimal():
-    """
-    Train model on 4 samples for quick validation.
-    """
+def train_100_samples():
+    """Train V2 model on 100 samples for generalization validation."""
     pl.seed_everything(42)
-
+    
     # === Configuration ===
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/minimal"
-
-    NUM_SAMPLES = 4
-    MAX_EPOCHS = 500
-    BATCH_SIZE = 4
-
+    out_dir = "logs/v2_100samples"
+    
+    NUM_SAMPLES = 100
+    MAX_EPOCHS = 300  # Less epochs than overfit test
+    BATCH_SIZE = 16   # Larger batch for 100 samples
+    
     os.makedirs(out_dir, exist_ok=True)
-
+    
     print("=" * 70)
-    print("4 SAMPLE MINIMAL TRAINING")
+    print("V2 MODEL - 100 SAMPLE VALIDATION")
     print("=" * 70)
-
+    print(f"\nDataset: {NUM_SAMPLES} samples")
+    print(f"Epochs: {MAX_EPOCHS}")
+    print(f"Batch Size: {BATCH_SIZE}")
+    print(f"Output: {out_dir}/")
+    print("\nThis will take 2-4 hours depending on GPU.")
+    print("=" * 70)
+    
     # === Dataset ===
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
@@ -116,7 +109,7 @@ def train_minimal():
         with_metadata=True,
         split="train",
     )
-
+    
     class SubsetDataset(torch.utils.data.Dataset):
         def __init__(self, base, indices):
             self.samples = [base[i] for i in indices]
@@ -124,7 +117,7 @@ def train_minimal():
             return len(self.samples)
         def __getitem__(self, idx):
             return self.samples[idx]
-
+    
     train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
     train_loader = DataLoader(
         train_ds, 
@@ -132,7 +125,7 @@ def train_minimal():
         shuffle=True, 
         collate_fn=zero_pad_collator
     )
-
+    
     # Get dimensions
     sample = train_ds[0]["data"]
     if hasattr(sample, 'zero_filled'):
@@ -142,19 +135,17 @@ def train_minimal():
     num_joints = sample.shape[-2]
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
-
-    print(f"\nDataset: {NUM_SAMPLES} samples")
-    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
-    print(f"Epochs: {MAX_EPOCHS}")
-
+    
+    print(f"\nDimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    
     # === Create Model ===
-    model = SignWritingToPoseDiffusion(
+    model = SignWritingToPoseDiffusionV2(
         num_keypoints=num_joints,
         num_dims_per_keypoint=num_dims,
         t_past=40,
         t_future=future_len,
     )
-
+    
     lit_model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
@@ -166,48 +157,59 @@ def train_minimal():
         t_future=future_len,
     )
     lit_model.model = model
-
+    
     # === Train ===
+    print(f"\n{'='*70}")
+    print("STARTING TRAINING...")
+    print("="*70)
+    
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        enable_checkpointing=False,
+        enable_checkpointing=True,
+        default_root_dir=out_dir,
         logger=False,
-        enable_progress_bar=False,
+        enable_progress_bar=True,  # Show progress for overnight run
     )
     trainer.fit(lit_model, train_loader)
-
-    # === Inference ===
+    
+    print(f"\n{'='*70}")
+    print("TRAINING COMPLETE!")
+    print("="*70)
+    
+    # === Inference on First Sample ===
+    print("\nGenerating prediction for first sample...")
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lit_model = lit_model.to(device)
     lit_model.eval()
-
+    
     test_batch = zero_pad_collator([train_ds[0]])
     cond = test_batch["conditions"]
-
+    
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
     sign = cond["sign_image"][:1].float().to(device)
     gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
-
+    
     past_norm = lit_model.normalize(past_raw)
     gt_norm = lit_model.normalize(gt_raw)
-
+    
     # DDPM sampling
     with torch.no_grad():
         past_bjct = lit_model.btjc_to_bjct(past_norm)
         B, J, C, _ = past_bjct.shape
         target_shape = (B, J, C, future_len)
-
+        
         class _Wrapper(torch.nn.Module):
             def __init__(self, model, past, sign):
                 super().__init__()
                 self.model, self.past, self.sign = model, past, sign
             def forward(self, x, t, **kwargs):
                 return self.model(x, t, self.past, self.sign)
-
+        
         wrapped = _Wrapper(lit_model.model, past_bjct, sign)
-
+        
         pred_bjct = lit_model.diffusion.p_sample_loop(
             model=wrapped,
             shape=target_shape,
@@ -216,53 +218,62 @@ def train_minimal():
             progress=False,
         )
         pred_norm = lit_model.bjct_to_btjc(pred_bjct)
-
-    # === Metrics ===
+    
+    # === Compute Metrics ===
     mse = F.mse_loss(pred_norm, gt_norm).item()
     disp_pred = mean_frame_disp(pred_norm)
     disp_gt = mean_frame_disp(gt_norm)
     disp_ratio = disp_pred / (disp_gt + 1e-8)
-
+    
     pred_np = pred_norm[0].cpu().numpy()
     gt_np = gt_norm[0].cpu().numpy()
     per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
     mpjpe = per_joint_err.mean()
     pck_01 = (per_joint_err < 0.1).mean() * 100
-
+    
     print("\n" + "=" * 70)
-    print("RESULTS")
+    print("RESULTS (Sample 0)")
     print("=" * 70)
     print(f"  Disp Ratio: {disp_ratio:.4f} (ideal = 1.0)")
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
     print(f"  MSE: {mse:.6f}")
-
+    
     # === Save Poses ===
     ref_path = base_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
-
+    
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
     ref_pose = reduce_holistic(ref_pose)
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-
+    
     gt_unnorm = lit_model.unnormalize(gt_norm)
     pred_unnorm = lit_model.unnormalize(pred_norm)
-
+    
     gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
     pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
-
+    
     with open(f"{out_dir}/gt.pose", "wb") as f:
         gt_pose.write(f)
     with open(f"{out_dir}/pred.pose", "wb") as f:
         pred_pose.write(f)
-
+    
     print(f"\nPose files saved to: {out_dir}/")
+    print("Training curve saved to: {out_dir}/train_curve.png")
+    
+    print("\n" + "=" * 70)
+    print("✅ 100-SAMPLE VALIDATION COMPLETE!")
     print("=" * 70)
-    print("✅ TRAINING COMPLETE!")
+    print("\nNext Steps:")
+    print("  1. Check training curves in logs/v2_100samples/")
+    print("  2. Compare results with 4-sample overfit test")
+    print("  3. If disp_ratio ≈ 1.0, proceed to full dataset")
+    print("  4. If results degrade significantly, consider architecture tuning")
     print("=" * 70)
+
 
 if __name__ == "__main__":
-    train_minimal()
+    train_100_samples()
