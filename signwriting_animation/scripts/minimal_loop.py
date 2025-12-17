@@ -87,7 +87,7 @@ def train_full_dataset():
 
     # Full dataset settings (CHANGED from 100-sample)
     MAX_EPOCHS = 50      # ← Reduced from 300 (more data = fewer epochs needed)
-    BATCH_SIZE =128       # ← Increased from 16 (can handle larger batches)
+    BATCH_SIZE =100       # ← Increased from 16 (can handle larger batches)
     LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
 
     os.makedirs(out_dir, exist_ok=True)
