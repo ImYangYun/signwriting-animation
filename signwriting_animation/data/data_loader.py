@@ -55,7 +55,7 @@ class DynamicPosePredictionDataset(Dataset):
         split: Data split to use ('train', 'dev', or 'test')
         use_reduce_holistic: Whether to reduce keypoints to 178 (default: True)
     """
-    
+
     def __init__(
         self,
         data_dir: str,
@@ -195,7 +195,7 @@ class DynamicPosePredictionDataset(Dataset):
                 "orig_end": end or total_frames,
             }
             sample["metadata"] = {
-                k: torch.tensor([int(v)], dtype=torch.long) 
+                k: torch.tensor([int(v)], dtype=torch.long)
                 for k, v in meta.items()
             }
 

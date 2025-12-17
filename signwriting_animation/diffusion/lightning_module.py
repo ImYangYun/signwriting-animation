@@ -4,6 +4,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import lightning as pl
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import (
@@ -398,10 +401,6 @@ class LitDiffusion(pl.LightningModule):
         pred_btjc = self.bjct_to_btjc(pred_bjct)
         return self.unnormalize(pred_btjc)
 
-    def on_train_start(self):
-        """Move normalization buffers to correct device before training."""
-        self.mean_pose = self.mean_pose.to(self.device)
-        self.std_pose = self.std_pose.to(self.device)
 
     def configure_optimizers(self):
         """Configure AdamW optimizer."""
@@ -409,30 +408,24 @@ class LitDiffusion(pl.LightningModule):
 
     def on_train_end(self):
         """Save training curves after training completes."""
-        try:
-            import matplotlib.pyplot as plt
+        out_dir = "logs/diffusion"
+        os.makedirs(out_dir, exist_ok=True)
 
-            out_dir = "logs/diffusion"
-            os.makedirs(out_dir, exist_ok=True)
+        _, axes = plt.subplots(2, 2, figsize=(10, 8))
 
-            _, axes = plt.subplots(2, 2, figsize=(10, 8))
+        axes[0, 0].plot(self.train_logs["loss"])
+        axes[0, 0].set_title("Total Loss")
 
-            axes[0, 0].plot(self.train_logs["loss"])
-            axes[0, 0].set_title("Total Loss")
+        axes[0, 1].plot(self.train_logs["mse"])
+        axes[0, 1].set_title("MSE Loss")
 
-            axes[0, 1].plot(self.train_logs["mse"])
-            axes[0, 1].set_title("MSE Loss")
+        axes[1, 0].plot(self.train_logs["vel"])
+        axes[1, 0].set_title("Velocity Loss")
 
-            axes[1, 0].plot(self.train_logs["vel"])
-            axes[1, 0].set_title("Velocity Loss")
+        axes[1, 1].plot(self.train_logs["disp_ratio"])
+        axes[1, 1].set_title("Displacement Ratio (ideal=1.0)")
+        axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5)
 
-            axes[1, 1].plot(self.train_logs["disp_ratio"])
-            axes[1, 1].set_title("Displacement Ratio (ideal=1.0)")
-            axes[1, 1].axhline(y=1.0, color='r', linestyle='--', alpha=0.5)
-
-            plt.tight_layout()
-            plt.savefig(f"{out_dir}/train_curve.png")
-            print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
-
-        except Exception as error:
-            print(f"[TRAIN CURVE] failed: {error}")
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/train_curve.png")
+        print(f"[TRAIN CURVE] saved to {out_dir}/train_curve.png")
