@@ -87,7 +87,7 @@ def tensor_to_pose(t_btjc: torch.Tensor,
 
 def train_minimal():
     """
-    Train V2 improved model on 4 samples for quick validation.
+    Train model on 4 samples for quick validation.
     """
     pl.seed_everything(42)
 
