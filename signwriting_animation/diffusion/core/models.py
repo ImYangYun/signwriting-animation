@@ -135,7 +135,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         )
 
         # === Output Positional Embeddings ===
-        self.output_pos_embed = nn.Embedding(t_future, num_latent_dims)
+        self.output_pos_embed = nn.Embedding(512, num_latent_dims)
 
         # === Frame Decoder ===
         decoder_input_dim = num_latent_dims * 3  # context + xt_emb + pos_emb
