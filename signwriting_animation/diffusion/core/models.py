@@ -5,43 +5,6 @@ from transformers import CLIPModel
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder
 
 
-class EmbedSignWriting(nn.Module):
-    """
-    SignWriting image encoder using CLIP vision model.
-    
-    Encodes SignWriting symbol images into latent embeddings that
-    condition the diffusion model on the target sign to generate.
-    
-    Args:
-        num_latent_dims: Output embedding dimension
-        embedding_arch: CLIP model architecture to use
-    """
-    
-    def __init__(self, num_latent_dims: int, embedding_arch: str = 'openai/clip-vit-base-patch32'):
-        super().__init__()
-        self.model = CLIPModel.from_pretrained(embedding_arch)
-        self.proj = None
-
-        # Project to target dimension if needed
-        if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
-            self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
-
-    def forward(self, image_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Encode SignWriting images to embeddings.
-        
-        Args:
-            image_batch: Input images [B, 3, H, W]
-            
-        Returns:
-            Embeddings [B, D]
-        """
-        embeddings_batch = self.model.get_image_features(pixel_values=image_batch)
-        if self.proj is not None:
-            embeddings_batch = self.proj(embeddings_batch)
-        return embeddings_batch
-
-
 class ContextEncoder(nn.Module):
     """
     Past motion context encoder with PositionalEncoding.
@@ -258,3 +221,40 @@ class SignWritingToPoseDiffusion(nn.Module):
             past_motion = past_motion * keep_batch_idx.view((batch_size, 1, 1, 1))
 
         return self.forward(x, timesteps, past_motion, signwriting_image)
+
+
+class EmbedSignWriting(nn.Module):
+    """
+    SignWriting image encoder using CLIP vision model.
+    
+    Encodes SignWriting symbol images into latent embeddings that
+    condition the diffusion model on the target sign to generate.
+    
+    Args:
+        num_latent_dims: Output embedding dimension
+        embedding_arch: CLIP model architecture to use
+    """
+    
+    def __init__(self, num_latent_dims: int, embedding_arch: str = 'openai/clip-vit-base-patch32'):
+        super().__init__()
+        self.model = CLIPModel.from_pretrained(embedding_arch)
+        self.proj = None
+
+        # Project to target dimension if needed
+        if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
+            self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
+
+    def forward(self, image_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Encode SignWriting images to embeddings.
+        
+        Args:
+            image_batch: Input images [B, 3, H, W]
+            
+        Returns:
+            Embeddings [B, D]
+        """
+        embeddings_batch = self.model.get_image_features(pixel_values=image_batch)
+        if self.proj is not None:
+            embeddings_batch = self.proj(embeddings_batch)
+        return embeddings_batch
