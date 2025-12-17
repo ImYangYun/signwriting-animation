@@ -1,3 +1,4 @@
+# pylint: disable=too-many-instance-attributes,too-many-arguments,too-many-locals
 import os
 import math
 import random
@@ -193,7 +194,7 @@ def main():
     data = batch["data"]
     if hasattr(data, "tensor"):
         data = data.tensor
-    print(f"\nData statistics:")
+    print("Data statistics:")
     print(f"  Min: {data.min().item():.4f}")
     print(f"  Max: {data.max().item():.4f}")
     print(f"  Mean: {data.mean().item():.4f}")

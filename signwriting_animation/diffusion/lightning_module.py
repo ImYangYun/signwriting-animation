@@ -1,3 +1,4 @@
+# pylint: disable=too-many-locals,too-many-instance-attributes,invalid-name
 import os
 import torch
 from torch import nn
@@ -168,7 +169,7 @@ class _ConditionalWrapper(nn.Module):
         self.past_bjct = past_bjct
         self.sign_img = sign_img
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Forward with fixed conditions."""
         return self.base_model(x, t, self.past_bjct, self.sign_img)
 
@@ -195,7 +196,7 @@ class LitDiffusion(pl.LightningModule):
         t_past: Number of past frames for conditioning
         t_future: Number of future frames to predict
     """
-    
+
     def __init__(
         self,
         num_keypoints: int = 178,
@@ -262,7 +263,7 @@ class LitDiffusion(pl.LightningModule):
         """Convert [B,J,C,T] to [B,T,J,C] format for output."""
         return x.permute(0, 3, 1, 2).contiguous()
 
-    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: dict, _batch_idx: int) -> torch.Tensor:
         """
         Single training step for V2 diffusion model.
         
@@ -422,7 +423,7 @@ class LitDiffusion(pl.LightningModule):
             out_dir = "logs/diffusion_v2"
             os.makedirs(out_dir, exist_ok=True)
 
-            fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+            _, axes = plt.subplots(2, 2, figsize=(10, 8))
 
             axes[0, 0].plot(self.train_logs["loss"])
             axes[0, 0].set_title("Total Loss (V2 - Frame-Independent)")
