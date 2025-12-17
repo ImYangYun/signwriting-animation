@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import lightning as pl
 from torch.utils.data import DataLoader
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
@@ -12,7 +13,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusionV2
+from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
 from signwriting_animation.diffusion.lightning_module import (
     LitDiffusion, sanitize_btjc, mean_frame_disp
 )
@@ -74,34 +75,39 @@ def tensor_to_pose(t_btjc: torch.Tensor,
     return pose_obj
 
 
-def train_100_samples():
-    """Train V2 model on 100 samples for generalization validation."""
+def train_full_dataset():
+    """Train model on full dataset."""
     pl.seed_everything(42)
-    
+
     # === Configuration ===
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/v2_100samples"
-    
-    NUM_SAMPLES = 100
-    MAX_EPOCHS = 300  # Less epochs than overfit test
-    BATCH_SIZE = 16   # Larger batch for 100 samples
-    
+    out_dir = "logs/full"
+
+    # Full dataset settings (CHANGED from 100-sample)
+    MAX_EPOCHS = 100      # ← Reduced from 300 (more data = fewer epochs needed)
+    BATCH_SIZE = 32       # ← Increased from 16 (can handle larger batches)
+    LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
+
     os.makedirs(out_dir, exist_ok=True)
-    
+
     print("=" * 70)
-    print("V2 MODEL - 100 SAMPLE VALIDATION")
+    print(" MODEL - FULL DATASET TRAINING")
     print("=" * 70)
-    print(f"\nDataset: {NUM_SAMPLES} samples")
-    print(f"Epochs: {MAX_EPOCHS}")
-    print(f"Batch Size: {BATCH_SIZE}")
-    print(f"Output: {out_dir}/")
-    print("\nThis will take 2-4 hours depending on GPU.")
+    print(f"\nConfiguration:")
+    print(f"  Dataset: FULL (all training samples)")
+    print(f"  Epochs: {MAX_EPOCHS}")
+    print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Output: {out_dir}/")
+    print(f"  GPU: {'Available ✓' if torch.cuda.is_available() else 'Not available ✗'}")
+    print("\nThis will take several hours to days depending on dataset size.")
     print("=" * 70)
-    
-    # === Dataset ===
-    base_ds = DynamicPosePredictionDataset(
+
+    # === Dataset (REMOVED SubsetDataset wrapper) ===
+    print("\nLoading full dataset...")
+    train_ds = DynamicPosePredictionDataset(  # ← Direct dataset, no subsetting
         data_dir=data_dir,
         csv_path=csv_path,
         num_past_frames=40,
@@ -109,23 +115,20 @@ def train_100_samples():
         with_metadata=True,
         split="train",
     )
-    
-    class SubsetDataset(torch.utils.data.Dataset):
-        def __init__(self, base, indices):
-            self.samples = [base[i] for i in indices]
-        def __len__(self):
-            return len(self.samples)
-        def __getitem__(self, idx):
-            return self.samples[idx]
-    
-    train_ds = SubsetDataset(base_ds, list(range(NUM_SAMPLES)))
+
+    print(f"Dataset loaded: {len(train_ds)} samples")
+
+    # DataLoader with optimizations for large dataset
     train_loader = DataLoader(
         train_ds, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
-        collate_fn=zero_pad_collator
+        collate_fn=zero_pad_collator,
+        num_workers=4,      # ← Parallel data loading
+        pin_memory=True,
+        persistent_workers=True,  # ← Keep workers alive between epochs
     )
-    
+
     # Get dimensions
     sample = train_ds[0]["data"]
     if hasattr(sample, 'zero_filled'):
@@ -135,28 +138,43 @@ def train_100_samples():
     num_joints = sample.shape[-2]
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
-    
-    print(f"\nDimensions: J={num_joints}, D={num_dims}, T={future_len}")
-    
+
+    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Batches per epoch: {len(train_loader)}")
+
     # === Create Model ===
-    model = SignWritingToPoseDiffusionV2(
+    print("\nInitializing model...")
+    model = SignWritingToPoseDiffusion(
         num_keypoints=num_joints,
         num_dims_per_keypoint=num_dims,
         t_past=40,
         t_future=future_len,
     )
-    
+
     lit_model = LitDiffusion(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=1e-3,
+        lr=LEARNING_RATE,  # ← Lower LR for stability
         diffusion_steps=8,
         vel_weight=1.0,
         t_past=40,
         t_future=future_len,
     )
     lit_model.model = model
+    
+    # === Callbacks (NEW) ===
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=f"{out_dir}/checkpoints",
+        filename="diffusion-{epoch:03d}-{train/disp_ratio:.4f}",
+        save_top_k=3,  # Keep best 3 checkpoints
+        monitor="train/disp_ratio",
+        mode="min",
+        save_last=True,  # Always save last checkpoint
+        every_n_epochs=5,  # Save every 5 epochs
+    )
+    
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
     
     # === Train ===
     print(f"\n{'='*70}")
@@ -167,19 +185,24 @@ def train_100_samples():
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        enable_checkpointing=True,
+        callbacks=[checkpoint_callback, lr_monitor],  # ← Added callbacks
         default_root_dir=out_dir,
-        logger=False,
-        enable_progress_bar=True,  # Show progress for overnight run
+        log_every_n_steps=50,  # ← Log more frequently
+        enable_progress_bar=True,
+        precision="16-mixed" if torch.cuda.is_available() else 32,  # ← Mixed precision for speed
     )
     trainer.fit(lit_model, train_loader)
     
     print(f"\n{'='*70}")
     print("TRAINING COMPLETE!")
     print("="*70)
+    print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
+    print(f"All checkpoints saved to: {out_dir}/checkpoints/")
     
-    # === Inference on First Sample ===
-    print("\nGenerating prediction for first sample...")
+    # === Inference Test on First Sample ===
+    print(f"\n{'='*70}")
+    print("TESTING INFERENCE ON SAMPLE 0...")
+    print("="*70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lit_model = lit_model.to(device)
@@ -231,16 +254,14 @@ def train_100_samples():
     mpjpe = per_joint_err.mean()
     pck_01 = (per_joint_err < 0.1).mean() * 100
     
-    print("\n" + "=" * 70)
-    print("RESULTS (Sample 0)")
-    print("=" * 70)
+    print("\nInference Test Results (Sample 0):")
     print(f"  Disp Ratio: {disp_ratio:.4f} (ideal = 1.0)")
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
     print(f"  MSE: {mse:.6f}")
     
-    # === Save Poses ===
-    ref_path = base_ds.records[0]["pose"]
+    # === Save Example Poses ===
+    ref_path = train_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
         ref_path = os.path.join(data_dir, ref_path)
     
@@ -256,24 +277,28 @@ def train_100_samples():
     gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
     pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
     
-    with open(f"{out_dir}/gt.pose", "wb") as f:
+    with open(f"{out_dir}/test_gt.pose", "wb") as f:
         gt_pose.write(f)
-    with open(f"{out_dir}/pred.pose", "wb") as f:
+    with open(f"{out_dir}/test_pred.pose", "wb") as f:
         pred_pose.write(f)
     
-    print(f"\nPose files saved to: {out_dir}/")
-    print("Training curve saved to: {out_dir}/train_curve.png")
+    print(f"\nTest pose files saved to: {out_dir}/")
+    print(f"Training curves saved to: {out_dir}/train_curve.png")
     
     print("\n" + "=" * 70)
-    print("✅ 100-SAMPLE VALIDATION COMPLETE!")
+    print("✅ FULL DATASET TRAINING COMPLETE!")
     print("=" * 70)
+    print("\nGenerated Files:")
+    print(f"  - Checkpoints: {out_dir}/checkpoints/")
+    print(f"  - Training curve: {out_dir}/train_curve.png")
+    print(f"  - Test poses: {out_dir}/test_gt.pose, test_pred.pose")
     print("\nNext Steps:")
-    print("  1. Check training curves in logs/v2_100samples/")
-    print("  2. Compare results with 4-sample overfit test")
-    print("  3. If disp_ratio ≈ 1.0, proceed to full dataset")
-    print("  4. If results degrade significantly, consider architecture tuning")
+    print("  1. Review training curves and metrics")
+    print("  2. Evaluate on test set")
+    print("  3. Generate predictions for qualitative analysis")
+    print("  4. Compare with baseline models")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    train_100_samples()
+    train_full_dataset()
