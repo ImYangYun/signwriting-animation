@@ -4,9 +4,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import lightning as pl
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    plt = None
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import (
@@ -258,6 +263,7 @@ class LitDiffusion(pl.LightningModule):
         """Convert [B,J,C,T] to [B,T,J,C] format for output."""
         return x.permute(0, 3, 1, 2).contiguous()
 
+    # pylint: disable=arguments-differ
     def training_step(self, batch: dict, _batch_idx: int) -> torch.Tensor:
         """
         Single training step for diffusion model.
