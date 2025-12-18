@@ -270,7 +270,7 @@ def test_checkpoint():
     # Get reference pose
     ref_path = test_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
-        import os
+
         ref_path = os.path.join(data_dir, ref_path)
     
     with open(ref_path, "rb") as f:
@@ -285,7 +285,6 @@ def test_checkpoint():
     gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
     pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
     
-    import os
     os.makedirs("logs/full", exist_ok=True)
     
     with open("logs/full/epoch29_test_gt.pose", "wb") as f:
@@ -299,6 +298,5 @@ def test_checkpoint():
 
 
 if __name__ == "__main__":
-    import os
     os.chdir("/home/yayun/data/signwriting-animation-fork")
     test_checkpoint()
