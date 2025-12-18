@@ -86,8 +86,8 @@ def train_full_dataset():
     out_dir = "logs/full"
 
     # Full dataset settings (CHANGED from 100-sample)
-    MAX_EPOCHS = 50
-    BATCH_SIZE =100
+    MAX_EPOCHS = 100
+    BATCH_SIZE = 1024
     LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
 
     os.makedirs(out_dir, exist_ok=True)
