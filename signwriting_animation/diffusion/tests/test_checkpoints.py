@@ -2,7 +2,7 @@
 Test inference using the epoch 29 checkpoint.
 Quick validation to see if 29 epochs is sufficient.
 """
-
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
