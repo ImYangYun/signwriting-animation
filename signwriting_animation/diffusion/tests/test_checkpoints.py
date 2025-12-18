@@ -1,6 +1,10 @@
 """
 Test inference using the epoch 29 checkpoint.
 Quick validation to see if 29 epochs is sufficient.
+
+Includes both:
+1. Single-step test (same as training) - to verify model learned correctly
+2. Full DDPM sampling test - to check actual generation quality
 """
 import os
 import torch
@@ -61,85 +65,102 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     return pose_obj
 
 
-def test_checkpoint():
-    """Test the epoch 29 checkpoint."""
+def test_single_step(lit_model, test_ds, device, num_samples=5):
+    """
+    Test using SINGLE-STEP prediction (same as training).
     
+    This tests whether the model learned to denoise correctly,
+    without the complexity of full DDPM sampling.
+    """
+    print("\n" + "=" * 70)
+    print("TEST 1: SINGLE-STEP PREDICTION (Same as Training)")
     print("=" * 70)
-    print("TESTING EPOCH 29 CHECKPOINT")
-    print("=" * 70)
+    print("This tests the model's denoising ability at different noise levels.")
+    print("If disp_ratio ≈ 1.0 here but not in DDPM sampling, the issue is sampling.\n")
     
-    # Load checkpoint
-    ckpt_path = "logs/full/checkpoints/last.ckpt"
-    
-    print(f"\nLoading checkpoint: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
-    
-    # Create model
-    data_dir = "/home/yayun/data/pose_data/"
-    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    
-    # Load a test sample to get dimensions
-    test_ds = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
-    )
-    
-    sample = test_ds[0]["data"]
-    if hasattr(sample, 'zero_filled'):
-        sample = sample.zero_filled()
-    if hasattr(sample, 'tensor'):
-        sample = sample.tensor
-    
-    num_joints = sample.shape[-2]
-    num_dims = sample.shape[-1]
-    future_len = sample.shape[0]
-    
-    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
-    
-    # Create LitDiffusion model
-    from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
-    
-    model = SignWritingToPoseDiffusion(
-        num_keypoints=num_joints,
-        num_dims_per_keypoint=num_dims,
-        t_past=40,
-        t_future=future_len,
-    )
-    
-    lit_model = LitDiffusion(
-        num_keypoints=num_joints,
-        num_dims=num_dims,
-        stats_path=stats_path,
-        lr=1e-4,
-        diffusion_steps=8,
-        vel_weight=1.0,
-        t_past=40,
-        t_future=future_len,
-    )
-    lit_model.model = model
-    
-    # Load weights
-    lit_model.load_state_dict(checkpoint['state_dict'])
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lit_model = lit_model.to(device)
     lit_model.eval()
     
-    print(f"Model loaded on: {device}")
+    # Test at different timesteps
+    timesteps_to_test = [0, 3, 7]  # Low, medium, high noise
     
-    # Test on first 5 samples
+    all_results = {t: [] for t in timesteps_to_test}
+    
+    for idx in range(num_samples):
+        test_batch = zero_pad_collator([test_ds[idx]])
+        cond = test_batch["conditions"]
+        
+        gt_btjc = sanitize_btjc(test_batch["data"][:1]).to(device)
+        past_btjc = sanitize_btjc(cond["input_pose"][:1]).to(device)
+        sign_img = cond["sign_image"][:1].float().to(device)
+        
+        gt_norm = lit_model.normalize(gt_btjc)
+        past_norm = lit_model.normalize(past_btjc)
+        
+        gt_bjct = lit_model.btjc_to_bjct(gt_norm)
+        past_bjct = lit_model.btjc_to_bjct(past_norm)
+        
+        with torch.no_grad():
+            for t_val in timesteps_to_test:
+                timestep = torch.tensor([t_val], device=device, dtype=torch.long)
+                noise = torch.randn_like(gt_bjct)
+                x_noisy = lit_model.diffusion.q_sample(gt_bjct, timestep, noise=noise)
+                
+                # Single-step prediction (same as training)
+                pred_x0_bjct = lit_model.model(x_noisy, timestep, past_bjct, sign_img)
+                
+                # Compute disp_ratio same as training
+                pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
+                gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
+                
+                pred_disp = pred_vel.abs().mean().item()
+                gt_disp = gt_vel.abs().mean().item()
+                disp_ratio = pred_disp / (gt_disp + 1e-8)
+                
+                # MSE
+                mse = F.mse_loss(pred_x0_bjct, gt_bjct).item()
+                
+                all_results[t_val].append({
+                    'disp_ratio': disp_ratio,
+                    'mse': mse
+                })
+    
+    # Print results
+    print(f"Results across {num_samples} samples:\n")
+    print(f"{'Timestep':<12} {'Avg Disp Ratio':<18} {'Avg MSE':<15} {'Status'}")
+    print("-" * 60)
+    
+    for t_val in timesteps_to_test:
+        avg_disp = np.mean([r['disp_ratio'] for r in all_results[t_val]])
+        avg_mse = np.mean([r['mse'] for r in all_results[t_val]])
+        
+        if 0.9 <= avg_disp <= 1.1:
+            status = "✅ Good"
+        elif 0.8 <= avg_disp <= 1.2:
+            status = "⚠️ Okay"
+        else:
+            status = "❌ Bad"
+        
+        print(f"t={t_val:<10} {avg_disp:<18.4f} {avg_mse:<15.6f} {status}")
+    
+    return all_results
+
+
+def test_ddpm_sampling(lit_model, test_ds, device, future_len, num_samples=5):
+    """
+    Test using FULL DDPM SAMPLING (actual inference).
+    
+    This is how the model will be used in practice - generating
+    from pure noise through iterative denoising.
+    """
     print("\n" + "=" * 70)
-    print("RUNNING INFERENCE ON 5 SAMPLES")
+    print("TEST 2: FULL DDPM SAMPLING (Actual Inference)")
     print("=" * 70)
+    print("This tests the full generation pipeline from pure noise.\n")
     
+    lit_model.eval()
     results = []
     
-    for idx in range(5):
+    for idx in range(num_samples):
         test_batch = zero_pad_collator([test_ds[idx]])
         cond = test_batch["conditions"]
         
@@ -193,17 +214,10 @@ def test_checkpoint():
             'mse': mse
         })
         
-        print(f"\nSample {idx}:")
-        print(f"  Disp Ratio: {disp_ratio:.4f}")
-        print(f"  MPJPE: {mpjpe:.6f}")
-        print(f"  PCK@0.1: {pck_01:.1f}%")
-        print(f"  MSE: {mse:.6f}")
+        print(f"Sample {idx}: Disp Ratio={disp_ratio:.4f}, MPJPE={mpjpe:.6f}, PCK@0.1={pck_01:.1f}%")
     
     # Summary
-    print("\n" + "=" * 70)
-    print("SUMMARY (5 samples)")
-    print("=" * 70)
-    
+    print("\n" + "-" * 40)
     avg_disp = np.mean([r['disp_ratio'] for r in results])
     avg_mpjpe = np.mean([r['mpjpe'] for r in results])
     avg_pck = np.mean([r['pck'] for r in results])
@@ -214,25 +228,119 @@ def test_checkpoint():
     print(f"Average PCK@0.1: {avg_pck:.1f}%")
     print(f"Average MSE: {avg_mse:.6f}")
     
-    # Verdict
+    return results
+
+
+def test_checkpoint():
+    """Test the epoch 29 checkpoint with both single-step and DDPM sampling."""
+    
+    print("=" * 70)
+    print("CHECKPOINT EVALUATION")
+    print("=" * 70)
+    
+    # Load checkpoint
+    ckpt_path = "logs/full/checkpoints/last.ckpt"
+    
+    print(f"\nLoading checkpoint: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    
+    # Create model
+    data_dir = "/home/yayun/data/pose_data/"
+    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
+    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
+    
+    # Load a test sample to get dimensions
+    # Use fixed seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    test_ds = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split="train",
+    )
+    
+    sample = test_ds[0]["data"]
+    if hasattr(sample, 'zero_filled'):
+        sample = sample.zero_filled()
+    if hasattr(sample, 'tensor'):
+        sample = sample.tensor
+    
+    num_joints = sample.shape[-2]
+    num_dims = sample.shape[-1]
+    future_len = sample.shape[0]
+    
+    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    
+    # Create LitDiffusion model
+    from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
+    
+    model = SignWritingToPoseDiffusion(
+        num_keypoints=num_joints,
+        num_dims_per_keypoint=num_dims,
+        t_past=40,
+        t_future=future_len,
+    )
+    
+    lit_model = LitDiffusion(
+        num_keypoints=num_joints,
+        num_dims=num_dims,
+        stats_path=stats_path,
+        lr=1e-4,
+        diffusion_steps=8,
+        vel_weight=1.0,
+        t_past=40,
+        t_future=future_len,
+    )
+    lit_model.model = model
+    
+    # Load weights
+    lit_model.load_state_dict(checkpoint['state_dict'])
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lit_model = lit_model.to(device)
+    lit_model.eval()
+    
+    print(f"Model loaded on: {device}")
+    
+    # ====== TEST 1: Single-step (same as training) ======
+    single_step_results = test_single_step(lit_model, test_ds, device, num_samples=5)
+    
+    # ====== TEST 2: Full DDPM sampling ======
+    ddpm_results = test_ddpm_sampling(lit_model, test_ds, device, future_len, num_samples=5)
+    
+    # ====== DIAGNOSIS ======
     print("\n" + "=" * 70)
-    print("VERDICT")
+    print("DIAGNOSIS")
     print("=" * 70)
     
-    if 0.95 <= avg_disp <= 1.10 and avg_mpjpe < 0.1 and avg_pck > 80:
-        print("✅ EXCELLENT! 29 epochs is sufficient!")
-        print("   The model generalizes well to unseen data.")
-    elif 0.90 <= avg_disp <= 1.15 and avg_mpjpe < 0.15 and avg_pck > 70:
-        print("✓ GOOD! 29 epochs is acceptable.")
-        print("  More training might improve slightly, but not critical.")
+    # Check single-step at t=0 (minimal noise)
+    avg_single_t0 = np.mean([r['disp_ratio'] for r in single_step_results[0]])
+    avg_ddpm = np.mean([r['disp_ratio'] for r in ddpm_results])
+    
+    print(f"\nSingle-step (t=0) disp_ratio: {avg_single_t0:.4f}")
+    print(f"DDPM sampling disp_ratio:     {avg_ddpm:.4f}")
+    
+    if 0.9 <= avg_single_t0 <= 1.1 and not (0.9 <= avg_ddpm <= 1.1):
+        print("\n⚠️  DIAGNOSIS: Model learned well, but DDPM sampling is broken!")
+        print("   Possible causes:")
+        print("   - diffusion_steps=8 is too few (try 50-100)")
+        print("   - Noise schedule mismatch")
+        print("   - p_sample_loop implementation issue")
+    elif not (0.9 <= avg_single_t0 <= 1.1):
+        print("\n❌ DIAGNOSIS: Model hasn't learned properly yet.")
+        print("   - Continue training for more epochs")
+        print("   - Check learning rate and loss weights")
     else:
-        print("⚠ NEEDS MORE TRAINING")
-        print("  Consider training to 50 epochs or using A100 for full training.")
+        print("\n✅ DIAGNOSIS: Model is working well!")
     
+    # ====== SAVE SAMPLE FOR VISUALIZATION ======
+    print("\n" + "=" * 70)
+    print("SAVING SAMPLE FOR VISUALIZATION")
     print("=" * 70)
-    
-    # Save first sample for visualization
-    print("\nSaving first sample for visualization...")
     
     test_batch = zero_pad_collator([test_ds[0]])
     cond = test_batch["conditions"]
@@ -270,7 +378,6 @@ def test_checkpoint():
     # Get reference pose
     ref_path = test_ds.records[0]["pose"]
     if not os.path.isabs(ref_path):
-
         ref_path = os.path.join(data_dir, ref_path)
     
     with open(ref_path, "rb") as f:
