@@ -85,8 +85,8 @@ def train_full_dataset():
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     out_dir = "logs/full"
 
-    # Full dataset settings (CHANGED from 100-sample)
-    MAX_EPOCHS = 100
+    # Full dataset settings
+    MAX_EPOCHS = 500
     BATCH_SIZE = 1024
     LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
 
