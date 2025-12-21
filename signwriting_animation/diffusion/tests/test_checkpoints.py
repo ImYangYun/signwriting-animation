@@ -153,10 +153,10 @@ def test_checkpoint():
     print("\n" + "=" * 70)
     print("NORMALIZATION STATS")
     print("=" * 70)
-    print(f"Mean shape: {lit_model.mean.shape}")
-    print(f"Std shape: {lit_model.std.shape}")
-    print(f"Mean range: [{lit_model.mean.min():.4f}, {lit_model.mean.max():.4f}]")
-    print(f"Std range: [{lit_model.std.min():.4f}, {lit_model.std.max():.4f}]")
+    print(f"Mean shape: {lit_model.mean_pose.shape}")
+    print(f"Std shape: {lit_model.std_pose.shape}")
+    print(f"Mean range: [{lit_model.mean_pose.min():.4f}, {lit_model.mean_pose.max():.4f}]")
+    print(f"Std range: [{lit_model.std_pose.min():.4f}, {lit_model.std_pose.max():.4f}]")
     
     # ====== DDPM SAMPLING TEST ======
     print("\n" + "=" * 70)
