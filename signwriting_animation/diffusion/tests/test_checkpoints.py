@@ -1,16 +1,10 @@
 """
-Test inference using the epoch 29 checkpoint.
-Quick validation to see if 29 epochs is sufficient.
-
-Includes both:
-1. Single-step test (same as training) - to verify model learned correctly
-2. Full DDPM sampling test - to check actual generation quality
+Improved checkpoint test - checks both normalized and unnormalized spaces.
 """
 import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader
 
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
@@ -65,102 +59,118 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     return pose_obj
 
 
-def test_single_step(lit_model, test_ds, device, num_samples=5):
-    """
-    Test using SINGLE-STEP prediction (same as training).
-    
-    This tests whether the model learned to denoise correctly,
-    without the complexity of full DDPM sampling.
-    """
-    print("\n" + "=" * 70)
-    print("TEST 1: SINGLE-STEP PREDICTION (Same as Training)")
-    print("=" * 70)
-    print("This tests the model's denoising ability at different noise levels.")
-    print("If disp_ratio ≈ 1.0 here but not in DDPM sampling, the issue is sampling.\n")
-    
-    lit_model.eval()
-    
-    # Test at different timesteps
-    timesteps_to_test = [0, 3, 7]  # Low, medium, high noise
-    
-    all_results = {t: [] for t in timesteps_to_test}
-    
-    for idx in range(num_samples):
-        test_batch = zero_pad_collator([test_ds[idx]])
-        cond = test_batch["conditions"]
-        
-        gt_btjc = sanitize_btjc(test_batch["data"][:1]).to(device)
-        past_btjc = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign_img = cond["sign_image"][:1].float().to(device)
-        
-        gt_norm = lit_model.normalize(gt_btjc)
-        past_norm = lit_model.normalize(past_btjc)
-        
-        gt_bjct = lit_model.btjc_to_bjct(gt_norm)
-        past_bjct = lit_model.btjc_to_bjct(past_norm)
-        
-        with torch.no_grad():
-            for t_val in timesteps_to_test:
-                timestep = torch.tensor([t_val], device=device, dtype=torch.long)
-                noise = torch.randn_like(gt_bjct)
-                x_noisy = lit_model.diffusion.q_sample(gt_bjct, timestep, noise=noise)
-                
-                # Single-step prediction (same as training)
-                pred_x0_bjct = lit_model.model(x_noisy, timestep, past_bjct, sign_img)
-                
-                # Compute disp_ratio same as training
-                pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
-                gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
-                
-                pred_disp = pred_vel.abs().mean().item()
-                gt_disp = gt_vel.abs().mean().item()
-                disp_ratio = pred_disp / (gt_disp + 1e-8)
-                
-                # MSE
-                mse = F.mse_loss(pred_x0_bjct, gt_bjct).item()
-                
-                all_results[t_val].append({
-                    'disp_ratio': disp_ratio,
-                    'mse': mse
-                })
-    
-    # Print results
-    print(f"Results across {num_samples} samples:\n")
-    print(f"{'Timestep':<12} {'Avg Disp Ratio':<18} {'Avg MSE':<15} {'Status'}")
-    print("-" * 60)
-    
-    for t_val in timesteps_to_test:
-        avg_disp = np.mean([r['disp_ratio'] for r in all_results[t_val]])
-        avg_mse = np.mean([r['mse'] for r in all_results[t_val]])
-        
-        if 0.9 <= avg_disp <= 1.1:
-            status = "✅ Good"
-        elif 0.8 <= avg_disp <= 1.2:
-            status = "⚠️ Okay"
-        else:
-            status = "❌ Bad"
-        
-        print(f"t={t_val:<10} {avg_disp:<18.4f} {avg_mse:<15.6f} {status}")
-    
-    return all_results
+def compute_disp_ratio_numpy(pred_data, gt_data):
+    """Compute displacement ratio using numpy (same method as pose file analysis)."""
+    pred_disp = np.sqrt(np.sum(np.diff(pred_data, axis=0)**2, axis=-1)).mean()
+    gt_disp = np.sqrt(np.sum(np.diff(gt_data, axis=0)**2, axis=-1)).mean()
+    return pred_disp / (gt_disp + 1e-8), pred_disp, gt_disp
 
 
-def test_ddpm_sampling(lit_model, test_ds, device, future_len, num_samples=5):
-    """
-    Test using FULL DDPM SAMPLING (actual inference).
+def compute_disp_ratio_torch(pred, gt):
+    """Compute displacement ratio using torch (same as training)."""
+    pred_disp = mean_frame_disp(pred)
+    gt_disp = mean_frame_disp(gt)
+    return pred_disp / (gt_disp + 1e-8), pred_disp, gt_disp
+
+
+def test_checkpoint():
+    """Test checkpoint with detailed diagnostics."""
     
-    This is how the model will be used in practice - generating
-    from pure noise through iterative denoising.
-    """
-    print("\n" + "=" * 70)
-    print("TEST 2: FULL DDPM SAMPLING (Actual Inference)")
     print("=" * 70)
-    print("This tests the full generation pipeline from pure noise.\n")
+    print("CHECKPOINT EVALUATION V2 (with space comparison)")
+    print("=" * 70)
     
+    # Configuration
+    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
+    data_dir = "/home/yayun/data/pose_data/"
+    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
+    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
+    out_dir = "logs/full/eval"
+    num_samples = 5
+    
+    os.makedirs(out_dir, exist_ok=True)
+    
+    print(f"\nLoading checkpoint: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    
+    # Fixed seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Load dataset
+    test_ds = DynamicPosePredictionDataset(
+        data_dir=data_dir,
+        csv_path=csv_path,
+        num_past_frames=40,
+        num_future_frames=20,
+        with_metadata=True,
+        split="train",
+    )
+    
+    # Get dimensions
+    sample = test_ds[0]["data"]
+    if hasattr(sample, 'zero_filled'):
+        sample = sample.zero_filled()
+    if hasattr(sample, 'tensor'):
+        sample = sample.tensor
+    
+    num_joints = sample.shape[-2]
+    num_dims = sample.shape[-1]
+    future_len = sample.shape[0]
+    
+    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    
+    # Create model
+    from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
+    
+    model = SignWritingToPoseDiffusion(
+        num_keypoints=num_joints,
+        num_dims_per_keypoint=num_dims,
+        t_past=40,
+        t_future=future_len,
+    )
+    
+    lit_model = LitDiffusion(
+        num_keypoints=num_joints,
+        num_dims=num_dims,
+        stats_path=stats_path,
+        lr=1e-4,
+        diffusion_steps=8,
+        vel_weight=1.0,
+        t_past=40,
+        t_future=future_len,
+    )
+    lit_model.model = model
+    lit_model.load_state_dict(checkpoint['state_dict'])
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lit_model = lit_model.to(device)
     lit_model.eval()
+    
+    print(f"Model loaded on: {device}")
+    
+    # Check normalization stats
+    print("\n" + "=" * 70)
+    print("NORMALIZATION STATS")
+    print("=" * 70)
+    print(f"Mean shape: {lit_model.mean.shape}")
+    print(f"Std shape: {lit_model.std.shape}")
+    print(f"Mean range: [{lit_model.mean.min():.4f}, {lit_model.mean.max():.4f}]")
+    print(f"Std range: [{lit_model.std.min():.4f}, {lit_model.std.max():.4f}]")
+    
+    # ====== DDPM SAMPLING TEST ======
+    print("\n" + "=" * 70)
+    print("DDPM SAMPLING TEST (comparing normalized vs unnormalized)")
+    print("=" * 70)
+    
     results = []
     
-    for idx in range(num_samples):
+    # Store indices for reproducibility
+    test_indices = list(range(num_samples))
+    
+    for i, idx in enumerate(test_indices):
+        print(f"\n--- Sample {i} (dataset idx={idx}) ---")
+        
         test_batch = zero_pad_collator([test_ds[idx]])
         cond = test_batch["conditions"]
         
@@ -195,213 +205,115 @@ def test_ddpm_sampling(lit_model, test_ds, device, future_len, num_samples=5):
             )
             pred_norm = lit_model.bjct_to_btjc(pred_bjct)
         
-        # Compute metrics
-        mse = F.mse_loss(pred_norm, gt_norm).item()
-        disp_pred = mean_frame_disp(pred_norm)
-        disp_gt = mean_frame_disp(gt_norm)
-        disp_ratio = disp_pred / (disp_gt + 1e-8)
+        # Unnormalize
+        gt_unnorm = lit_model.unnormalize(gt_norm)
+        pred_unnorm = lit_model.unnormalize(pred_norm)
         
-        pred_np = pred_norm[0].cpu().numpy()
-        gt_np = gt_norm[0].cpu().numpy()
+        # Compute metrics in BOTH spaces
+        
+        # 1. Normalized space (torch)
+        ratio_norm_torch, pred_d_norm, gt_d_norm = compute_disp_ratio_torch(pred_norm, gt_norm)
+        
+        # 2. Unnormalized space (torch)
+        ratio_unnorm_torch, pred_d_unnorm, gt_d_unnorm = compute_disp_ratio_torch(pred_unnorm, gt_unnorm)
+        
+        # 3. Unnormalized space (numpy - same as pose file analysis)
+        pred_np = pred_unnorm[0].cpu().numpy()
+        gt_np = gt_unnorm[0].cpu().numpy()
+        ratio_unnorm_np, pred_d_np, gt_d_np = compute_disp_ratio_numpy(pred_np, gt_np)
+        
+        # MSE and other metrics
+        mse_norm = F.mse_loss(pred_norm, gt_norm).item()
+        mse_unnorm = F.mse_loss(pred_unnorm, gt_unnorm).item()
+        
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
         mpjpe = per_joint_err.mean()
         pck_01 = (per_joint_err < 0.1).mean() * 100
         
+        print(f"  Normalized space:")
+        print(f"    GT disp: {gt_d_norm:.4f}, Pred disp: {pred_d_norm:.4f}, Ratio: {ratio_norm_torch:.4f}")
+        print(f"  Unnormalized space (torch):")
+        print(f"    GT disp: {gt_d_unnorm:.4f}, Pred disp: {pred_d_unnorm:.4f}, Ratio: {ratio_unnorm_torch:.4f}")
+        print(f"  Unnormalized space (numpy):")
+        print(f"    GT disp: {gt_d_np:.4f}, Pred disp: {pred_d_np:.4f}, Ratio: {ratio_unnorm_np:.4f}")
+        print(f"  MPJPE: {mpjpe:.6f}, PCK@0.1: {pck_01:.1f}%")
+        
         results.append({
-            'disp_ratio': disp_ratio,
+            'idx': idx,
+            'ratio_norm': ratio_norm_torch,
+            'ratio_unnorm_torch': ratio_unnorm_torch,
+            'ratio_unnorm_np': ratio_unnorm_np,
+            'gt_disp_norm': gt_d_norm,
+            'pred_disp_norm': pred_d_norm,
+            'gt_disp_unnorm': gt_d_unnorm,
+            'pred_disp_unnorm': pred_d_unnorm,
             'mpjpe': mpjpe,
             'pck': pck_01,
-            'mse': mse
+            'mse_norm': mse_norm,
+            'mse_unnorm': mse_unnorm,
         })
         
-        print(f"Sample {idx}: Disp Ratio={disp_ratio:.4f}, MPJPE={mpjpe:.6f}, PCK@0.1={pck_01:.1f}%")
+        # Save pose files for first 3 samples
+        if i < 3:
+            ref_path = test_ds.records[idx]["pose"]
+            if not os.path.isabs(ref_path):
+                ref_path = os.path.join(data_dir, ref_path)
+            
+            with open(ref_path, "rb") as f:
+                ref_pose = Pose.read(f)
+            ref_pose = reduce_holistic(ref_pose)
+            if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+                ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+            
+            gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+            pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
+            
+            with open(f"{out_dir}/sample{i}_gt.pose", "wb") as f:
+                gt_pose.write(f)
+            with open(f"{out_dir}/sample{i}_pred.pose", "wb") as f:
+                pred_pose.write(f)
+            print(f"  Saved: {out_dir}/sample{i}_gt.pose, sample{i}_pred.pose")
     
-    # Summary
-    print("\n" + "-" * 40)
-    avg_disp = np.mean([r['disp_ratio'] for r in results])
+    # ====== SUMMARY ======
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    
+    avg_ratio_norm = np.mean([r['ratio_norm'] for r in results])
+    avg_ratio_unnorm_torch = np.mean([r['ratio_unnorm_torch'] for r in results])
+    avg_ratio_unnorm_np = np.mean([r['ratio_unnorm_np'] for r in results])
     avg_mpjpe = np.mean([r['mpjpe'] for r in results])
     avg_pck = np.mean([r['pck'] for r in results])
-    avg_mse = np.mean([r['mse'] for r in results])
     
-    print(f"Average Disp Ratio: {avg_disp:.4f} (ideal=1.0)")
+    print(f"\nAverage Disp Ratio (normalized, torch):   {avg_ratio_norm:.4f}")
+    print(f"Average Disp Ratio (unnormalized, torch): {avg_ratio_unnorm_torch:.4f}")
+    print(f"Average Disp Ratio (unnormalized, numpy): {avg_ratio_unnorm_np:.4f}")
     print(f"Average MPJPE: {avg_mpjpe:.6f}")
     print(f"Average PCK@0.1: {avg_pck:.1f}%")
-    print(f"Average MSE: {avg_mse:.6f}")
-    
-    return results
-
-
-def test_checkpoint():
-    """Test the epoch 29 checkpoint with both single-step and DDPM sampling."""
-    
-    print("=" * 70)
-    print("CHECKPOINT EVALUATION")
-    print("=" * 70)
-    
-    # Load checkpoint
-    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
-    
-    print(f"\nLoading checkpoint: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
-    
-    # Create model
-    data_dir = "/home/yayun/data/pose_data/"
-    csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    
-    # Load a test sample to get dimensions
-    # Use fixed seed for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    
-    test_ds = DynamicPosePredictionDataset(
-        data_dir=data_dir,
-        csv_path=csv_path,
-        num_past_frames=40,
-        num_future_frames=20,
-        with_metadata=True,
-        split="train",
-    )
-    
-    sample = test_ds[0]["data"]
-    if hasattr(sample, 'zero_filled'):
-        sample = sample.zero_filled()
-    if hasattr(sample, 'tensor'):
-        sample = sample.tensor
-    
-    num_joints = sample.shape[-2]
-    num_dims = sample.shape[-1]
-    future_len = sample.shape[0]
-    
-    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
-    
-    # Create LitDiffusion model
-    from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
-    
-    model = SignWritingToPoseDiffusion(
-        num_keypoints=num_joints,
-        num_dims_per_keypoint=num_dims,
-        t_past=40,
-        t_future=future_len,
-    )
-    
-    lit_model = LitDiffusion(
-        num_keypoints=num_joints,
-        num_dims=num_dims,
-        stats_path=stats_path,
-        lr=1e-4,
-        diffusion_steps=8,
-        vel_weight=1.0,
-        t_past=40,
-        t_future=future_len,
-    )
-    lit_model.model = model
-    
-    # Load weights
-    lit_model.load_state_dict(checkpoint['state_dict'])
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lit_model = lit_model.to(device)
-    lit_model.eval()
-    
-    print(f"Model loaded on: {device}")
-    
-    # ====== TEST 1: Single-step (same as training) ======
-    single_step_results = test_single_step(lit_model, test_ds, device, num_samples=5)
-    
-    # ====== TEST 2: Full DDPM sampling ======
-    ddpm_results = test_ddpm_sampling(lit_model, test_ds, device, future_len, num_samples=5)
     
     # ====== DIAGNOSIS ======
     print("\n" + "=" * 70)
     print("DIAGNOSIS")
     print("=" * 70)
     
-    # Check single-step at t=0 (minimal noise)
-    avg_single_t0 = np.mean([r['disp_ratio'] for r in single_step_results[0]])
-    avg_ddpm = np.mean([r['disp_ratio'] for r in ddpm_results])
+    print(f"\nNormalized space ratio:   {avg_ratio_norm:.4f}")
+    print(f"Unnormalized space ratio: {avg_ratio_unnorm_np:.4f}")
     
-    print(f"\nSingle-step (t=0) disp_ratio: {avg_single_t0:.4f}")
-    print(f"DDPM sampling disp_ratio:     {avg_ddpm:.4f}")
+    if abs(avg_ratio_norm - avg_ratio_unnorm_np) > 0.5:
+        print("\n⚠️  Large discrepancy between normalized and unnormalized space!")
+        print("   This suggests the normalization stats may not match the data.")
+        print("   The UNNORMALIZED ratio is more reliable for visual quality.")
     
-    if 0.9 <= avg_single_t0 <= 1.1 and not (0.9 <= avg_ddpm <= 1.1):
-        print("\n⚠️  DIAGNOSIS: Model learned well, but DDPM sampling is broken!")
-        print("   Possible causes:")
-        print("   - diffusion_steps=8 is too few (try 50-100)")
-        print("   - Noise schedule mismatch")
-        print("   - p_sample_loop implementation issue")
-    elif not (0.9 <= avg_single_t0 <= 1.1):
-        print("\n❌ DIAGNOSIS: Model hasn't learned properly yet.")
-        print("   - Continue training for more epochs")
-        print("   - Check learning rate and loss weights")
+    # Use unnormalized ratio for final judgment
+    if 0.8 <= avg_ratio_unnorm_np <= 1.2:
+        print(f"\n✅ Model is working well! (unnorm ratio={avg_ratio_unnorm_np:.4f})")
+    elif 0.7 <= avg_ratio_unnorm_np <= 1.3:
+        print(f"\n⚠️  Model is okay but could be better (unnorm ratio={avg_ratio_unnorm_np:.4f})")
     else:
-        print("\n✅ DIAGNOSIS: Model is working well!")
+        print(f"\n❌ Model needs improvement (unnorm ratio={avg_ratio_unnorm_np:.4f})")
     
-    # ====== SAVE SAMPLE FOR VISUALIZATION ======
-    print("\n" + "=" * 70)
-    print("SAVING SAMPLE FOR VISUALIZATION")
-    print("=" * 70)
-    
-    test_batch = zero_pad_collator([test_ds[0]])
-    cond = test_batch["conditions"]
-    
-    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-    sign = cond["sign_image"][:1].float().to(device)
-    gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
-    
-    past_norm = lit_model.normalize(past_raw)
-    gt_norm = lit_model.normalize(gt_raw)
-    
-    with torch.no_grad():
-        past_bjct = lit_model.btjc_to_bjct(past_norm)
-        B, J, C, _ = past_bjct.shape
-        target_shape = (B, J, C, future_len)
-        
-        class _Wrapper(torch.nn.Module):
-            def __init__(self, model, past, sign):
-                super().__init__()
-                self.model, self.past, self.sign = model, past, sign
-            def forward(self, x, t, **kwargs):
-                return self.model(x, t, self.past, self.sign)
-        
-        wrapped = _Wrapper(lit_model.model, past_bjct, sign)
-        
-        pred_bjct = lit_model.diffusion.p_sample_loop(
-            model=wrapped,
-            shape=target_shape,
-            clip_denoised=False,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        pred_norm = lit_model.bjct_to_btjc(pred_bjct)
-    
-    # Get reference pose
-    ref_path = test_ds.records[0]["pose"]
-    if not os.path.isabs(ref_path):
-        ref_path = os.path.join(data_dir, ref_path)
-    
-    with open(ref_path, "rb") as f:
-        ref_pose = Pose.read(f)
-    ref_pose = reduce_holistic(ref_pose)
-    if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
-        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    
-    gt_unnorm = lit_model.unnormalize(gt_norm)
-    pred_unnorm = lit_model.unnormalize(pred_norm)
-    
-    gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
-    pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
-    
-    os.makedirs("logs/full", exist_ok=True)
-    
-    with open("logs/full/epoch29_test_gt.pose", "wb") as f:
-        gt_pose.write(f)
-    with open("logs/full/epoch29_test_pred.pose", "wb") as f:
-        pred_pose.write(f)
-    
-    print("Saved: logs/full/epoch29_test_gt.pose")
-    print("Saved: logs/full/epoch29_test_pred.pose")
-    print("\n✅ Testing complete!")
+    print(f"\nPose files saved to: {out_dir}/")
+    print("✅ Testing complete!")
 
 
 if __name__ == "__main__":
