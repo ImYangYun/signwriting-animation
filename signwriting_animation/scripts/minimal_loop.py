@@ -86,7 +86,7 @@ def train_full_dataset():
     out_dir = "logs/full"
 
     # Full dataset settings
-    MAX_EPOCHS = 500
+    MAX_EPOCHS = 100
     BATCH_SIZE = 1024
     LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
 
@@ -155,8 +155,8 @@ def train_full_dataset():
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=LEARNING_RATE,  # ← Lower LR for stability
-        diffusion_steps=8,
+        lr=LEARNING_RATE,
+        diffusion_steps=50,
         vel_weight=1.0,
         t_past=40,
         t_future=future_len,
