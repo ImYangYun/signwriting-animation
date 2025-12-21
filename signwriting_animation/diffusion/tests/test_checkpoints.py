@@ -239,7 +239,7 @@ def test_checkpoint():
     print("=" * 70)
     
     # Load checkpoint
-    ckpt_path = "logs/full/checkpoints/last.ckpt"
+    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
     
     print(f"\nLoading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location='cpu')
