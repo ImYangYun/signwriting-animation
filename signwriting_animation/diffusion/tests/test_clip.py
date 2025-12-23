@@ -371,8 +371,34 @@ def test_unfrozen_clip():
         split="train",
     )
     
-    # Use first N samples
-    subset_ds = Subset(full_ds, list(range(NUM_SAMPLES)))
+    # ============================================================
+    # IMPORTANT: Select samples from DIFFERENT pose files!
+    # idx 0,1,2,3 may be from the same video with same SignWriting
+    # ============================================================
+    print("\n  Finding samples from different pose files...")
+    
+    seen_files = set()
+    selected_indices = []
+    
+    for idx in range(len(full_ds)):
+        if len(selected_indices) >= NUM_SAMPLES:
+            break
+        
+        record = full_ds.records[idx]
+        pose_file = record["pose"]
+        
+        if pose_file not in seen_files:
+            seen_files.add(pose_file)
+            selected_indices.append(idx)
+            print(f"    Selected idx={idx}, file={os.path.basename(pose_file)}")
+    
+    if len(selected_indices) < NUM_SAMPLES:
+        print(f"  WARNING: Only found {len(selected_indices)} unique files!")
+    
+    print(f"  Selected indices: {selected_indices}")
+    
+    # Use selected samples
+    subset_ds = Subset(full_ds, selected_indices)
     train_loader = DataLoader(
         subset_ds, batch_size=NUM_SAMPLES, shuffle=True,
         collate_fn=zero_pad_collator, num_workers=0,
@@ -449,7 +475,8 @@ def test_unfrozen_clip():
     lit_model.eval()
     
     sign_embeddings = []
-    sample_indices = list(range(NUM_SAMPLES))
+    # Use the same indices we trained on
+    sample_indices = selected_indices
     
     for idx in sample_indices:
         batch = zero_pad_collator([full_ds[idx]])
