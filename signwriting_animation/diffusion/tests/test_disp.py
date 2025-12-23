@@ -1,3 +1,6 @@
+"""
+Full Dataset Training with Displacement Loss
+"""
 import os
 import torch
 import torch.nn.functional as F
@@ -14,7 +17,7 @@ from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
-from signwriting_animation.diffusion.lightning_module import (
+from signwriting_animation.diffusion.lightning_disp import (
     LitDiffusion, sanitize_btjc, mean_frame_disp
 )
 
@@ -31,7 +34,6 @@ def tensor_to_pose(t_btjc: torch.Tensor,
     
     t_np = t.detach().cpu().numpy().astype(np.float32)
     
-    # Create pose object
     arr = t_np[:, None, :, :]
     T = arr.shape[0]
     conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
@@ -39,12 +41,9 @@ def tensor_to_pose(t_btjc: torch.Tensor,
     
     body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
-    
-    # Fix hand positions (must be before scaling!)
     unshift_hands(pose_obj)
     
     if scale_to_ref:
-        # Get reference data
         T_pred = t_np.shape[0]
         T_ref_total = ref_pose.body.data.shape[0]
         future_start = max(0, T_ref_total - T_pred)
@@ -53,7 +52,6 @@ def tensor_to_pose(t_btjc: torch.Tensor,
             dtype=np.float32
         )
         
-        # Scale to reference variance
         def _var(a):
             center = a.mean(axis=(0, 1), keepdims=True)
             return float(((a - center) ** 2).mean())
@@ -66,7 +64,6 @@ def tensor_to_pose(t_btjc: torch.Tensor,
             scale = np.sqrt(var_ref / var_input)
             pose_obj.body.data = pose_obj.body.data * scale
         
-        # Align center
         pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
         input_center = pose_data.mean(axis=0)
         ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
@@ -75,39 +72,42 @@ def tensor_to_pose(t_btjc: torch.Tensor,
     return pose_obj
 
 
-def train_full_dataset():
-    """Train model on full dataset."""
+def train_full_dataset_disp():
+    """Train model on full dataset with displacement loss."""
     pl.seed_everything(42)
 
     # === Configuration ===
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/full"
+    out_dir = "logs/full_disp"
 
-    # Full dataset settings
+    # Training settings
     MAX_EPOCHS = 100
     BATCH_SIZE = 1024
-    LEARNING_RATE = 1e-4  # ← Reduced from 1e-3 (more stable for large data)
+    LEARNING_RATE = 1e-4
+    DIFFUSION_STEPS = 8
+    DISP_WEIGHT = 1.0
 
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
-    print(" MODEL - FULL DATASET TRAINING")
+    print(" FULL DATASET TRAINING (with Displacement Loss)")
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  Dataset: FULL (all training samples)")
     print(f"  Epochs: {MAX_EPOCHS}")
     print(f"  Batch Size: {BATCH_SIZE}")
     print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Diffusion Steps: {DIFFUSION_STEPS}")
+    print(f"  Displacement Loss Weight: {DISP_WEIGHT}")
     print(f"  Output: {out_dir}/")
     print(f"  GPU: {'Available ✓' if torch.cuda.is_available() else 'Not available ✗'}")
-    print("\nThis will take several hours to days depending on dataset size.")
     print("=" * 70)
 
-    # === Dataset (REMOVED SubsetDataset wrapper) ===
+    # === Dataset ===
     print("\nLoading full dataset...")
-    train_ds = DynamicPosePredictionDataset(  # ← Direct dataset, no subsetting
+    train_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
         num_past_frames=40,
@@ -118,15 +118,14 @@ def train_full_dataset():
 
     print(f"Dataset loaded: {len(train_ds)} samples")
 
-    # DataLoader with optimizations for large dataset
     train_loader = DataLoader(
         train_ds, 
         batch_size=BATCH_SIZE, 
         shuffle=True, 
         collate_fn=zero_pad_collator,
-        num_workers=4,      # ← Parallel data loading
+        num_workers=4,
         pin_memory=False,
-        persistent_workers=True,  # ← Keep workers alive between epochs
+        persistent_workers=True,
     )
 
     # Get dimensions
@@ -142,8 +141,8 @@ def train_full_dataset():
     print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
     print(f"Batches per epoch: {len(train_loader)}")
 
-    # === Create Model ===
-    print("\nInitializing model...")
+    # === Create Model with Displacement Loss ===
+    print("\nInitializing model (with disp_loss)...")
     model = SignWritingToPoseDiffusion(
         num_keypoints=num_joints,
         num_dims_per_keypoint=num_dims,
@@ -156,22 +155,24 @@ def train_full_dataset():
         num_dims=num_dims,
         stats_path=stats_path,
         lr=LEARNING_RATE,
-        diffusion_steps=8,
+        diffusion_steps=DIFFUSION_STEPS,
         vel_weight=1.0,
+        acc_weight=0.5,
+        disp_weight=DISP_WEIGHT,
         t_past=40,
         t_future=future_len,
     )
     lit_model.model = model
     
-    # === Callbacks (NEW) ===
+    # === Callbacks ===
     checkpoint_callback = ModelCheckpoint(
         dirpath=f"{out_dir}/checkpoints",
-        filename="diffusion-{epoch:03d}-{train/disp_ratio:.4f}",
+        filename="disp-{epoch:03d}-{train/disp_ratio:.4f}",
         save_top_k=3,
         monitor="train/disp_ratio",
         mode="min",
         save_last=True,
-        every_n_epochs=5,  # Save every 5 epochs
+        every_n_epochs=5,
     )
     
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
@@ -197,9 +198,8 @@ def train_full_dataset():
     print("TRAINING COMPLETE!")
     print("="*70)
     print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
-    print(f"All checkpoints saved to: {out_dir}/checkpoints/")
     
-    # === Inference Test on First Sample ===
+    # === Inference Test ===
     print(f"\n{'='*70}")
     print("TESTING INFERENCE ON SAMPLE 0...")
     print("="*70)
@@ -218,7 +218,6 @@ def train_full_dataset():
     past_norm = lit_model.normalize(past_raw)
     gt_norm = lit_model.normalize(gt_raw)
     
-    # DDPM sampling
     with torch.no_grad():
         past_bjct = lit_model.btjc_to_bjct(past_norm)
         B, J, C, _ = past_bjct.shape
@@ -283,22 +282,13 @@ def train_full_dataset():
         pred_pose.write(f)
     
     print(f"\nTest pose files saved to: {out_dir}/")
-    print(f"Training curves saved to: {out_dir}/train_curve.png")
     
     print("\n" + "=" * 70)
-    print("✅ FULL DATASET TRAINING COMPLETE!")
+    print("✅ FULL DATASET TRAINING WITH DISP_LOSS COMPLETE!")
     print("=" * 70)
-    print("\nGenerated Files:")
-    print(f"  - Checkpoints: {out_dir}/checkpoints/")
-    print(f"  - Training curve: {out_dir}/train_curve.png")
-    print(f"  - Test poses: {out_dir}/test_gt.pose, test_pred.pose")
-    print("\nNext Steps:")
-    print("  1. Review training curves and metrics")
-    print("  2. Evaluate on test set")
-    print("  3. Generate predictions for qualitative analysis")
-    print("  4. Compare with baseline models")
+    print(f"\nCheckpoints: {out_dir}/checkpoints/")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    train_full_dataset()
+    train_full_dataset_disp()
