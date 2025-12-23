@@ -77,7 +77,7 @@ def compute_disp_ratio_torch(pred, gt):
 def test_checkpoint():
     """Test checkpoint with detailed diagnostics."""
 
-    CLIP_DENOISED = False
+    CLIP_DENOISED = True
     FIXED_INDICES = [10, 50, 100, 200, 500]  # 固定样本索引，保证对比公平
     
     ckpt_path = "logs/full/checkpoints/last-v2.ckpt"
