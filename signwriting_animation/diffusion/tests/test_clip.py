@@ -452,11 +452,18 @@ def train_full_dataset():
 
     # Training hyperparameters
     MAX_EPOCHS = 100
-    BATCH_SIZE = 1024  # Smaller due to unfrozen CLIP memory
+    BATCH_SIZE = 1024  # H200 80GB, 如果 OOM 改成 512 或 256
     LEARNING_RATE = 1e-4
     DIFFUSION_STEPS = 8
     CONTRASTIVE_WEIGHT = 0.5
     FREEZE_CLIP = False  # KEY: CLIP is trainable
+    
+    # 打印 GPU 显存信息
+    if torch.cuda.is_available():
+        gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"\n  GPU Memory Total: {gpu_mem_total:.1f} GB")
+        print(f"  Batch Size: {BATCH_SIZE}")
+        print(f"  If OOM occurs, reduce BATCH_SIZE to 512 or 256")
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -551,6 +558,13 @@ def train_full_dataset():
     print(f"\n{'='*70}")
     print("STARTING TRAINING...")
     print("="*70)
+
+    resume_ckpt = None
+    last_ckpt_path = f"{out_dir}/checkpoints/last.ckpt"
+    if os.path.exists(last_ckpt_path):
+        print(f"  Found existing checkpoint: {last_ckpt_path}")
+        print(f"  Resuming training from checkpoint...")
+        resume_ckpt = last_ckpt_path
     
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
@@ -563,7 +577,7 @@ def train_full_dataset():
         precision="16-mixed" if torch.cuda.is_available() else 32,
         gradient_clip_val=1.0,
     )
-    trainer.fit(lit_model, train_loader)
+    trainer.fit(lit_model, train_loader, ckpt_path=resume_ckpt)
     
     print(f"\n{'='*70}")
     print("TRAINING COMPLETE!")
