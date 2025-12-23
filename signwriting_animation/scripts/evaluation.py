@@ -15,7 +15,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc
+from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc, mean_frame_disp
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
@@ -90,14 +90,16 @@ def generate_pose_files():
         print(f"Columns: {list(df.columns)}")
         
         # Find best samples (ratio closest to 1.0)
-        df['ratio_diff'] = abs(df['disp_ratio'] - 1.0)
+        # 兼容两种列名
+        ratio_col = 'disp_ratio' if 'disp_ratio' in df.columns else 'ratio'
+        df['ratio_diff'] = abs(df[ratio_col] - 1.0)
         df_sorted = df.sort_values('ratio_diff')
         
         print("\n--- Best samples (ratio closest to 1.0) ---")
-        print(df_sorted.head(10)[['idx', 'disp_ratio', 'pck_01', 'mpjpe']])
+        print(df_sorted.head(10)[['idx', ratio_col, 'pck_01', 'mpjpe']])
         
         print("\n--- Worst samples (ratio furthest from 1.0) ---")
-        print(df_sorted.tail(5)[['idx', 'disp_ratio', 'pck_01', 'mpjpe']])
+        print(df_sorted.tail(5)[['idx', ratio_col, 'pck_01', 'mpjpe']])
         
         # Select samples: 5 best + 2 worst for comparison
         best_indices = df_sorted.head(5)['idx'].tolist()
