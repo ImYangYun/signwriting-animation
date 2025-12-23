@@ -1,5 +1,6 @@
 """
 Improved checkpoint test - checks both normalized and unnormalized spaces.
+Fixed sample indices for fair comparison.
 """
 import os
 import torch
@@ -75,20 +76,25 @@ def compute_disp_ratio_torch(pred, gt):
 
 def test_checkpoint():
     """Test checkpoint with detailed diagnostics."""
+
+    CLIP_DENOISED = False
+    FIXED_INDICES = [10, 50, 100, 200, 500]  # 固定样本索引，保证对比公平
     
-    print("=" * 70)
-    print("CHECKPOINT EVALUATION V2 (with space comparison)")
-    print("=" * 70)
-    
-    # Configuration
     ckpt_path = "logs/full/checkpoints/last-v2.ckpt"
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/full/eval"
-    num_samples = 5
+    out_dir = f"logs/full/eval_clip{CLIP_DENOISED}"  # 不同配置存不同目录
+    # ============================================================
     
     os.makedirs(out_dir, exist_ok=True)
+    
+    print("=" * 70)
+    print("CHECKPOINT EVALUATION V2 (with space comparison)")
+    print("=" * 70)
+    print(f"\n>>> CLIP_DENOISED = {CLIP_DENOISED}")
+    print(f">>> FIXED_INDICES = {FIXED_INDICES}")
+    print(f">>> Output dir: {out_dir}")
     
     print(f"\nLoading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location='cpu')
@@ -160,13 +166,13 @@ def test_checkpoint():
     
     # ====== DDPM SAMPLING TEST ======
     print("\n" + "=" * 70)
-    print("DDPM SAMPLING TEST (comparing normalized vs unnormalized)")
+    print(f"DDPM SAMPLING TEST (clip_denoised={CLIP_DENOISED})")
     print("=" * 70)
     
     results = []
     
-    # Store indices for reproducibility
-    test_indices = list(range(num_samples))
+    # 使用固定索引
+    test_indices = FIXED_INDICES
     
     for i, idx in enumerate(test_indices):
         print(f"\n--- Sample {i} (dataset idx={idx}) ---")
@@ -199,7 +205,7 @@ def test_checkpoint():
             pred_bjct = lit_model.diffusion.p_sample_loop(
                 model=wrapped,
                 shape=target_shape,
-                clip_denoised=True,
+                clip_denoised=CLIP_DENOISED,  # ← 使用配置变量
                 model_kwargs={"y": {}},
                 progress=False,
             )
@@ -247,6 +253,8 @@ def test_checkpoint():
             'pred_disp_norm': pred_d_norm,
             'gt_disp_unnorm': gt_d_unnorm,
             'pred_disp_unnorm': pred_d_unnorm,
+            'gt_disp_np': gt_d_np,
+            'pred_disp_np': pred_d_np,
             'mpjpe': mpjpe,
             'pck': pck_01,
             'mse_norm': mse_norm,
@@ -268,15 +276,15 @@ def test_checkpoint():
             gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
             pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
             
-            with open(f"{out_dir}/sample{i}_gt.pose", "wb") as f:
+            with open(f"{out_dir}/sample{i}_idx{idx}_gt.pose", "wb") as f:
                 gt_pose.write(f)
-            with open(f"{out_dir}/sample{i}_pred.pose", "wb") as f:
+            with open(f"{out_dir}/sample{i}_idx{idx}_pred.pose", "wb") as f:
                 pred_pose.write(f)
-            print(f"  Saved: {out_dir}/sample{i}_gt.pose, sample{i}_pred.pose")
+            print(f"  Saved: {out_dir}/sample{i}_idx{idx}_gt.pose, sample{i}_idx{idx}_pred.pose")
     
     # ====== SUMMARY ======
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print(f"SUMMARY (clip_denoised={CLIP_DENOISED})")
     print("=" * 70)
     
     avg_ratio_norm = np.mean([r['ratio_norm'] for r in results])
@@ -290,6 +298,16 @@ def test_checkpoint():
     print(f"Average Disp Ratio (unnormalized, numpy): {avg_ratio_unnorm_np:.4f}")
     print(f"Average MPJPE: {avg_mpjpe:.6f}")
     print(f"Average PCK@0.1: {avg_pck:.1f}%")
+    
+    # Per-sample table
+    print("\n" + "-" * 70)
+    print("Per-sample results:")
+    print("-" * 70)
+    print(f"{'idx':>5} | {'GT disp':>8} | {'Pred disp':>9} | {'Ratio':>6} | {'PCK':>6}")
+    print("-" * 70)
+    for r in results:
+        print(f"{r['idx']:>5} | {r['gt_disp_np']:>8.4f} | {r['pred_disp_np']:>9.4f} | {r['ratio_unnorm_np']:>6.2f} | {r['pck']:>5.1f}%")
+    print("-" * 70)
     
     # ====== DIAGNOSIS ======
     print("\n" + "=" * 70)
