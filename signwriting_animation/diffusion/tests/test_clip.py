@@ -366,7 +366,7 @@ def test_unfrozen_clip():
     # ============================================================
     # CONFIGURATION
     # ============================================================
-    NUM_SAMPLES = 4
+    NUM_SAMPLES = 8  # 增加样本数量，让对比学习更有效
     MAX_EPOCHS = 200
     DIFFUSION_STEPS = 8
     FREEZE_CLIP = False  # ← KEY: Set to False to unfreeze CLIP
@@ -375,13 +375,13 @@ def test_unfrozen_clip():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = f"logs/unfrozen_clip_contrastive_{NUM_SAMPLES}sample"
+    out_dir = f"logs/unfrozen_clip_contrastive_diffvideos_{NUM_SAMPLES}sample"
     # ============================================================
     
     os.makedirs(out_dir, exist_ok=True)
     
     print("=" * 70)
-    print("4-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE LOSS")
+    print("8-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE (DIFF VIDEOS)")
     print("=" * 70)
     print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
@@ -401,12 +401,13 @@ def test_unfrozen_clip():
     )
     
     # ============================================================
-    # IMPORTANT: Select samples with DIFFERENT SignWriting text!
-    # Same pose file can have different texts (different time segments)
+    # IMPORTANT: Select samples with DIFFERENT pose files AND texts!
+    # This ensures truly different SignWriting images
     # ============================================================
-    print("\n  Finding samples with different SignWriting texts...")
+    print("\n  Finding samples from different videos with different texts...")
     
     seen_texts = set()
+    seen_poses = set()
     selected_indices = []
     
     for idx in range(len(full_ds)):
@@ -415,15 +416,17 @@ def test_unfrozen_clip():
         
         record = full_ds.records[idx]
         text = record.get("text", "")
+        pose = record.get("pose", "")
         
-        # Only keep samples with unique text
-        if text and text not in seen_texts:
+        # Only keep samples with unique text AND unique pose file
+        if text and text not in seen_texts and pose not in seen_poses:
             seen_texts.add(text)
+            seen_poses.add(pose)
             selected_indices.append(idx)
-            print(f"    Selected idx={idx}, text={text[:40]}...")
+            print(f"    Selected idx={idx}, pose={pose[:30]}..., text={text[:30]}...")
     
     if len(selected_indices) < NUM_SAMPLES:
-        print(f"  WARNING: Only found {len(selected_indices)} unique texts!")
+        print(f"  WARNING: Only found {len(selected_indices)} unique samples!")
     
     print(f"  Selected indices: {selected_indices}")
     
