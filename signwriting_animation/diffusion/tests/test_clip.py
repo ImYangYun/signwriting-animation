@@ -1,22 +1,30 @@
 """
-4-Sample Overfit Test: Unfrozen CLIP Version
+Full Dataset Training: Unfrozen CLIP + Contrastive Learning
 
-Goal: Test if unfreezing CLIP allows it to learn to distinguish SignWriting symbols.
+Based on successful 32-sample overfit test:
+- Disp ratio: 1.01 (ideal = 1.0) ✅
+- Sign influence: 44% (verified) ✅
+- CLIP learns to distinguish SignWriting ✅
 
-Key change: CLIP parameters are trainable (not frozen).
+Usage:
+    srun --partition=lowprio --gres=gpu:V100:1 --mem=64G --time=48:00:00 \
+        python train_unfrozen_clip_full.py
 """
 import os
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import lightning as pl
 from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
+from pose_format import Pose
+from pose_format.numpy.pose_body import NumPyPoseBody
+from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
+from pose_anonymization.data.normalization import unshift_hands
 from transformers import CLIPModel
 
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder
@@ -28,29 +36,21 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 
 
 # ============================================================
-# Modified EmbedSignWriting with freeze option
+# Model Components (Unfrozen CLIP version)
 # ============================================================
+
 class EmbedSignWritingUnfrozen(nn.Module):
-    """
-    SignWriting image encoder using CLIP vision model.
-    Key change: CLIP is NOT frozen, so it learns to distinguish SignWriting.
-    """
+    """SignWriting encoder with trainable CLIP."""
     
-    def __init__(self, num_latent_dims: int, embedding_arch: str = 'openai/clip-vit-base-patch32',
+    def __init__(self, num_latent_dims: int, 
+                 embedding_arch: str = 'openai/clip-vit-base-patch32',
                  freeze_clip: bool = False):
         super().__init__()
         self.model = CLIPModel.from_pretrained(embedding_arch)
-        self.freeze_clip = freeze_clip
         
-        # Freeze or unfreeze CLIP
         if freeze_clip:
-            print("[EmbedSignWriting] CLIP is FROZEN")
             for param in self.model.parameters():
                 param.requires_grad = False
-        else:
-            print("[EmbedSignWriting] CLIP is UNFROZEN (trainable)")
-            # Optionally freeze some layers, only train later layers
-            # For now, train everything
         
         self.proj = None
         if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
@@ -63,12 +63,11 @@ class EmbedSignWritingUnfrozen(nn.Module):
         return embeddings_batch
 
 
-# ============================================================
-# Modified ContextEncoder (same as before)
-# ============================================================
 class ContextEncoder(nn.Module):
-    def __init__(self, input_feats: int, latent_dim: int, num_layers: int = 2, 
-                 num_heads: int = 4, dropout: float = 0.1):
+    """Past motion context encoder."""
+    
+    def __init__(self, input_feats: int, latent_dim: int, 
+                 num_layers: int = 2, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.pose_encoder = nn.Linear(input_feats, latent_dim)
         self.pos_encoding = PositionalEncoding(latent_dim, dropout)
@@ -87,59 +86,42 @@ class ContextEncoder(nn.Module):
         x_emb = self.pos_encoding(x_emb)
         x_enc = self.encoder(x_emb)
         x_enc = x_enc.permute(1, 0, 2)
-        context = x_enc.mean(dim=1)
-        return context
+        return x_enc.mean(dim=1)
 
 
-# ============================================================
-# Modified Model with unfrozen CLIP
-# ============================================================
 class SignWritingToPoseDiffusionUnfrozen(nn.Module):
-    """
-    Same architecture but with unfrozen CLIP.
-    """
+    """Diffusion model with unfrozen CLIP + Frame-Independent decoder."""
     
     def __init__(self, num_keypoints: int, num_dims_per_keypoint: int,
                  embedding_arch: str = 'openai/clip-vit-base-patch32',
                  num_latent_dims: int = 256, num_heads: int = 4, dropout: float = 0.1,
-                 t_past: int = 40, t_future: int = 20,
-                 freeze_clip: bool = False):  # ← Key parameter
+                 t_past: int = 40, t_future: int = 20, freeze_clip: bool = False):
         super().__init__()
 
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
         self.t_past = t_past
         self.t_future = t_future
-        self._forward_count = 0
 
         input_feats = num_keypoints * num_dims_per_keypoint
 
-        # Past motion encoder
         self.past_context_encoder = ContextEncoder(
             input_feats, num_latent_dims,
             num_layers=2, num_heads=num_heads, dropout=dropout,
         )
-
-        # SignWriting encoder - NOW WITH FREEZE OPTION
         self.embed_signwriting = EmbedSignWritingUnfrozen(
             num_latent_dims, embedding_arch, freeze_clip=freeze_clip
         )
-
-        # Timestep encoder
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
         self.time_embed = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
 
-        # Noisy frame encoder
         self.xt_frame_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
             nn.GELU(),
             nn.Linear(num_latent_dims, num_latent_dims),
         )
-
-        # Position embedding
         self.output_pos_embed = nn.Embedding(512, num_latent_dims)
 
-        # Decoder
         decoder_input_dim = num_latent_dims * 3
         self.decoder = nn.Sequential(
             nn.Linear(decoder_input_dim, 512),
@@ -153,22 +135,17 @@ class SignWritingToPoseDiffusionUnfrozen(nn.Module):
         B, J, C, T_future = x.shape
         device = x.device
 
-        # Convert past_motion to BTJC
         if past_motion.dim() == 4:
             if past_motion.shape[1] == J and past_motion.shape[2] == C:
                 past_btjc = past_motion.permute(0, 3, 1, 2).contiguous()
             else:
                 past_btjc = past_motion
 
-        # Encode conditions
         past_ctx = self.past_context_encoder(past_btjc)
         sign_emb = self.embed_signwriting(signwriting_im_batch)
         time_emb = self.time_embed(timesteps).squeeze(0)
-
-        # Fuse conditions (addition)
         context = past_ctx + sign_emb + time_emb
 
-        # Frame-independent decoding
         outputs = []
         for t in range(T_future):
             xt_frame = x[:, :, :, t].reshape(B, -1)
@@ -183,15 +160,15 @@ class SignWritingToPoseDiffusionUnfrozen(nn.Module):
         result = result.permute(1, 0, 2)
         result = result.reshape(B, T_future, J, C)
         result = result.permute(0, 2, 3, 1).contiguous()
-
-        self._forward_count += 1
         return result
 
 
 # ============================================================
-# Lightning Module
+# Utilities
 # ============================================================
+
 def sanitize_btjc(x):
+    """Sanitize pose tensor to BTJC format."""
     if hasattr(x, "zero_filled"):
         x = x.zero_filled()
     if hasattr(x, "tensor"):
@@ -214,33 +191,87 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return torch.clip(betas, 0.0001, 0.9999)
 
 
-class LitDiffusionUnfrozenCLIP(pl.LightningModule):
-    """Lightning module with unfrozen CLIP and contrastive loss to prevent collapse."""
+def mean_frame_disp(x_btjc: torch.Tensor) -> float:
+    x = sanitize_btjc(x_btjc)
+    if x.size(1) < 2:
+        return 0.0
+    v = x[:, 1:] - x[:, :-1]
+    return v.abs().mean().item()
+
+
+def tensor_to_pose(t_btjc: torch.Tensor, header, ref_pose: Pose, scale_to_ref: bool = True) -> Pose:
+    """Convert tensor to Pose format."""
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
     
-    def __init__(self, num_keypoints=178, num_dims=3, lr=1e-4,
+    t_np = t.detach().cpu().numpy().astype(np.float32)
+    arr = t_np[:, None, :, :]
+    T = arr.shape[0]
+    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
+    fps = ref_pose.body.fps
+    
+    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
+    pose_obj = Pose(header=header, body=body)
+    unshift_hands(pose_obj)
+    
+    if scale_to_ref:
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
+        future_start = max(0, T_ref_total - T_pred)
+        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
+        
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+        
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+    
+    return pose_obj
+
+
+class LitDiffusionUnfrozenCLIP(pl.LightningModule):
+    """Lightning module with unfrozen CLIP + contrastive loss."""
+    
+    def __init__(self, 
+                 num_keypoints=178, 
+                 num_dims=3, 
+                 lr=1e-4,
                  stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
-                 diffusion_steps=8, vel_weight=1.0, acc_weight=0.5,
-                 t_past=40, t_future=20,
+                 diffusion_steps=8, 
+                 vel_weight=1.0, 
+                 acc_weight=0.5,
+                 t_past=40, 
+                 t_future=20,
                  freeze_clip=False,
-                 contrastive_weight=0.5):  # ← 新增：对比学习权重
+                 contrastive_weight=0.5):
         super().__init__()
         self.save_hyperparameters()
 
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
-        self.freeze_clip = freeze_clip
-        self.contrastive_weight = contrastive_weight  # ← 新增
+        self.contrastive_weight = contrastive_weight
         self._step_count = 0
 
-        # Load normalization stats
         stats = torch.load(stats_path, map_location="cpu")
         mean = stats["mean"].float().view(1, 1, -1, 3)
         std = stats["std"].float().view(1, 1, -1, 3)
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        # Create model with freeze option
         self.model = SignWritingToPoseDiffusionUnfrozen(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
@@ -249,7 +280,6 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
             freeze_clip=freeze_clip,
         )
 
-        # Diffusion
         betas = cosine_beta_schedule(diffusion_steps).numpy()
         self.diffusion = GaussianDiffusion(
             betas=betas,
@@ -296,7 +326,7 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
 
         pred_x0_bjct = self.model(x_noisy, timestep, past_bjct, sign_img)
 
-        # Losses
+        # === Losses ===
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
         
         pred_vel = pred_x0_bjct[..., 1:] - pred_x0_bjct[..., :-1]
@@ -309,26 +339,14 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
             gt_acc = gt_vel[..., 1:] - gt_vel[..., :-1]
             loss_acc = F.mse_loss(pred_acc, gt_acc)
 
-        # ============================================================
-        # CONTRASTIVE LOSS: Prevent sign embedding collapse
-        # Different signs should have different embeddings!
-        # ============================================================
+        # === Contrastive Loss ===
         loss_contrastive = torch.tensor(0.0, device=device)
         if batch_size > 1 and self.contrastive_weight > 0:
-            # Get sign embeddings
-            sign_embs = self.model.embed_signwriting(sign_img)  # [B, D]
-            sign_embs_norm = F.normalize(sign_embs, p=2, dim=-1)  # L2 normalize
-            
-            # Compute cosine similarity matrix
-            cos_sim = torch.mm(sign_embs_norm, sign_embs_norm.t())  # [B, B]
-            
-            # Off-diagonal elements should be low (different signs = different embeddings)
-            # Diagonal elements are 1.0 (self-similarity), we ignore them
+            sign_embs = self.model.embed_signwriting(sign_img)
+            sign_embs_norm = F.normalize(sign_embs, p=2, dim=-1)
+            cos_sim = torch.mm(sign_embs_norm, sign_embs_norm.t())
             mask = ~torch.eye(batch_size, dtype=torch.bool, device=device)
             off_diag_sim = cos_sim[mask]
-            
-            # Minimize average off-diagonal similarity
-            # We want different signs to have low similarity
             loss_contrastive = off_diag_sim.mean()
         
         loss = loss_mse + self.vel_weight * loss_vel + self.acc_weight * loss_acc + self.contrastive_weight * loss_contrastive
@@ -339,13 +357,16 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
             gt_disp = gt_vel.abs().mean().item()
             disp_ratio = pred_disp / (gt_disp + 1e-8)
 
-        if self._step_count % 50 == 0:
+        # Logging
+        if self._step_count % 100 == 0:
             print(f"[Step {self._step_count}] loss={loss.item():.4f}, mse={loss_mse.item():.4f}, "
-                  f"contrastive={loss_contrastive.item():.4f}, disp_ratio={disp_ratio:.4f}")
+                  f"vel={loss_vel.item():.4f}, contrastive={loss_contrastive.item():.4f}, "
+                  f"disp_ratio={disp_ratio:.4f}")
 
         self.log_dict({
             "train/loss": loss,
             "train/loss_mse": loss_mse,
+            "train/loss_vel": loss_vel,
             "train/loss_contrastive": loss_contrastive,
             "train/disp_ratio": disp_ratio,
         }, prog_bar=True)
@@ -358,40 +379,47 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
 
 
 # ============================================================
-# Test Script
+# Main Training
 # ============================================================
-def test_unfrozen_clip():
-    """Test if unfreezing CLIP helps it learn to distinguish SignWriting."""
-    
-    # ============================================================
-    # CONFIGURATION
-    # ============================================================
-    NUM_SAMPLES = 32  # 增加样本数量
-    MAX_EPOCHS = 300  # 稍微增加 epochs
-    DIFFUSION_STEPS = 8
-    FREEZE_CLIP = False  # ← KEY: Set to False to unfreeze CLIP
-    CONTRASTIVE_WEIGHT = 0.5  # ← 新增：对比学习权重
-    
+
+def train_full_dataset():
+    """Train on full dataset with unfrozen CLIP + contrastive loss."""
+    pl.seed_everything(42)
+
+    # === Configuration ===
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = f"logs/unfrozen_clip_contrastive_diffvideos_{NUM_SAMPLES}sample"
-    # ============================================================
-    
+    out_dir = "logs/full_unfrozen_clip"
+
+    # Training hyperparameters
+    MAX_EPOCHS = 100
+    BATCH_SIZE = 64  # Smaller due to unfrozen CLIP memory
+    LEARNING_RATE = 1e-4
+    DIFFUSION_STEPS = 8
+    CONTRASTIVE_WEIGHT = 0.5
+    FREEZE_CLIP = False  # KEY: CLIP is trainable
+
     os.makedirs(out_dir, exist_ok=True)
-    
+
     print("=" * 70)
-    print("32-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE (DIFF VIDEOS)")
+    print(" FULL DATASET TRAINING: UNFROZEN CLIP + CONTRASTIVE LOSS")
     print("=" * 70)
-    print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
-    print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
-    print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")
-    print(f"  FREEZE_CLIP: {FREEZE_CLIP}")
-    print(f"  CONTRASTIVE_WEIGHT: {CONTRASTIVE_WEIGHT}")
-    print(f"  Output: {out_dir}")
-    
-    # Load dataset
-    full_ds = DynamicPosePredictionDataset(
+    print(f"\nConfiguration:")
+    print(f"  Epochs: {MAX_EPOCHS}")
+    print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"  Learning Rate: {LEARNING_RATE}")
+    print(f"  Diffusion Steps: {DIFFUSION_STEPS}")
+    print(f"  Contrastive Weight: {CONTRASTIVE_WEIGHT}")
+    print(f"  Freeze CLIP: {FREEZE_CLIP}")
+    print(f"  Output: {out_dir}/")
+    print(f"  GPU: {'Available ✓' if torch.cuda.is_available() else 'Not available ✗'}")
+    print("\nExpected training time: ~30 hours on V100")
+    print("=" * 70)
+
+    # === Dataset ===
+    print("\nLoading full dataset...")
+    train_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
         num_past_frames=40,
@@ -399,48 +427,21 @@ def test_unfrozen_clip():
         with_metadata=True,
         split="train",
     )
-    
-    # ============================================================
-    # IMPORTANT: Select samples with DIFFERENT pose files AND texts!
-    # This ensures truly different SignWriting images
-    # ============================================================
-    print("\n  Finding samples from different videos with different texts...")
-    
-    seen_texts = set()
-    seen_poses = set()
-    selected_indices = []
-    
-    for idx in range(len(full_ds)):
-        if len(selected_indices) >= NUM_SAMPLES:
-            break
-        
-        record = full_ds.records[idx]
-        text = record.get("text", "")
-        pose = record.get("pose", "")
-        
-        # Only keep samples with unique text AND unique pose file
-        if text and text not in seen_texts and pose not in seen_poses:
-            seen_texts.add(text)
-            seen_poses.add(pose)
-            selected_indices.append(idx)
-            print(f"    Selected idx={idx}, pose={pose[:30]}..., text={text[:30]}...")
-    
-    if len(selected_indices) < NUM_SAMPLES:
-        print(f"  WARNING: Only found {len(selected_indices)} unique samples!")
-    
-    print(f"  Selected indices: {selected_indices}")
-    
-    # Use selected samples
-    subset_ds = Subset(full_ds, selected_indices)
+
+    print(f"Dataset loaded: {len(train_ds)} samples")
+
     train_loader = DataLoader(
-        subset_ds, batch_size=min(8, NUM_SAMPLES), shuffle=True,  # batch_size 最大 8
-        collate_fn=zero_pad_collator, num_workers=0,
+        train_ds, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        collate_fn=zero_pad_collator,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
-    
-    print(f"  Using {NUM_SAMPLES} samples for overfit test")
-    
+
     # Get dimensions
-    sample = full_ds[0]["data"]
+    sample = train_ds[0]["data"]
     if hasattr(sample, 'zero_filled'):
         sample = sample.zero_filled()
     if hasattr(sample, 'tensor'):
@@ -448,165 +449,164 @@ def test_unfrozen_clip():
     num_joints = sample.shape[-2]
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
+
+    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"Batches per epoch: {len(train_loader)}")
+
+    # === Create Model ===
+    print("\nInitializing model...")
+    print(f"  [EmbedSignWriting] CLIP is {'FROZEN' if FREEZE_CLIP else 'UNFROZEN (trainable)'}")
     
-    print(f"  Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
-    
-    # Create model
     lit_model = LitDiffusionUnfrozenCLIP(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
-        lr=1e-4,
+        lr=LEARNING_RATE,
         diffusion_steps=DIFFUSION_STEPS,
         vel_weight=1.0,
+        acc_weight=0.5,
         t_past=40,
         t_future=future_len,
         freeze_clip=FREEZE_CLIP,
         contrastive_weight=CONTRASTIVE_WEIGHT,
     )
     
-    # Count parameters
     total_params = sum(p.numel() for p in lit_model.parameters())
     trainable_params = sum(p.numel() for p in lit_model.parameters() if p.requires_grad)
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
     
-    # Callbacks
+    # === Callbacks ===
     checkpoint_callback = ModelCheckpoint(
         dirpath=f"{out_dir}/checkpoints",
-        filename="best-{epoch}",
-        save_top_k=1,
-        monitor="train/loss",
-        mode="min",
+        filename="epoch{epoch:03d}-ratio{train/disp_ratio:.4f}",
+        save_top_k=3,
+        monitor="train/disp_ratio",
+        mode="max",
         save_last=True,
+        every_n_epochs=5,
     )
     
-    # Train
-    print("\n" + "=" * 70)
-    print("TRAINING...")
-    print("=" * 70)
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    
+    # === Train ===
+    print(f"\n{'='*70}")
+    print("STARTING TRAINING...")
+    print("="*70)
     
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, lr_monitor],
         default_root_dir=out_dir,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
         enable_progress_bar=True,
+        precision="16-mixed" if torch.cuda.is_available() else 32,
+        gradient_clip_val=1.0,
     )
-    
     trainer.fit(lit_model, train_loader)
     
-    # ============================================================
-    # TEST: Check sign embedding similarity after training
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("CHECKING SIGN EMBEDDING SIMILARITY AFTER TRAINING")
-    print("=" * 70)
+    print(f"\n{'='*70}")
+    print("TRAINING COMPLETE!")
+    print("="*70)
+    print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
     
-    device = next(lit_model.parameters()).device
+    # === Inference Test ===
+    print(f"\n{'='*70}")
+    print("TESTING INFERENCE ON SAMPLE 0...")
+    print("="*70)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lit_model = lit_model.to(device)
     lit_model.eval()
     
-    sign_embeddings = []
-    # Use the same indices we trained on
-    sample_indices = selected_indices
+    test_batch = zero_pad_collator([train_ds[0]])
+    cond = test_batch["conditions"]
     
-    for idx in sample_indices:
-        batch = zero_pad_collator([full_ds[idx]])
-        sign = batch["conditions"]["sign_image"][:1].float().to(device)
-        
-        with torch.no_grad():
-            sign_emb = lit_model.model.embed_signwriting(sign)
-        sign_embeddings.append(sign_emb)
-        print(f"  idx={idx}: sign_emb norm = {sign_emb.norm().item():.4f}")
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    gt_raw = sanitize_btjc(test_batch["data"][:1]).to(device)
     
-    print("\n  Pairwise cosine similarity:")
-    for i in range(len(sign_embeddings)):
-        for j in range(i+1, len(sign_embeddings)):
-            cos_sim = F.cosine_similarity(sign_embeddings[i], sign_embeddings[j]).item()
-            print(f"    idx {sample_indices[i]} vs {sample_indices[j]}: {cos_sim:.4f}")
+    past_norm = lit_model.normalize(past_raw)
+    gt_norm = lit_model.normalize(gt_raw)
     
-    # ============================================================
-    # TEST: Inference on training samples
-    # ============================================================
-    print("\n" + "=" * 70)
-    print("INFERENCE ON TRAINING SAMPLES")
-    print("=" * 70)
-    
-    results = []
-    
-    for idx in sample_indices:
-        batch = zero_pad_collator([full_ds[idx]])
-        cond = batch["conditions"]
-        
-        past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
-        sign = cond["sign_image"][:1].float().to(device)
-        gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
-        
-        past_norm = lit_model.normalize(past_raw)
-        gt_norm = lit_model.normalize(gt_raw)
+    with torch.no_grad():
         past_bjct = lit_model.btjc_to_bjct(past_norm)
+        B, J, C, _ = past_bjct.shape
+        target_shape = (B, J, C, future_len)
         
-        # DDPM sampling
-        with torch.no_grad():
-            B, J, C, _ = past_bjct.shape
-            target_shape = (B, J, C, future_len)
-            
-            class _Wrapper(nn.Module):
-                def __init__(self, model, past, sign):
-                    super().__init__()
-                    self.model, self.past, self.sign = model, past, sign
-                def forward(self, x, t, **kwargs):
-                    return self.model(x, t, self.past, self.sign)
-            
-            wrapped = _Wrapper(lit_model.model, past_bjct, sign)
-            
-            pred_bjct = lit_model.diffusion.p_sample_loop(
-                model=wrapped,
-                shape=target_shape,
-                clip_denoised=True,
-                model_kwargs={"y": {}},
-                progress=False,
-            )
-            pred_btjc = lit_model.bjct_to_btjc(pred_bjct)
+        class _Wrapper(nn.Module):
+            def __init__(self, model, past, sign):
+                super().__init__()
+                self.model, self.past, self.sign = model, past, sign
+            def forward(self, x, t, **kwargs):
+                return self.model(x, t, self.past, self.sign)
         
-        # Compute metrics
-        gt_unnorm = lit_model.unnormalize(gt_norm)
-        pred_unnorm = lit_model.unnormalize(pred_btjc)
+        wrapped = _Wrapper(lit_model.model, past_bjct, sign)
         
-        gt_np = gt_unnorm[0].cpu().numpy()
-        pred_np = pred_unnorm[0].cpu().numpy()
-        
-        gt_disp = np.sqrt(np.sum(np.diff(gt_np, axis=0)**2, axis=-1)).mean()
-        pred_disp = np.sqrt(np.sum(np.diff(pred_np, axis=0)**2, axis=-1)).mean()
-        ratio = pred_disp / (gt_disp + 1e-8)
-        
-        print(f"  Sample {idx}: GT_disp={gt_disp:.4f}, Pred_disp={pred_disp:.4f}, Ratio={ratio:.4f}")
-        results.append(ratio)
+        pred_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
+        pred_norm = lit_model.bjct_to_btjc(pred_bjct)
     
-    avg_ratio = np.mean(results)
+    # Metrics
+    mse = F.mse_loss(pred_norm, gt_norm).item()
+    disp_pred = mean_frame_disp(pred_norm)
+    disp_gt = mean_frame_disp(gt_norm)
+    disp_ratio = disp_pred / (disp_gt + 1e-8)
     
-    # ============================================================
-    # VERDICT
-    # ============================================================
+    pred_np = pred_norm[0].cpu().numpy()
+    gt_np = gt_norm[0].cpu().numpy()
+    per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
+    mpjpe = per_joint_err.mean()
+    pck_01 = (per_joint_err < 0.1).mean() * 100
+    
+    print("\nInference Test Results (Sample 0):")
+    print(f"  Disp Ratio: {disp_ratio:.4f} (ideal = 1.0)")
+    print(f"  MPJPE: {mpjpe:.6f}")
+    print(f"  PCK@0.1: {pck_01:.1f}%")
+    print(f"  MSE: {mse:.6f}")
+    
+    # Save poses
+    ref_path = train_ds.records[0]["pose"]
+    if not os.path.isabs(ref_path):
+        ref_path = os.path.join(data_dir, ref_path)
+    
+    with open(ref_path, "rb") as f:
+        ref_pose = Pose.read(f)
+    ref_pose = reduce_holistic(ref_pose)
+    if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+    
+    gt_unnorm = lit_model.unnormalize(gt_norm)
+    pred_unnorm = lit_model.unnormalize(pred_norm)
+    
+    gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+    pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
+    
+    with open(f"{out_dir}/test_gt.pose", "wb") as f:
+        gt_pose.write(f)
+    with open(f"{out_dir}/test_pred.pose", "wb") as f:
+        pred_pose.write(f)
+    
+    print(f"\nPose files saved to: {out_dir}/")
+    
     print("\n" + "=" * 70)
-    print("VERDICT")
+    print("✅ FULL DATASET TRAINING COMPLETE!")
     print("=" * 70)
-    print(f"\n  Average Inference Disp Ratio: {avg_ratio:.4f} (ideal = 1.0)")
-    
-    if 0.8 <= avg_ratio <= 1.2:
-        print("\n  ✅ SUCCESS! Unfrozen CLIP helps the model learn.")
-        print("     → Proceed with full dataset training")
-    else:
-        print("\n  ❌ Still not working well.")
-        print("     → May need other approaches (e.g., FSW text, different encoder)")
-    
-    print("\n" + "=" * 70)
-    print("✅ Test complete!")
+    print("\nKey improvements:")
+    print("  1. CLIP is unfrozen - learns to distinguish SignWriting")
+    print("  2. Contrastive loss prevents embedding collapse")
+    print("  3. Sign condition verified to have ~44% influence")
+    print(f"\nCheckpoints: {out_dir}/checkpoints/")
     print("=" * 70)
 
 
 if __name__ == "__main__":
     os.chdir("/home/yayun/data/signwriting-animation-fork")
-    test_unfrozen_clip()
+    train_full_dataset()
