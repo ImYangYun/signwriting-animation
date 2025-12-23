@@ -84,7 +84,7 @@ def test_checkpoint():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = f"logs/full/eval_clip{CLIP_DENOISED}"  # 不同配置存不同目录
+    out_dir = f"logs/full/eval_clip_v1{CLIP_DENOISED}"
     # ============================================================
     
     os.makedirs(out_dir, exist_ok=True)
@@ -141,7 +141,7 @@ def test_checkpoint():
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-4,
-        diffusion_steps=50,
+        diffusion_steps=8,
         vel_weight=1.0,
         t_past=40,
         t_future=future_len,
