@@ -215,13 +215,14 @@ def cosine_beta_schedule(timesteps, s=0.008):
 
 
 class LitDiffusionUnfrozenCLIP(pl.LightningModule):
-    """Lightning module with unfrozen CLIP."""
+    """Lightning module with unfrozen CLIP and contrastive loss to prevent collapse."""
     
     def __init__(self, num_keypoints=178, num_dims=3, lr=1e-4,
                  stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
                  diffusion_steps=8, vel_weight=1.0, acc_weight=0.5,
                  t_past=40, t_future=20,
-                 freeze_clip=False):  # ← Key parameter
+                 freeze_clip=False,
+                 contrastive_weight=0.5):  # ← 新增：对比学习权重
         super().__init__()
         self.save_hyperparameters()
 
@@ -229,6 +230,7 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
         self.freeze_clip = freeze_clip
+        self.contrastive_weight = contrastive_weight  # ← 新增
         self._step_count = 0
 
         # Load normalization stats
@@ -307,7 +309,29 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
             gt_acc = gt_vel[..., 1:] - gt_vel[..., :-1]
             loss_acc = F.mse_loss(pred_acc, gt_acc)
 
-        loss = loss_mse + self.vel_weight * loss_vel + self.acc_weight * loss_acc
+        # ============================================================
+        # CONTRASTIVE LOSS: Prevent sign embedding collapse
+        # Different signs should have different embeddings!
+        # ============================================================
+        loss_contrastive = torch.tensor(0.0, device=device)
+        if batch_size > 1 and self.contrastive_weight > 0:
+            # Get sign embeddings
+            sign_embs = self.model.embed_signwriting(sign_img)  # [B, D]
+            sign_embs_norm = F.normalize(sign_embs, p=2, dim=-1)  # L2 normalize
+            
+            # Compute cosine similarity matrix
+            cos_sim = torch.mm(sign_embs_norm, sign_embs_norm.t())  # [B, B]
+            
+            # Off-diagonal elements should be low (different signs = different embeddings)
+            # Diagonal elements are 1.0 (self-similarity), we ignore them
+            mask = ~torch.eye(batch_size, dtype=torch.bool, device=device)
+            off_diag_sim = cos_sim[mask]
+            
+            # Minimize average off-diagonal similarity
+            # We want different signs to have low similarity
+            loss_contrastive = off_diag_sim.mean()
+        
+        loss = loss_mse + self.vel_weight * loss_vel + self.acc_weight * loss_acc + self.contrastive_weight * loss_contrastive
 
         # Displacement ratio
         with torch.no_grad():
@@ -316,10 +340,13 @@ class LitDiffusionUnfrozenCLIP(pl.LightningModule):
             disp_ratio = pred_disp / (gt_disp + 1e-8)
 
         if self._step_count % 50 == 0:
-            print(f"[Step {self._step_count}] loss={loss.item():.4f}, disp_ratio={disp_ratio:.4f}")
+            print(f"[Step {self._step_count}] loss={loss.item():.4f}, mse={loss_mse.item():.4f}, "
+                  f"contrastive={loss_contrastive.item():.4f}, disp_ratio={disp_ratio:.4f}")
 
         self.log_dict({
             "train/loss": loss,
+            "train/loss_mse": loss_mse,
+            "train/loss_contrastive": loss_contrastive,
             "train/disp_ratio": disp_ratio,
         }, prog_bar=True)
 
@@ -343,22 +370,24 @@ def test_unfrozen_clip():
     MAX_EPOCHS = 200
     DIFFUSION_STEPS = 8
     FREEZE_CLIP = False  # ← KEY: Set to False to unfreeze CLIP
+    CONTRASTIVE_WEIGHT = 0.5  # ← 新增：对比学习权重
     
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = f"logs/unfrozen_clip_{NUM_SAMPLES}sample"
+    out_dir = f"logs/unfrozen_clip_contrastive_{NUM_SAMPLES}sample"
     # ============================================================
     
     os.makedirs(out_dir, exist_ok=True)
     
     print("=" * 70)
-    print("4-SAMPLE OVERFIT TEST: UNFROZEN CLIP")
+    print("4-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE LOSS")
     print("=" * 70)
     print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
     print(f"  DIFFUSION_STEPS: {DIFFUSION_STEPS}")
     print(f"  FREEZE_CLIP: {FREEZE_CLIP}")
+    print(f"  CONTRASTIVE_WEIGHT: {CONTRASTIVE_WEIGHT}")
     print(f"  Output: {out_dir}")
     
     # Load dataset
@@ -372,12 +401,12 @@ def test_unfrozen_clip():
     )
     
     # ============================================================
-    # IMPORTANT: Select samples from DIFFERENT pose files!
-    # idx 0,1,2,3 may be from the same video with same SignWriting
+    # IMPORTANT: Select samples with DIFFERENT SignWriting text!
+    # Same pose file can have different texts (different time segments)
     # ============================================================
-    print("\n  Finding samples from different pose files...")
+    print("\n  Finding samples with different SignWriting texts...")
     
-    seen_files = set()
+    seen_texts = set()
     selected_indices = []
     
     for idx in range(len(full_ds)):
@@ -385,15 +414,16 @@ def test_unfrozen_clip():
             break
         
         record = full_ds.records[idx]
-        pose_file = record["pose"]
+        text = record.get("text", "")
         
-        if pose_file not in seen_files:
-            seen_files.add(pose_file)
+        # Only keep samples with unique text
+        if text and text not in seen_texts:
+            seen_texts.add(text)
             selected_indices.append(idx)
-            print(f"    Selected idx={idx}, file={os.path.basename(pose_file)}")
+            print(f"    Selected idx={idx}, text={text[:40]}...")
     
     if len(selected_indices) < NUM_SAMPLES:
-        print(f"  WARNING: Only found {len(selected_indices)} unique files!")
+        print(f"  WARNING: Only found {len(selected_indices)} unique texts!")
     
     print(f"  Selected indices: {selected_indices}")
     
@@ -429,6 +459,7 @@ def test_unfrozen_clip():
         t_past=40,
         t_future=future_len,
         freeze_clip=FREEZE_CLIP,
+        contrastive_weight=CONTRASTIVE_WEIGHT,
     )
     
     # Count parameters
