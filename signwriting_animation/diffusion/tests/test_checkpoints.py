@@ -81,7 +81,7 @@ def test_checkpoint():
     print("=" * 70)
     
     # Configuration
-    ckpt_path = "logs/full/checkpoints/last-2.ckpt"
+    ckpt_path = "logs/full/checkpoints/last-v2.ckpt"
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
