@@ -452,7 +452,7 @@ def train_full_dataset():
 
     # Training hyperparameters
     MAX_EPOCHS = 100
-    BATCH_SIZE = 64  # Smaller due to unfrozen CLIP memory
+    BATCH_SIZE = 1024  # Smaller due to unfrozen CLIP memory
     LEARNING_RATE = 1e-4
     DIFFUSION_STEPS = 8
     CONTRASTIVE_WEIGHT = 0.5
