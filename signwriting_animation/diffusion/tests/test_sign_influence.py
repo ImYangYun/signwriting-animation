@@ -18,7 +18,7 @@ sys.path.insert(0, "/home/yayun/data/signwriting-animation-fork")
 os.chdir("/home/yayun/data/signwriting-animation-fork")
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from test_unfrozen_clip import (
+from test_clip import (
     LitDiffusionUnfrozenCLIP, 
     sanitize_btjc,
 )
