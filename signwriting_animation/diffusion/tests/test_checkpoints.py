@@ -199,7 +199,7 @@ def test_checkpoint():
             pred_bjct = lit_model.diffusion.p_sample_loop(
                 model=wrapped,
                 shape=target_shape,
-                clip_denoised=False,
+                clip_denoised=True,
                 model_kwargs={"y": {}},
                 progress=False,
             )
