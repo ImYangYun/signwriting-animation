@@ -26,7 +26,7 @@ def test_4sample_overfit():
     # CONFIGURATION
     # ============================================================
     NUM_SAMPLES = 4
-    MAX_EPOCHS = 100  # 足够 overfit
+    MAX_EPOCHS = 500
     DIFFUSION_STEPS = 8
     BATCH_SIZE = 4
     DISP_WEIGHT = 1.0  # displacement loss 权重
