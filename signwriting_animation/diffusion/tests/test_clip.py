@@ -366,8 +366,8 @@ def test_unfrozen_clip():
     # ============================================================
     # CONFIGURATION
     # ============================================================
-    NUM_SAMPLES = 8  # 增加样本数量，让对比学习更有效
-    MAX_EPOCHS = 200
+    NUM_SAMPLES = 32  # 增加样本数量
+    MAX_EPOCHS = 300  # 稍微增加 epochs
     DIFFUSION_STEPS = 8
     FREEZE_CLIP = False  # ← KEY: Set to False to unfreeze CLIP
     CONTRASTIVE_WEIGHT = 0.5  # ← 新增：对比学习权重
@@ -381,7 +381,7 @@ def test_unfrozen_clip():
     os.makedirs(out_dir, exist_ok=True)
     
     print("=" * 70)
-    print("8-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE (DIFF VIDEOS)")
+    print("32-SAMPLE OVERFIT TEST: UNFROZEN CLIP + CONTRASTIVE (DIFF VIDEOS)")
     print("=" * 70)
     print(f"  NUM_SAMPLES: {NUM_SAMPLES}")
     print(f"  MAX_EPOCHS: {MAX_EPOCHS}")
@@ -433,7 +433,7 @@ def test_unfrozen_clip():
     # Use selected samples
     subset_ds = Subset(full_ds, selected_indices)
     train_loader = DataLoader(
-        subset_ds, batch_size=NUM_SAMPLES, shuffle=True,
+        subset_ds, batch_size=min(8, NUM_SAMPLES), shuffle=True,  # batch_size 最大 8
         collate_fn=zero_pad_collator, num_workers=0,
     )
     
