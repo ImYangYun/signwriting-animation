@@ -55,7 +55,7 @@ def test_sign_amplification():
     DIFFUSION_STEPS = 8
     
     # Test with different amplification factors
-    AMPLIFY_FACTORS = [1.0, 2.0, 5.0, 10.0]
+    AMPLIFY_FACTORS = [1.0, 2.0, 5.0, 10.0, 20.0]  # Added 20x
     
     # Test samples
     TEST_INDICES = [3300, 2800, 900]  # Good samples from previous eval
@@ -130,8 +130,8 @@ def test_sign_amplification():
     for name, module in lit_model.model.named_children():
         print(f"  {name}: {type(module).__name__}")
     
-    # Verify required components exist
-    required = ['sign_encoder', 'time_embed', 'context_encoder', 'xt_encoder', 'pos_embed', 'decoder']
+    # Verify required components exist (actual names from model)
+    required = ['embed_signwriting', 'time_embed', 'past_context_encoder', 'xt_frame_encoder', 'output_pos_embed', 'decoder']
     missing = [r for r in required if not hasattr(lit_model.model, r)]
     if missing:
         print(f"\n❌ Missing components: {missing}")
@@ -142,10 +142,46 @@ def test_sign_amplification():
         print("\n✅ All required components found!")
     
     # ============================================================
-    # First: Check sign embedding similarity
+    # First: Check embedding norms (CRITICAL for addition fusion!)
     # ============================================================
     print("\n" + "=" * 70)
-    print("STEP 1: CHECK SIGN EMBEDDING SIMILARITY")
+    print("STEP 1: CHECK EMBEDDING NORMS")
+    print("=" * 70)
+    print("Model uses ADDITION fusion: context = past_ctx + sign_emb + time_emb")
+    print("If sign_emb norm << past_ctx norm, sign info gets drowned out!\n")
+    
+    # Pick one sample to analyze
+    idx = TEST_INDICES[0]
+    batch = zero_pad_collator([test_ds[idx]])
+    cond = batch["conditions"]
+    
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    
+    past_norm = lit_model.normalize(past_raw)
+    past_bjct = lit_model.btjc_to_bjct(past_norm)
+    past_btjc = past_bjct.permute(0, 3, 1, 2).contiguous()
+    
+    with torch.no_grad():
+        past_ctx = lit_model.model.past_context_encoder(past_btjc)
+        sign_emb = lit_model.model.embed_signwriting(sign)
+        time_emb = lit_model.model.time_embed(torch.tensor([4], device=device)).squeeze(0)  # mid timestep
+    
+    print(f"  past_ctx norm:  {past_ctx.norm().item():.4f}")
+    print(f"  sign_emb norm:  {sign_emb.norm().item():.4f}")
+    print(f"  time_emb norm:  {time_emb.norm().item():.4f}")
+    print(f"\n  Ratio (sign/past): {sign_emb.norm().item() / (past_ctx.norm().item() + 1e-8):.4f}")
+    print(f"  Ratio (sign/time): {sign_emb.norm().item() / (time_emb.norm().item() + 1e-8):.4f}")
+    
+    if sign_emb.norm().item() < past_ctx.norm().item() * 0.1:
+        print("\n  ⚠️  WARNING: sign_emb is <10% of past_ctx!")
+        print("     → Sign information likely drowned out by addition!")
+    
+    # ============================================================
+    # Check sign embedding similarity across samples
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("STEP 2: CHECK SIGN EMBEDDING SIMILARITY")
     print("=" * 70)
     
     sign_embeddings = []
@@ -154,9 +190,9 @@ def test_sign_amplification():
         sign = batch["conditions"]["sign_image"][:1].float().to(device)
         
         with torch.no_grad():
-            sign_emb = lit_model.model.sign_encoder(sign)  # [B, D]
+            sign_emb = lit_model.model.embed_signwriting(sign)  # [B, D]
         sign_embeddings.append(sign_emb)
-        print(f"  idx={idx}: sign_emb norm = {sign_emb.norm().item():.4f}")
+        print(f"  idx={idx}: sign_emb norm = {sign_emb.norm().item():.4f}, shape = {sign_emb.shape}")
     
     # Compute pairwise cosine similarity
     print("\n  Pairwise cosine similarity:")
@@ -168,49 +204,24 @@ def test_sign_amplification():
             print(f"    idx {TEST_INDICES[i]} vs {TEST_INDICES[j]}: {cos_sim:.4f}")
     
     # ============================================================
-    # Custom forward with amplified sign embedding
+    # Custom forward with amplified sign embedding using hook
     # ============================================================
-    class AmplifiedSignModel(torch.nn.Module):
-        """Wrapper that amplifies sign embedding."""
-        def __init__(self, base_model, amplify_factor):
-            super().__init__()
-            self.base_model = base_model
-            self.amplify_factor = amplify_factor
-        
-        def forward(self, x_noisy, timestep, past, sign_img):
-            # Get original embeddings
-            sign_emb = self.base_model.sign_encoder(sign_img)
-            
-            # AMPLIFY sign embedding
-            sign_emb = sign_emb * self.amplify_factor
-            
-            # Continue with rest of forward pass
-            # (Need to replicate the model's forward logic with modified sign_emb)
-            t_emb = self.base_model.time_embed(timestep)
-            context = self.base_model.context_encoder(past)
-            
-            B, J, C, T = x_noisy.shape
-            x_flat = x_noisy.permute(0, 3, 1, 2).reshape(B * T, J * C)
-            xt_emb = self.base_model.xt_encoder(x_flat)
-            
-            pos_idx = torch.arange(T, device=x_noisy.device).unsqueeze(0).expand(B, -1)
-            pos_emb = self.base_model.pos_embed(pos_idx).reshape(B * T, -1)
-            
-            context_exp = context.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
-            t_emb_exp = t_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
-            sign_emb_exp = sign_emb.unsqueeze(1).expand(-1, T, -1).reshape(B * T, -1)
-            
-            combined = torch.cat([context_exp, xt_emb, t_emb_exp, sign_emb_exp, pos_emb], dim=-1)
-            out = self.base_model.decoder(combined)
-            out = out.reshape(B, T, J, C).permute(0, 2, 3, 1)
-            
-            return out
+    
+    # Use hook to amplify sign embedding output
+    amplify_factor_holder = [1.0]  # Use list to allow modification in hook
+    
+    def amplify_hook(module, input, output):
+        """Hook to amplify sign embedding output."""
+        return output * amplify_factor_holder[0]
+    
+    # Register hook on embed_signwriting
+    hook_handle = lit_model.model.embed_signwriting.register_forward_hook(amplify_hook)
     
     # ============================================================
     # Test with different amplification factors
     # ============================================================
     print("\n" + "=" * 70)
-    print("STEP 2: TEST AMPLIFICATION FACTORS")
+    print("STEP 3: TEST AMPLIFICATION FACTORS")
     print("=" * 70)
     
     results = []
@@ -245,8 +256,8 @@ def test_sign_amplification():
         for amp_factor in AMPLIFY_FACTORS:
             torch.manual_seed(42)  # Same noise for fair comparison
             
-            # Create amplified model
-            amp_model = AmplifiedSignModel(lit_model.model, amp_factor)
+            # Set amplification factor via hook
+            amplify_factor_holder[0] = amp_factor
             
             with torch.no_grad():
                 B, J, C, _ = past_bjct.shape
@@ -259,7 +270,7 @@ def test_sign_amplification():
                     def forward(self, x, t, **kwargs):
                         return self.model(x, t, self.past, self.sign)
                 
-                wrapped = _Wrapper(amp_model, past_bjct, sign)
+                wrapped = _Wrapper(lit_model.model, past_bjct, sign)
                 
                 pred_bjct = lit_model.diffusion.p_sample_loop(
                     model=wrapped,
@@ -317,6 +328,10 @@ def test_sign_amplification():
         print(f"  amp={amp:.1f}x: avg_ratio={avg_ratio:.3f}, avg_PCK={avg_pck:.1f}%")
     
     print(f"\nPose files saved to: {out_dir}/")
+    
+    # Remove hook
+    hook_handle.remove()
+    
     print("=" * 70)
     print("✅ Test complete!")
     print("=" * 70)
