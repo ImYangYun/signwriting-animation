@@ -25,7 +25,7 @@ def test_concat_4sample():
     # CONFIGURATION
     # ============================================================
     NUM_SAMPLES = 4
-    MAX_EPOCHS = 200
+    MAX_EPOCHS = 2500
     DIFFUSION_STEPS = 8
     BATCH_SIZE = 4
     
