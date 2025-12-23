@@ -135,7 +135,7 @@ def test_checkpoint():
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-4,
-        diffusion_steps=8,
+        diffusion_steps=50,
         vel_weight=1.0,
         t_past=40,
         t_future=future_len,
