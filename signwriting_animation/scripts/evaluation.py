@@ -1,49 +1,121 @@
 """
-50-sample evaluation for thesis results.
-Config: 8 steps + clip_denoised=True
+Generate pose files for selected samples from 50-sample evaluation.
+Based on results.csv to pick good/bad examples.
 """
 import os
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 
+from pose_format import Pose
+from pose_format.numpy.pose_body import NumPyPoseBody
+from pose_format.utils.generic import reduce_holistic
 from pose_format.torch.masked.collator import zero_pad_collator
+from pose_anonymization.data.normalization import unshift_hands
 
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc, mean_frame_disp
+from signwriting_animation.diffusion.lightning_module import LitDiffusion, sanitize_btjc
 
 
-def compute_disp_ratio_numpy(pred_data, gt_data):
-    pred_disp = np.sqrt(np.sum(np.diff(pred_data, axis=0)**2, axis=-1)).mean()
-    gt_disp = np.sqrt(np.sum(np.diff(gt_data, axis=0)**2, axis=-1)).mean()
-    return pred_disp / (gt_disp + 1e-8), pred_disp, gt_disp
-
-
-def evaluate():
-    DIFFUSION_STEPS = 8
-    CLIP_DENOISED = True
-    NUM_SAMPLES = 50
-
-    SAMPLE_INDICES = list(range(0, 5000, 100))[:NUM_SAMPLES]
+def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
+    """Convert tensor to pose format."""
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
     
-    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
+    t_np = t.detach().cpu().numpy().astype(np.float32)
+    arr = t_np[:, None, :, :]
+    T = arr.shape[0]
+    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
+    fps = ref_pose.body.fps
+    
+    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
+    pose_obj = Pose(header=header, body=body)
+    unshift_hands(pose_obj)
+    
+    if scale_to_ref:
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
+        future_start = max(0, T_ref_total - T_pred)
+        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
+        
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+        
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+    
+    return pose_obj
+
+
+def generate_pose_files():
+    """Generate pose files for selected samples."""
+
+    # ============================================================
+    # CONFIGURATION
+    # ============================================================
+    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"  # 8-step model
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = f"logs/full/eval_{NUM_SAMPLES}samples_step{DIFFUSION_STEPS}_clip{CLIP_DENOISED}"
+    results_csv = "logs/full/eval_50samples_step8_clipTrue/results.csv"
+    out_dir = "logs/full/pose_samples"
+    
+    CLIP_DENOISED = True
     # ============================================================
     
     os.makedirs(out_dir, exist_ok=True)
     
     print("=" * 70)
-    print(f"THESIS EVALUATION: {NUM_SAMPLES} samples")
+    print("GENERATE POSE FILES FOR SELECTED SAMPLES")
     print("=" * 70)
-    print(f"  Diffusion steps: {DIFFUSION_STEPS}")
-    print(f"  clip_denoised: {CLIP_DENOISED}")
-    print(f"  Output: {out_dir}")
     
-    # Load checkpoint
+    # Load results.csv to find good/bad samples
+    if os.path.exists(results_csv):
+        df = pd.read_csv(results_csv)
+        print(f"\nLoaded {len(df)} samples from {results_csv}")
+        print(f"Columns: {list(df.columns)}")
+        
+        # Find best samples (ratio closest to 1.0)
+        df['ratio_diff'] = abs(df['disp_ratio'] - 1.0)
+        df_sorted = df.sort_values('ratio_diff')
+        
+        print("\n--- Best samples (ratio closest to 1.0) ---")
+        print(df_sorted.head(10)[['idx', 'disp_ratio', 'pck_01', 'mpjpe']])
+        
+        print("\n--- Worst samples (ratio furthest from 1.0) ---")
+        print(df_sorted.tail(5)[['idx', 'disp_ratio', 'pck_01', 'mpjpe']])
+        
+        # Select samples: 5 best + 2 worst for comparison
+        best_indices = df_sorted.head(5)['idx'].tolist()
+        worst_indices = df_sorted.tail(2)['idx'].tolist()
+        selected_indices = best_indices + worst_indices
+        
+        print(f"\nSelected indices: {selected_indices}")
+    else:
+        print(f"WARNING: {results_csv} not found, using default indices")
+        # Default: uniformly sampled
+        selected_indices = [0, 500, 1000, 2000, 3000, 4000, 4500]
+    
+    # Load model
+    print(f"\nLoading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location='cpu')
+    
+    torch.manual_seed(42)
+    np.random.seed(42)
     
     # Load dataset
     test_ds = DynamicPosePredictionDataset(
@@ -55,10 +127,6 @@ def evaluate():
         split="train",
     )
     
-    print(f"  Dataset size: {len(test_ds)}")
-    print(f"  Sample indices: {SAMPLE_INDICES[:5]}...{SAMPLE_INDICES[-5:]}")
-    
-    # Get dimensions
     sample = test_ds[0]["data"]
     if hasattr(sample, 'zero_filled'):
         sample = sample.zero_filled()
@@ -68,6 +136,8 @@ def evaluate():
     num_joints = sample.shape[-2]
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
+    
+    print(f"Dimensions: J={num_joints}, D={num_dims}, T={future_len}")
     
     # Create model
     from signwriting_animation.diffusion.core.models import SignWritingToPoseDiffusion
@@ -84,7 +154,7 @@ def evaluate():
         num_dims=num_dims,
         stats_path=stats_path,
         lr=1e-4,
-        diffusion_steps=DIFFUSION_STEPS,
+        diffusion_steps=8,
         vel_weight=1.0,
         t_past=40,
         t_future=future_len,
@@ -96,18 +166,22 @@ def evaluate():
     lit_model = lit_model.to(device)
     lit_model.eval()
     
-    print(f"  Model loaded on: {device}")
+    print(f"Model loaded on: {device}")
+    
+    # Generate pose files
     print("\n" + "=" * 70)
-    print("RUNNING EVALUATION...")
+    print("GENERATING POSE FILES")
     print("=" * 70)
     
     results = []
     
-    for i, idx in enumerate(SAMPLE_INDICES):
+    for i, idx in enumerate(selected_indices):
+        print(f"\n--- Sample {i}: idx={idx} ---")
+        
         if idx >= len(test_ds):
-            print(f"  Skipping idx={idx} (out of range)")
+            print(f"  WARNING: idx {idx} out of range, skipping")
             continue
-            
+        
         test_batch = zero_pad_collator([test_ds[idx]])
         cond = test_batch["conditions"]
         
@@ -146,101 +220,69 @@ def evaluate():
         gt_unnorm = lit_model.unnormalize(gt_norm)
         pred_unnorm = lit_model.unnormalize(pred_norm)
         
-        # Metrics
+        # Compute metrics
         pred_np = pred_unnorm[0].cpu().numpy()
         gt_np = gt_unnorm[0].cpu().numpy()
-        ratio, pred_disp, gt_disp = compute_disp_ratio_numpy(pred_np, gt_np)
+        
+        pred_disp = np.sqrt(np.sum(np.diff(pred_np, axis=0)**2, axis=-1)).mean()
+        gt_disp = np.sqrt(np.sum(np.diff(gt_np, axis=0)**2, axis=-1)).mean()
+        ratio = pred_disp / (gt_disp + 1e-8)
         
         per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
         mpjpe = per_joint_err.mean()
         pck_01 = (per_joint_err < 0.1).mean() * 100
-        pck_005 = (per_joint_err < 0.05).mean() * 100
-        mse = F.mse_loss(pred_unnorm, gt_unnorm).item()
+        
+        print(f"  GT disp: {gt_disp:.4f}, Pred disp: {pred_disp:.4f}, Ratio: {ratio:.4f}")
+        print(f"  MPJPE: {mpjpe:.6f}, PCK@0.1: {pck_01:.1f}%")
         
         results.append({
             'idx': idx,
-            'gt_disp': gt_disp,
-            'pred_disp': pred_disp,
             'ratio': ratio,
+            'pck': pck_01,
             'mpjpe': mpjpe,
-            'pck_01': pck_01,
-            'pck_005': pck_005,
-            'mse': mse,
         })
         
-        if (i + 1) % 10 == 0:
-            print(f"  Processed {i+1}/{len(SAMPLE_INDICES)} samples...")
+        # Save pose files
+        ref_path = test_ds.records[idx]["pose"]
+        if not os.path.isabs(ref_path):
+            ref_path = os.path.join(data_dir, ref_path)
+        
+        with open(ref_path, "rb") as f:
+            ref_pose = Pose.read(f)
+        ref_pose = reduce_holistic(ref_pose)
+        if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+            ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        
+        gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+        pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
+        
+        # Label as good/bad based on ratio
+        label = "good" if 0.7 <= ratio <= 1.3 else "bad"
+        
+        gt_filename = f"{out_dir}/idx{idx}_{label}_ratio{ratio:.2f}_gt.pose"
+        pred_filename = f"{out_dir}/idx{idx}_{label}_ratio{ratio:.2f}_pred.pose"
+        
+        with open(gt_filename, "wb") as f:
+            gt_pose.write(f)
+        with open(pred_filename, "wb") as f:
+            pred_pose.write(f)
+        
+        print(f"  Saved: {os.path.basename(gt_filename)}, {os.path.basename(pred_filename)}")
     
-    # ====== SUMMARY ======
+    # Summary
     print("\n" + "=" * 70)
-    print("RESULTS SUMMARY")
+    print("SUMMARY")
     print("=" * 70)
+    print(f"\n{'idx':>6} | {'Ratio':>6} | {'PCK@0.1':>8} | {'Label':>5}")
+    print("-" * 40)
+    for r in results:
+        label = "good" if 0.7 <= r['ratio'] <= 1.3 else "bad"
+        print(f"{r['idx']:>6} | {r['ratio']:>6.2f} | {r['pck']:>7.1f}% | {label:>5}")
     
-    avg_ratio = np.mean([r['ratio'] for r in results])
-    std_ratio = np.std([r['ratio'] for r in results])
-    avg_mpjpe = np.mean([r['mpjpe'] for r in results])
-    std_mpjpe = np.std([r['mpjpe'] for r in results])
-    avg_pck_01 = np.mean([r['pck_01'] for r in results])
-    std_pck_01 = np.std([r['pck_01'] for r in results])
-    avg_pck_005 = np.mean([r['pck_005'] for r in results])
-    avg_mse = np.mean([r['mse'] for r in results])
-    
-    print(f"\nSamples evaluated: {len(results)}")
-    print(f"\nDisplacement Ratio: {avg_ratio:.4f} ± {std_ratio:.4f}")
-    print(f"MPJPE:              {avg_mpjpe:.6f} ± {std_mpjpe:.6f}")
-    print(f"PCK@0.1:            {avg_pck_01:.1f}% ± {std_pck_01:.1f}%")
-    print(f"PCK@0.05:           {avg_pck_005:.1f}%")
-    print(f"MSE:                {avg_mse:.6f}")
-    
-    # Ratio distribution
-    ratios = [r['ratio'] for r in results]
-    print(f"\nRatio distribution:")
-    print(f"  Min:    {min(ratios):.4f}")
-    print(f"  Max:    {max(ratios):.4f}")
-    print(f"  Median: {np.median(ratios):.4f}")
-    
-    # Count by ratio range
-    ratio_good = sum(1 for r in ratios if 0.8 <= r <= 1.2)
-    ratio_ok = sum(1 for r in ratios if 0.5 <= r <= 1.5)
-    print(f"\n  Ratio in [0.8, 1.2]: {ratio_good}/{len(results)} ({100*ratio_good/len(results):.1f}%)")
-    print(f"  Ratio in [0.5, 1.5]: {ratio_ok}/{len(results)} ({100*ratio_ok/len(results):.1f}%)")
-    
-    # Save detailed results
-    import csv
-    csv_path = f"{out_dir}/results.csv"
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\nDetailed results saved to: {csv_path}")
-    
-    # LaTeX table format
-    print("\n" + "=" * 70)
-    print("LATEX TABLE (copy to thesis)")
-    print("=" * 70)
-    print(f"""
-\\begin{{table}}[h]
-\\centering
-\\caption{{Quantitative evaluation results (n={len(results)})}}
-\\begin{{tabular}}{{lc}}
-\\toprule
-Metric & Value \\\\
-\\midrule
-Displacement Ratio & {avg_ratio:.2f} $\\pm$ {std_ratio:.2f} \\\\
-MPJPE & {avg_mpjpe:.4f} $\\pm$ {std_mpjpe:.4f} \\\\
-PCK@0.1 & {avg_pck_01:.1f}\\% $\\pm$ {std_pck_01:.1f}\\% \\\\
-PCK@0.05 & {avg_pck_005:.1f}\\% \\\\
-MSE & {avg_mse:.4f} \\\\
-\\bottomrule
-\\end{{tabular}}
-\\end{{table}}
-""")
-    
-    print("=" * 70)
-    print("✅ Evaluation complete!")
-    print("=" * 70)
+    print(f"\nPose files saved to: {out_dir}/")
+    print("✅ Complete!")
 
 
 if __name__ == "__main__":
     os.chdir("/home/yayun/data/signwriting-animation-fork")
-    evaluate()
+    generate_pose_files()
