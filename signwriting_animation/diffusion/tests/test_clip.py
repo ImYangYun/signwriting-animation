@@ -27,6 +27,15 @@ from pose_format.torch.masked.collator import zero_pad_collator
 from pose_anonymization.data.normalization import unshift_hands
 from transformers import CLIPModel
 
+# DTW metric (optional, graceful fallback if unavailable)
+try:
+    from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
+    HAS_DTW = True
+except ImportError:
+    HAS_DTW = False
+    PE_DTW = None
+    print("[WARNING] pose_evaluation not found, DTW metric disabled")
+
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder
 from CAMDM.diffusion.gaussian_diffusion import (
     GaussianDiffusion, ModelMeanType, ModelVarType, LossType
@@ -199,6 +208,51 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     return v.abs().mean().item()
 
 
+def _btjc_to_tjc_list(x_btjc: torch.Tensor, mask_bt: torch.Tensor = None) -> list:
+    """Convert batched BTJC tensor to list of variable-length TJC tensors."""
+    x_btjc = sanitize_btjc(x_btjc)
+    batch_size, seq_len, _, _ = x_btjc.shape
+    
+    if mask_bt is None:
+        # No mask, use full sequence
+        return [x_btjc[b].contiguous() for b in range(batch_size)]
+    
+    mask_bt = (mask_bt > 0.5).float()
+    seqs = []
+    for b in range(batch_size):
+        t = int(mask_bt[b].sum().item())
+        t = max(0, min(t, seq_len))
+        seqs.append(x_btjc[b, :t].contiguous())
+    return seqs
+
+
+@torch.no_grad()
+def compute_dtw(pred_btjc: torch.Tensor, tgt_btjc: torch.Tensor) -> float:
+    """Compute DTW distance between prediction and target."""
+    if not HAS_DTW:
+        return 0.0
+    
+    preds = _btjc_to_tjc_list(pred_btjc)
+    tgts = _btjc_to_tjc_list(tgt_btjc)
+    
+    try:
+        dtw_metric = PE_DTW()
+    except (ImportError, RuntimeError):
+        return 0.0
+    
+    vals = []
+    for p, g in zip(preds, tgts):
+        if p.size(0) < 2 or g.size(0) < 2:
+            continue
+        pv = p.detach().cpu().numpy().astype("float32")[:, None, :, :]
+        gv = g.detach().cpu().numpy().astype("float32")[:, None, :, :]
+        vals.append(float(dtw_metric.get_distance(pv, gv)))
+    
+    if not vals:
+        return 0.0
+    return float(np.mean(vals))
+
+
 def tensor_to_pose(t_btjc: torch.Tensor, header, ref_pose: Pose, scale_to_ref: bool = True) -> Pose:
     """Convert tensor to Pose format."""
     if t_btjc.dim() == 4:
@@ -241,6 +295,10 @@ def tensor_to_pose(t_btjc: torch.Tensor, header, ref_pose: Pose, scale_to_ref: b
     
     return pose_obj
 
+
+# ============================================================
+# Lightning Module
+# ============================================================
 
 class LitDiffusionUnfrozenCLIP(pl.LightningModule):
     """Lightning module with unfrozen CLIP + contrastive loss."""
@@ -560,6 +618,11 @@ def train_full_dataset():
     disp_gt = mean_frame_disp(gt_norm)
     disp_ratio = disp_pred / (disp_gt + 1e-8)
     
+    # DTW
+    gt_unnorm = lit_model.unnormalize(gt_norm)
+    pred_unnorm = lit_model.unnormalize(pred_norm)
+    dtw_val = compute_dtw(pred_unnorm, gt_unnorm)
+    
     pred_np = pred_norm[0].cpu().numpy()
     gt_np = gt_norm[0].cpu().numpy()
     per_joint_err = np.sqrt(((pred_np - gt_np) ** 2).sum(-1))
@@ -571,6 +634,7 @@ def train_full_dataset():
     print(f"  MPJPE: {mpjpe:.6f}")
     print(f"  PCK@0.1: {pck_01:.1f}%")
     print(f"  MSE: {mse:.6f}")
+    print(f"  DTW: {dtw_val:.4f}")
     
     # Save poses
     ref_path = train_ds.records[0]["pose"]
@@ -582,9 +646,6 @@ def train_full_dataset():
     ref_pose = reduce_holistic(ref_pose)
     if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
         ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
-    
-    gt_unnorm = lit_model.unnormalize(gt_norm)
-    pred_unnorm = lit_model.unnormalize(pred_norm)
     
     gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
     pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
