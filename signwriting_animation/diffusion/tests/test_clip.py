@@ -501,7 +501,7 @@ def train_full_dataset():
         shuffle=True, 
         collate_fn=zero_pad_collator,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=True,
     )
 
