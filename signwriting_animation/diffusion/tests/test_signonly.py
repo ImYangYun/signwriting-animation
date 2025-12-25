@@ -157,25 +157,62 @@ def cosine_beta_schedule(timesteps, s=0.008):
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0.0001, 0.9999)
 
-def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
-    if t_btjc.dim() == 4: t = t_btjc[0]
-    else: t = t_btjc
+def tensor_to_pose(t_btjc: torch.Tensor, 
+                   header, 
+                   ref_pose: Pose, 
+                   scale_to_ref: bool = True) -> Pose:
+    """Convert tensor prediction to Pose format for visualization.
+    
+    CORRECT VERSION - from original train_full.py
+    """
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
+    
     t_np = t.detach().cpu().numpy().astype(np.float32)
+    
+    # Create pose object
     arr = t_np[:, None, :, :]
     T = arr.shape[0]
     conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
-    body = NumPyPoseBody(fps=ref_pose.body.fps, data=arr, confidence=conf)
+    fps = ref_pose.body.fps
+    
+    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
+    
+    # Fix hand positions (must be before scaling!)
     unshift_hands(pose_obj)
+    
     if scale_to_ref:
-        T_pred, T_ref_total = t_np.shape[0], ref_pose.body.data.shape[0]
+        # Get reference data
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
         future_start = max(0, T_ref_total - T_pred)
-        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-        def _var(a): return float(((a - a.mean(axis=(0,1), keepdims=True)) ** 2).mean())
-        var_input, var_ref = _var(pose_obj.body.data[:, 0]), _var(ref_arr)
+        ref_arr = np.asarray(
+            ref_pose.body.data[future_start:future_start+T_pred, 0], 
+            dtype=np.float32
+        )
+        
+        # Scale to reference variance
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
         if var_input > 1e-8:
-            pose_obj.body.data = pose_obj.body.data * np.sqrt(var_ref / var_input)
-        pose_obj.body.data = pose_obj.body.data + (ref_arr.mean(axis=(0,1)) - pose_obj.body.data[:, 0].mean(axis=(0,1)))
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+        
+        # Align center (CORRECT VERSION)
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+    
     return pose_obj
 
 
@@ -378,17 +415,17 @@ def train_overfit(args):
     for idx in selected_indices[:5]:
         batch = zero_pad_collator([full_ds[idx]])
         sign = batch["conditions"]["sign_image"][:1].float().to(device)
-        gt = sanitize_btjc(batch["data"][:1]).to(device)
+        gt = sanitize_btjc(batch["data"][:1]).to(device)  # Already unnormalized!
         
         with torch.no_grad():
             pred = inference_sign_only(sign)
         
-        gt_unnorm = lit_model.unnormalize(lit_model.normalize(gt))
-        gt_disp = (gt_unnorm[:, 1:] - gt_unnorm[:, :-1]).abs().mean().item()
+        # gt is already unnormalized, don't double process!
+        gt_disp = (gt[:, 1:] - gt[:, :-1]).abs().mean().item()
         pred_disp = (pred[:, 1:] - pred[:, :-1]).abs().mean().item()
         ratio = pred_disp / (gt_disp + 1e-8)
         
-        diff = (pred - gt_unnorm).cpu().numpy()[0]
+        diff = (pred - gt).cpu().numpy()[0]
         pck = (np.sqrt((diff**2).sum(-1)) < 0.1).mean() * 100
         
         print(f"idx={idx}: ratio={ratio:.2f}, PCK={pck:.1f}%")
@@ -405,19 +442,21 @@ def train_overfit(args):
     best_idx = max(results, key=lambda x: x["pck"])["idx"]
     batch = zero_pad_collator([full_ds[best_idx]])
     sign = batch["conditions"]["sign_image"][:1].float().to(device)
-    gt = sanitize_btjc(batch["data"][:1]).to(device)
+    gt = sanitize_btjc(batch["data"][:1]).to(device)  # Already unnormalized!
     
     with torch.no_grad():
         pred = inference_sign_only(sign)
-    gt_unnorm = lit_model.unnormalize(lit_model.normalize(gt))
+    # gt is already unnormalized, use directly
 
     ref_path = full_ds.records[best_idx]["pose"]
     if not ref_path.startswith("/"): ref_path = data_dir + ref_path
     with open(ref_path, "rb") as f:
         ref_pose = Pose.read(f)
     ref_pose = reduce_holistic(ref_pose)
+    if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
 
-    gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+    gt_pose = tensor_to_pose(gt, ref_pose.header, ref_pose)
     pred_pose = tensor_to_pose(pred, ref_pose.header, ref_pose)
 
     with open(f"{out_dir}/test_gt.pose", "wb") as f: gt_pose.write(f)
