@@ -253,7 +253,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, 
-                        default="logs/full/checkpoints/last_1.ckpt")
+                        default="logs/full/checkpoints/last_v1.ckpt")
     args = parser.parse_args()
     
     test_sign_influence(args.checkpoint)
