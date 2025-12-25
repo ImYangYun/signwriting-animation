@@ -79,7 +79,7 @@ def test_checkpoint():
 
     CLIP_DENOISED = True
     FIXED_INDICES = [10, 50, 100, 200, 500]
-    
+
     ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
