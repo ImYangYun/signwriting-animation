@@ -46,10 +46,10 @@ def inference(lit_model, past, sign, future_len=20):
 
 def main():
     # Configuration
-    ckpt_path = 'logs/past_dropout_overfit_32sample_p50/checkpoints/last.ckpt'
+    ckpt_path = 'logs/past_dropout_overfit_32sample_p30/checkpoints/last.ckpt'
     data_dir = '/home/yayun/data/pose_data/'
     csv_path = '/home/yayun/data/signwriting-animation/data_fixed.csv'
-    out_dir = 'logs/past_dropout_overfit_32sample_p50'
+    out_dir = 'logs/past_dropout_overfit_32sample_p30'
     
     print("=" * 60)
     print("INFERENCE TEST: p=0.5 Past Dropout Checkpoint")
