@@ -71,12 +71,12 @@ def evaluate():
     DIFFUSION_STEPS = 8
     CLIP_DENOISED = True
     NUM_SAMPLES = 50
-    SAVE_POSE_FILES = True  # ← 新增：是否保存 pose 文件
-    NUM_POSE_TO_SAVE = 10   # ← 新增：保存多少个 pose（5 best + 5 worst）
+    SAVE_POSE_FILES = True
+    NUM_POSE_TO_SAVE = 10
 
     SAMPLE_INDICES = list(range(0, 5000, 100))[:NUM_SAMPLES]
     
-    ckpt_path = "logs/full/checkpoints/last-v1.ckpt"
+    ckpt_path = "logs/full_unfrozen_clip/checkpoints/last.ckpt"
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
