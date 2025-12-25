@@ -12,7 +12,7 @@ import numpy as np
 
 os.chdir("/home/yayun/data/signwriting-animation-fork")
 
-from train_past_dropout import (
+from test_droupout import (
     LitDiffusionPastDropout, 
     DynamicPosePredictionDataset,
     sanitize_btjc,
