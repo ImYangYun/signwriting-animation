@@ -73,7 +73,6 @@ def compute_disp_ratio_torch(pred, gt):
     gt_disp = mean_frame_disp(gt)
     return pred_disp / (gt_disp + 1e-8), pred_disp, gt_disp
 
-
 def test_checkpoint():
     """Test checkpoint with detailed diagnostics."""
 
@@ -86,7 +85,7 @@ def test_checkpoint():
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     out_dir = f"logs/full/eval_clip_v1{CLIP_DENOISED}"
     # ============================================================
-    
+
     os.makedirs(out_dir, exist_ok=True)
     
     print("=" * 70)
