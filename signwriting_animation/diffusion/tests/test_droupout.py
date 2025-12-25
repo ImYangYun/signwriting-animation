@@ -275,7 +275,7 @@ class LitDiffusionPastDropout(pl.LightningModule):
                  t_future=20,
                  freeze_clip=False,
                  contrastive_weight=0.5,
-                 past_drop_prob=0.3):  # NEW: Past dropout probability
+                 past_drop_prob=0.5):  # 50% dropout to force sign usage
         super().__init__()
         self.save_hyperparameters()
 
@@ -809,8 +809,8 @@ if __name__ == "__main__":
                         help="Number of samples for overfit test (default: 32)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Number of epochs (default: 300 for overfit, 100 for full)")
-    parser.add_argument("--past_drop_prob", type=float, default=0.3,
-                        help="Past dropout probability (default: 0.3)")
+    parser.add_argument("--past_drop_prob", type=float, default=0.5,
+                        help="Past dropout probability (default: 0.5)")
     
     args = parser.parse_args()
     
