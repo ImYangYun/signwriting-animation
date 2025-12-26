@@ -47,7 +47,7 @@ def main():
     # ============================================================
     # Load model
     # ============================================================
-    from train_past_dropout_fixed import LitDiffusionPastDropout
+    from test_droupout import LitDiffusionPastDropout
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
