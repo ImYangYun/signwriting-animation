@@ -54,12 +54,22 @@ class CachedDataset(Dataset):
             if hasattr(gt, "zero_filled"): gt = gt.zero_filled()
             if hasattr(gt, "tensor"): gt = gt.tensor
             
+            # Remove batch dim, and squeeze any extra dims
+            past_t = past[0]
+            gt_t = gt[0]
+            
+            # Handle [T, 1, J, C] -> [T, J, C]
+            if past_t.dim() == 4 and past_t.shape[1] == 1:
+                past_t = past_t.squeeze(1)
+            if gt_t.dim() == 4 and gt_t.shape[1] == 1:
+                gt_t = gt_t.squeeze(1)
+            
             record = base_ds.records[idx]
             
             self.samples.append({
-                "past": past[0],
+                "past": past_t,
                 "sign": sign[0],
-                "gt": gt[0],
+                "gt": gt_t,
             })
             self.metadata.append({
                 "idx": idx,
