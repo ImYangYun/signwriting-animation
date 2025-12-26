@@ -278,6 +278,8 @@ class FSWPosePredictionDataset(Dataset):
     
     def _load_pose(self, record):
         """Load and preprocess pose file."""
+        from pose_anonymization.data.normalization import unshift_hands
+        
         pose_path = record['pose']
         if not os.path.isabs(pose_path):
             pose_path = os.path.join(self.data_dir, pose_path)
@@ -289,6 +291,9 @@ class FSWPosePredictionDataset(Dataset):
         pose = reduce_holistic(pose)
         if "POSE_WORLD_LANDMARKS" in [c.name for c in pose.header.components]:
             pose = pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        
+        # Apply unshift_hands (same as original dataset)
+        unshift_hands(pose)
         
         # Get frame range
         start_frame = int(record['start'] * pose.body.fps / 1000)
@@ -547,6 +552,52 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     return v.abs().mean().item()
 
 
+def tensor_to_pose(t_btjc: torch.Tensor, header, ref_pose: Pose, scale_to_ref: bool = True) -> Pose:
+    """Convert tensor to Pose format for visualization."""
+    from pose_format.numpy.pose_body import NumPyPoseBody
+    from pose_anonymization.data.normalization import unshift_hands
+    
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
+    
+    t_np = t.detach().cpu().numpy().astype(np.float32)
+    arr = t_np[:, None, :, :]
+    T = arr.shape[0]
+    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
+    fps = ref_pose.body.fps
+    
+    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
+    pose_obj = Pose(header=header, body=body)
+    unshift_hands(pose_obj)
+    
+    if scale_to_ref:
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
+        future_start = max(0, T_ref_total - T_pred)
+        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
+        
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+        
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+    
+    return pose_obj
+
+
 class LitFSWDiffusion(pl.LightningModule):
     """Lightning module for FSW + CLIP diffusion."""
     
@@ -557,6 +608,8 @@ class LitFSWDiffusion(pl.LightningModule):
                  stats_path="/home/yayun/data/pose_data/mean_std_178_with_preprocess.pt",
                  diffusion_steps=8, 
                  vel_weight=1.0,
+                 acc_weight=0.5,
+                 contrastive_weight=0.5,
                  t_past=40, 
                  t_future=20,
                  freeze_clip=False):
@@ -565,6 +618,8 @@ class LitFSWDiffusion(pl.LightningModule):
 
         self.diffusion_steps = diffusion_steps
         self.vel_weight = vel_weight
+        self.acc_weight = acc_weight
+        self.contrastive_weight = contrastive_weight
         self._step_count = 0
 
         # Load normalization stats
@@ -646,7 +701,28 @@ class LitFSWDiffusion(pl.LightningModule):
         gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
         loss_vel = F.mse_loss(pred_vel, gt_vel)
 
-        loss = loss_mse + self.vel_weight * loss_vel
+        # Acceleration loss
+        loss_acc = torch.tensor(0.0, device=device)
+        if pred_vel.size(-1) > 1:
+            pred_acc = pred_vel[..., 1:] - pred_vel[..., :-1]
+            gt_acc = gt_vel[..., 1:] - gt_vel[..., :-1]
+            loss_acc = F.mse_loss(pred_acc, gt_acc)
+
+        # Contrastive loss (for CLIP embeddings)
+        loss_contrastive = torch.tensor(0.0, device=device)
+        if batch_size > 1 and self.contrastive_weight > 0:
+            # Get CLIP embeddings from the combined encoder
+            clip_emb = self.model.sign_encoder.clip_model.get_image_features(pixel_values=sign_img)
+            clip_emb_norm = F.normalize(clip_emb, p=2, dim=-1)
+            cos_sim = torch.mm(clip_emb_norm, clip_emb_norm.t())
+            mask = ~torch.eye(batch_size, dtype=torch.bool, device=device)
+            off_diag_sim = cos_sim[mask]
+            loss_contrastive = off_diag_sim.mean()
+
+        loss = (loss_mse + 
+                self.vel_weight * loss_vel + 
+                self.acc_weight * loss_acc + 
+                self.contrastive_weight * loss_contrastive)
 
         # Displacement ratio
         with torch.no_grad():
@@ -656,12 +732,15 @@ class LitFSWDiffusion(pl.LightningModule):
 
         if self._step_count % 50 == 0:
             print(f"[Step {self._step_count}] loss={loss.item():.4f}, mse={loss_mse.item():.4f}, "
-                  f"vel={loss_vel.item():.4f}, disp_ratio={disp_ratio:.4f}")
+                  f"vel={loss_vel.item():.4f}, acc={loss_acc.item():.4f}, "
+                  f"contrastive={loss_contrastive.item():.4f}, disp_ratio={disp_ratio:.4f}")
 
         self.log_dict({
             "train/loss": loss,
             "train/loss_mse": loss_mse,
             "train/loss_vel": loss_vel,
+            "train/loss_acc": loss_acc,
+            "train/loss_contrastive": loss_contrastive,
             "train/disp_ratio": disp_ratio,
         }, prog_bar=True)
 
@@ -764,6 +843,8 @@ def train_overfit():
         lr=LEARNING_RATE,
         diffusion_steps=DIFFUSION_STEPS,
         vel_weight=1.0,
+        acc_weight=0.5,
+        contrastive_weight=0.0,  # 0 for overfitting (only 4 samples)
         t_past=40,
         t_future=future_len,
         freeze_clip=False,
@@ -889,6 +970,86 @@ def train_overfit():
     print(f"  Average Sign-Only PCK@0.1: {avg_pck_signonly:.1f}%")
     print(f"  Average Disp Ratio: {avg_ratio:.3f}")
     print(f"  Gap (Normal - Sign-Only): {avg_pck_normal - avg_pck_signonly:.1f}%")
+    
+    # Save pose files for visualization
+    print(f"\n{'='*70}")
+    print("SAVING POSE FILES")
+    print("="*70)
+    
+    pose_out_dir = f"{out_dir}/poses"
+    os.makedirs(pose_out_dir, exist_ok=True)
+    
+    for idx in range(len(full_ds)):
+        sample = full_ds[idx]
+        record = full_ds.records[idx]
+        
+        gt_btjc = sample['data'].unsqueeze(0).to(device)
+        past_btjc = sample['conditions']['input_pose'].unsqueeze(0).to(device)
+        sign_img = sample['conditions']['sign_image'].unsqueeze(0).to(device)
+        fsw_string = [sample['conditions']['fsw_string']]
+        
+        gt_norm = lit_model.normalize(gt_btjc)
+        past_norm = lit_model.normalize(past_btjc)
+        
+        past_bjct = lit_model.btjc_to_bjct(past_norm)
+        B, J, C, _ = past_bjct.shape
+        T_future = gt_norm.shape[1]
+        
+        with torch.no_grad():
+            # Normal inference
+            wrapper = FSWInferenceWrapper(lit_model.model, past_bjct, sign_img, fsw_string)
+            pred_bjct = lit_model.diffusion.p_sample_loop(
+                model=wrapper,
+                shape=(B, J, C, T_future),
+                clip_denoised=True,
+                model_kwargs={"y": {}},
+                progress=False,
+            )
+            pred_norm = lit_model.bjct_to_btjc(pred_bjct)
+            
+            # Sign-Only
+            zeros_past = torch.zeros_like(past_bjct)
+            wrapper_signonly = FSWInferenceWrapper(lit_model.model, zeros_past, sign_img, fsw_string)
+            pred_signonly_bjct = lit_model.diffusion.p_sample_loop(
+                model=wrapper_signonly,
+                shape=(B, J, C, T_future),
+                clip_denoised=True,
+                model_kwargs={"y": {}},
+                progress=False,
+            )
+            pred_signonly_norm = lit_model.bjct_to_btjc(pred_signonly_bjct)
+        
+        # Unnormalize
+        gt_unnorm = lit_model.unnormalize(gt_norm)
+        pred_unnorm = lit_model.unnormalize(pred_norm)
+        pred_signonly_unnorm = lit_model.unnormalize(pred_signonly_norm)
+        
+        # Load reference pose for header
+        ref_path = record['pose']
+        if not os.path.isabs(ref_path):
+            ref_path = os.path.join(data_dir, ref_path)
+        
+        with open(ref_path, 'rb') as f:
+            ref_pose = Pose.read(f)
+        ref_pose = reduce_holistic(ref_pose)
+        if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+            ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        
+        # Convert to pose and save
+        gt_pose = tensor_to_pose(gt_unnorm, ref_pose.header, ref_pose)
+        pred_pose = tensor_to_pose(pred_unnorm, ref_pose.header, ref_pose)
+        pred_so_pose = tensor_to_pose(pred_signonly_unnorm, ref_pose.header, ref_pose)
+        
+        with open(f"{pose_out_dir}/sample{idx}_gt.pose", "wb") as f:
+            gt_pose.write(f)
+        with open(f"{pose_out_dir}/sample{idx}_pred.pose", "wb") as f:
+            pred_pose.write(f)
+        with open(f"{pose_out_dir}/sample{idx}_signonly.pose", "wb") as f:
+            pred_so_pose.write(f)
+        
+        print(f"  Saved sample {idx}: gt, pred, signonly")
+    
+    print(f"\nPose files saved to: {pose_out_dir}/")
     
     print(f"\n{'='*70}")
     if avg_pck_normal > 90 and avg_pck_signonly > 50:
