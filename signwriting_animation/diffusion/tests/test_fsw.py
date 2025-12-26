@@ -98,18 +98,30 @@ class FSWEncoder(nn.Module):
         
         try:
             sign = fsw_to_sign(fsw_string)
-            if not sign.symbols:
+            
+            # Handle both dict and object return types
+            if isinstance(sign, dict):
+                symbols_list = sign.get('symbols', [])
+            else:
+                symbols_list = sign.symbols if hasattr(sign, 'symbols') else []
+            
+            if not symbols_list:
                 return [(0, 0, 0.0, 0.0)]
             
             symbols = []
-            for sym in sign.symbols:
-                # sym.symbol is like "S10000" 
-                symbol_str = sym.symbol
+            for sym in symbols_list:
+                # Handle both dict and object
+                if isinstance(sym, dict):
+                    symbol_str = sym.get('symbol', 'S10000')
+                    position = sym.get('position', (500, 500))
+                else:
+                    symbol_str = sym.symbol
+                    position = sym.position
+                
                 if symbol_str.startswith('S'):
                     symbol_str = symbol_str[1:]
                 
                 # Parse: symbol_str is like "10011" (5 hex digits)
-                # base = first 3 digits (hand category), var = last 2 digits
                 try:
                     full_id = int(symbol_str, 16)
                     base_id = (full_id >> 8) % 100   # Higher bits for category
@@ -119,8 +131,8 @@ class FSWEncoder(nn.Module):
                     var_id = 0
                 
                 # Normalize position to [-1, 1]
-                x = (sym.position[0] - 500) / 250.0
-                y = (sym.position[1] - 500) / 250.0
+                x = (position[0] - 500) / 250.0
+                y = (position[1] - 500) / 250.0
                 
                 # Clamp to avoid extreme values
                 x = max(-2.0, min(2.0, x))
@@ -238,15 +250,22 @@ class CombinedSignWritingEncoder(nn.Module):
         clip_emb = self.clip_model.get_image_features(pixel_values=sign_images)
         clip_emb = self.clip_proj(clip_emb)
         
-        # FSW encoding
+        # DEBUG: check CLIP output
+        if torch.isnan(clip_emb).any():
+            print(f"[ERROR] NaN in clip_emb!")
+            clip_emb = torch.nan_to_num(clip_emb, nan=0.0)
+        
+        # FSW encoding - ensure FSW encoder is on same device
+        self.fsw_encoder = self.fsw_encoder.to(clip_emb.device)
         fsw_emb = self.fsw_encoder(fsw_strings)
         
-        # Weighted fusion
-        # Option 1: Concatenate + project
-        combined = self.fusion(torch.cat([clip_emb, fsw_emb], dim=-1))
+        # DEBUG: check FSW output
+        if torch.isnan(fsw_emb).any():
+            print(f"[ERROR] NaN in fsw_emb!")
+            fsw_emb = torch.nan_to_num(fsw_emb, nan=0.0)
         
-        # Option 2: Weighted sum (simpler)
-        # combined = (1 - self.fsw_weight) * clip_emb + self.fsw_weight * fsw_emb
+        # Weighted fusion
+        combined = self.fusion(torch.cat([clip_emb, fsw_emb], dim=-1))
         
         return combined
 
@@ -731,6 +750,20 @@ class LitFSWDiffusion(pl.LightningModule):
         # Predict x0
         pred_x0_bjct = self.model(x_noisy, timestep, past_bjct, sign_img, fsw_strings)
 
+        # DEBUG: Check model output
+        if torch.isnan(pred_x0_bjct).any():
+            print(f"[ERROR] NaN in model output pred_x0_bjct!")
+            print(f"  x_noisy has NaN: {torch.isnan(x_noisy).any()}")
+            print(f"  timestep: {timestep}")
+            print(f"  fsw_strings: {fsw_strings}")
+            # Try to identify where NaN comes from
+            with torch.no_grad():
+                past_ctx = self.model.past_context_encoder(past_bjct.permute(0, 3, 1, 2))
+                print(f"  past_ctx has NaN: {torch.isnan(past_ctx).any()}")
+                sign_emb = self.model.sign_encoder(sign_img, fsw_strings)
+                print(f"  sign_emb has NaN: {torch.isnan(sign_emb).any()}")
+            pred_x0_bjct = torch.nan_to_num(pred_x0_bjct, nan=0.0)
+
         # Losses
         loss_mse = F.mse_loss(pred_x0_bjct, gt_bjct)
         
@@ -840,9 +873,21 @@ def train_overfit():
         print(f"FSW: {test_fsw}")
         
         test_sign = fsw_to_sign(test_fsw)
-        print(f"Parsed {len(test_sign.symbols)} symbols:")
-        for sym in test_sign.symbols:
-            print(f"  {sym.symbol} @ {sym.position}")
+        print(f"Return type: {type(test_sign)}")
+        
+        # Handle both dict and object
+        if isinstance(test_sign, dict):
+            symbols_list = test_sign.get('symbols', [])
+            print(f"Dict keys: {test_sign.keys()}")
+        else:
+            symbols_list = test_sign.symbols if hasattr(test_sign, 'symbols') else []
+        
+        print(f"Parsed {len(symbols_list)} symbols:")
+        for sym in symbols_list:
+            if isinstance(sym, dict):
+                print(f"  {sym.get('symbol')} @ {sym.get('position')}")
+            else:
+                print(f"  {sym.symbol} @ {sym.position}")
         print("FSW parsing: OK ✓")
     except Exception as e:
         print(f"FSW parsing ERROR: {e}")
