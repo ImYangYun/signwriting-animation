@@ -23,7 +23,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 # Import from training script
 sys.path.insert(0, os.getcwd())
-from train_unfrozen_clip_full import (
+from test_clip import (
     LitDiffusionUnfrozenCLIP,
     DynamicPosePredictionDataset,
     sanitize_btjc,
