@@ -31,7 +31,7 @@ def main():
     # ============================================================
     # Config
     # ============================================================
-    CKPT_PATH = "logs/past_dropout_fixed_8sample_p30/checkpoints/last.ckpt"
+    CKPT_PATH = "logs/past_dropout_fixed_8sample_p50/checkpoints/last.ckpt"
     DATA_DIR = "/home/yayun/data/pose_data/"
     CSV_PATH = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     
