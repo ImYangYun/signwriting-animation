@@ -1,11 +1,11 @@
 """
-Classifier-Free Guidance (CFG) Evaluation
+Classifier-Free Guidance (CFG) Evaluation - Fixed Version
 
-Test if CFG can improve Sign-Only generation by amplifying
-the influence of SignWriting conditioning.
+Uses a wrapper model to inject CFG into the existing diffusion p_sample_loop,
+instead of reimplementing the diffusion loop.
 
 Usage:
-    python eval_cfg.py --checkpoint logs/full_unfrozen_clip/checkpoints/last.ckpt
+    python eval_cfg_fixed.py --checkpoint logs/full_unfrozen_clip/checkpoints/last.ckpt
 """
 
 import os
@@ -23,7 +23,7 @@ from pose_format.torch.masked.collator import zero_pad_collator
 
 # Import from training script
 sys.path.insert(0, os.getcwd())
-from test_clip import (
+from train_unfrozen_clip_full import (
     LitDiffusionUnfrozenCLIP,
     DynamicPosePredictionDataset,
     sanitize_btjc,
@@ -31,161 +31,71 @@ from test_clip import (
 )
 
 
-class CFGSampler:
-    """Classifier-Free Guidance sampler for diffusion model."""
+class CFGModelWrapper(nn.Module):
+    """
+    Wrapper that applies CFG at each denoising step.
     
-    def __init__(self, lit_model, device):
-        self.lit_model = lit_model
-        self.model = lit_model.model
-        self.diffusion = lit_model.diffusion
-        self.device = device
-        
-    @torch.no_grad()
-    def sample_normal(self, past_bjct, sign_img, target_shape):
-        """Normal sampling with both conditions."""
-        
-        class Wrapper(nn.Module):
-            def __init__(self, model, past, sign):
-                super().__init__()
-                self.model, self.past, self.sign = model, past, sign
-            def forward(self, x, t, **kwargs):
-                return self.model(x, t, self.past, self.sign)
-        
-        wrapped = Wrapper(self.model, past_bjct, sign_img)
-        
-        pred_bjct = self.diffusion.p_sample_loop(
-            model=wrapped,
-            shape=target_shape,
-            clip_denoised=True,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        return pred_bjct
+    This wraps the original model and applies CFG logic in forward(),
+    so we can use the existing p_sample_loop without modification.
+    """
     
-    @torch.no_grad()
-    def sample_sign_only(self, sign_img, target_shape):
-        """Sign-Only sampling: past motion = zeros."""
-        B, J, C, T = target_shape
-        zeros_past = torch.zeros(B, J, C, 40, device=self.device)  # T_past = 40
-        
-        class Wrapper(nn.Module):
-            def __init__(self, model, past, sign):
-                super().__init__()
-                self.model, self.past, self.sign = model, past, sign
-            def forward(self, x, t, **kwargs):
-                return self.model(x, t, self.past, self.sign)
-        
-        wrapped = Wrapper(self.model, zeros_past, sign_img)
-        
-        pred_bjct = self.diffusion.p_sample_loop(
-            model=wrapped,
-            shape=target_shape,
-            clip_denoised=True,
-            model_kwargs={"y": {}},
-            progress=False,
-        )
-        return pred_bjct
-    
-    @torch.no_grad()
-    def sample_cfg(self, past_bjct, sign_img, target_shape, guidance_scale=2.0):
+    def __init__(self, model, past_cond, past_uncond, sign_cond, sign_uncond, 
+                 guidance_scale=1.0, mode='sign'):
         """
-        CFG sampling: amplify the difference between cond and uncond.
+        Args:
+            model: The original diffusion model
+            past_cond: Conditional past motion [B, J, C, T]
+            past_uncond: Unconditional past motion (zeros) [B, J, C, T]
+            sign_cond: Conditional sign embedding [B, ...]
+            sign_uncond: Unconditional sign embedding (zeros) [B, ...]
+            guidance_scale: CFG scale (1.0 = no guidance)
+            mode: 'sign' to amplify sign, 'past' to amplify past
+        """
+        super().__init__()
+        self.model = model
+        self.past_cond = past_cond
+        self.past_uncond = past_uncond
+        self.sign_cond = sign_cond
+        self.sign_uncond = sign_uncond
+        self.guidance_scale = guidance_scale
+        self.mode = mode
+    
+    def forward(self, x, t, **kwargs):
+        """
+        CFG forward pass.
         
         pred = pred_uncond + s * (pred_cond - pred_uncond)
-             = (1-s) * pred_uncond + s * pred_cond
-        
-        When s > 1, this amplifies the effect of having past motion,
-        which should make the model rely more on SignWriting for the 
-        "content" while using past for smoothness.
-        
-        Or we can flip it: use Sign as the condition to amplify.
         """
-        B, J, C, T = target_shape
-        zeros_past = torch.zeros(B, J, C, 40, device=self.device)
+        if self.guidance_scale == 1.0:
+            # No guidance, just normal forward
+            return self.model(x, t, self.past_cond, self.sign_cond)
         
-        # Custom p_sample_loop with CFG
-        # Start from pure noise
-        x_t = torch.randn(target_shape, device=self.device)
-        
-        indices = list(range(self.diffusion.num_timesteps))[::-1]
-        
-        for i in indices:
-            t = torch.tensor([i] * B, device=self.device)
-            
-            # Conditional prediction (with past)
-            pred_cond = self.model(x_t, t, past_bjct, sign_img)
-            
-            # Unconditional prediction (without past, Sign-Only)
-            pred_uncond = self.model(x_t, t, zeros_past, sign_img)
-            
-            # CFG: amplify the effect of past motion
-            # This makes the model produce smoother motion while
-            # still being guided by SignWriting
-            pred_x0 = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
-            
-            # Get x_{t-1} from predicted x_0
-            if i > 0:
-                # Use diffusion to get previous timestep
-                # Simplified: just use the predicted x0 with some noise
-                alpha_bar = self.diffusion.alphas_cumprod[i]
-                alpha_bar_prev = self.diffusion.alphas_cumprod[i-1] if i > 0 else 1.0
-                
-                # Compute x_{t-1}
-                beta = 1 - alpha_bar / alpha_bar_prev
-                noise = torch.randn_like(x_t) if i > 1 else 0
-                
-                # x_{t-1} = sqrt(alpha_bar_prev) * pred_x0 + sqrt(1-alpha_bar_prev) * noise
-                x_t = (
-                    torch.sqrt(torch.tensor(alpha_bar_prev, device=self.device)) * pred_x0 +
-                    torch.sqrt(torch.tensor(1 - alpha_bar_prev, device=self.device)) * noise
-                )
-            else:
-                x_t = pred_x0
-        
-        return x_t
-    
-    @torch.no_grad()
-    def sample_cfg_sign_amplified(self, past_bjct, sign_img, target_shape, guidance_scale=2.0):
-        """
-        Alternative CFG: amplify SignWriting's influence.
-        
-        Uses empty/random sign embedding as unconditional.
-        NOTE: This requires the model to have seen zero sign embeddings during training,
-        which may not be the case. This is more experimental.
-        """
-        B, J, C, T = target_shape
-        
-        # Create "unconditional" sign embedding (zeros or random)
-        # This is a bit hacky since we didn't train with sign dropout
-        zeros_sign = torch.zeros_like(sign_img)
-        
-        x_t = torch.randn(target_shape, device=self.device)
-        indices = list(range(self.diffusion.num_timesteps))[::-1]
-        
-        for i in indices:
-            t = torch.tensor([i] * B, device=self.device)
-            
-            # With sign
-            pred_cond = self.model(x_t, t, past_bjct, sign_img)
-            
-            # Without sign (experimental)
-            pred_uncond = self.model(x_t, t, past_bjct, zeros_sign)
-            
+        if self.mode == 'sign':
             # Amplify sign's influence
-            pred_x0 = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
-            
-            if i > 0:
-                alpha_bar = self.diffusion.alphas_cumprod[i]
-                alpha_bar_prev = self.diffusion.alphas_cumprod[i-1] if i > 0 else 1.0
-                noise = torch.randn_like(x_t) if i > 1 else 0
-                x_t = (
-                    torch.sqrt(torch.tensor(alpha_bar_prev, device=self.device)) * pred_x0 +
-                    torch.sqrt(torch.tensor(1 - alpha_bar_prev, device=self.device)) * noise
-                )
-            else:
-                x_t = pred_x0
+            # cond: with sign, uncond: without sign
+            pred_cond = self.model(x, t, self.past_cond, self.sign_cond)
+            pred_uncond = self.model(x, t, self.past_cond, self.sign_uncond)
+        elif self.mode == 'past':
+            # Amplify past's influence
+            # cond: with past, uncond: without past
+            pred_cond = self.model(x, t, self.past_cond, self.sign_cond)
+            pred_uncond = self.model(x, t, self.past_uncond, self.sign_cond)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
         
-        return x_t
+        # CFG formula
+        pred = pred_uncond + self.guidance_scale * (pred_cond - pred_uncond)
+        return pred
+
+
+class NormalModelWrapper(nn.Module):
+    """Simple wrapper for normal inference."""
+    def __init__(self, model, past, sign):
+        super().__init__()
+        self.model, self.past, self.sign = model, past, sign
+    
+    def forward(self, x, t, **kwargs):
+        return self.model(x, t, self.past, self.sign)
 
 
 def compute_metrics(pred_norm, gt_norm):
@@ -218,9 +128,9 @@ def compute_metrics(pred_norm, gt_norm):
     }
 
 
-def evaluate_sample(sampler, lit_model, batch, guidance_scales=[1.0, 1.5, 2.0, 3.0]):
+@torch.no_grad()
+def evaluate_sample(lit_model, batch, device, guidance_scales=[1.5, 2.0, 3.0]):
     """Evaluate one sample with different methods and guidance scales."""
-    device = sampler.device
     
     cond = batch["conditions"]
     past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
@@ -236,31 +146,99 @@ def evaluate_sample(sampler, lit_model, batch, guidance_scales=[1.0, 1.5, 2.0, 3
     T_future = gt_norm.shape[1]
     target_shape = (B, J, C, T_future)
     
+    # Create unconditional inputs
+    zeros_past = torch.zeros_like(past_bjct)
+    zeros_sign = torch.zeros_like(sign)
+    
     results = {}
     
-    # 1. Normal inference
-    pred_bjct = sampler.sample_normal(past_bjct, sign, target_shape)
+    # 1. Normal inference (past + sign)
+    wrapped = NormalModelWrapper(lit_model.model, past_bjct, sign)
+    pred_bjct = lit_model.diffusion.p_sample_loop(
+        model=wrapped,
+        shape=target_shape,
+        clip_denoised=True,
+        model_kwargs={"y": {}},
+        progress=False,
+    )
     pred_norm = lit_model.bjct_to_btjc(pred_bjct)
     results['normal'] = compute_metrics(pred_norm, gt_norm)
     
-    # 2. Sign-Only inference
-    pred_bjct = sampler.sample_sign_only(sign, target_shape)
+    # 2. Sign-Only inference (no past)
+    wrapped = NormalModelWrapper(lit_model.model, zeros_past, sign)
+    pred_bjct = lit_model.diffusion.p_sample_loop(
+        model=wrapped,
+        shape=target_shape,
+        clip_denoised=True,
+        model_kwargs={"y": {}},
+        progress=False,
+    )
     pred_norm = lit_model.bjct_to_btjc(pred_bjct)
     results['sign_only'] = compute_metrics(pred_norm, gt_norm)
     
-    # 3. CFG with different scales (amplify past motion effect)
+    # 3. CFG amplifying Sign (with past, amplify sign's effect)
     for scale in guidance_scales:
-        if scale == 1.0:
-            continue  # Same as normal
-        pred_bjct = sampler.sample_cfg(past_bjct, sign, target_shape, guidance_scale=scale)
+        wrapped = CFGModelWrapper(
+            model=lit_model.model,
+            past_cond=past_bjct,
+            past_uncond=past_bjct,  # Keep past the same
+            sign_cond=sign,
+            sign_uncond=zeros_sign,
+            guidance_scale=scale,
+            mode='sign'
+        )
+        pred_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
+        pred_norm = lit_model.bjct_to_btjc(pred_bjct)
+        results[f'cfg_sign_{scale}'] = compute_metrics(pred_norm, gt_norm)
+    
+    # 4. CFG amplifying Past (with sign, amplify past's effect)
+    for scale in guidance_scales:
+        wrapped = CFGModelWrapper(
+            model=lit_model.model,
+            past_cond=past_bjct,
+            past_uncond=zeros_past,
+            sign_cond=sign,
+            sign_uncond=sign,  # Keep sign the same
+            guidance_scale=scale,
+            mode='past'
+        )
+        pred_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
         pred_norm = lit_model.bjct_to_btjc(pred_bjct)
         results[f'cfg_past_{scale}'] = compute_metrics(pred_norm, gt_norm)
     
-    # 4. CFG amplifying sign (experimental)
-    for scale in [1.5, 2.0]:
-        pred_bjct = sampler.sample_cfg_sign_amplified(past_bjct, sign, target_shape, guidance_scale=scale)
+    # 5. Sign-Only + CFG Sign (no past, but amplify sign)
+    # This tests if CFG can help Sign-Only inference
+    for scale in guidance_scales:
+        wrapped = CFGModelWrapper(
+            model=lit_model.model,
+            past_cond=zeros_past,  # No past
+            past_uncond=zeros_past,
+            sign_cond=sign,
+            sign_uncond=zeros_sign,
+            guidance_scale=scale,
+            mode='sign'
+        )
+        pred_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
         pred_norm = lit_model.bjct_to_btjc(pred_bjct)
-        results[f'cfg_sign_{scale}'] = compute_metrics(pred_norm, gt_norm)
+        results[f'signonly_cfg_{scale}'] = compute_metrics(pred_norm, gt_norm)
     
     return results
 
@@ -278,7 +256,7 @@ def main():
                         help='CSV path')
     parser.add_argument('--n_samples', type=int, default=20,
                         help='Number of samples to evaluate')
-    parser.add_argument('--output', type=str, default='cfg_results.csv',
+    parser.add_argument('--output', type=str, default='cfg_results_fixed.csv',
                         help='Output CSV path')
     args = parser.parse_args()
     
@@ -311,19 +289,16 @@ def main():
     sample_indices = np.random.choice(len(test_ds), min(args.n_samples, len(test_ds)), replace=False)
     sample_indices = sorted(sample_indices)
     
-    # Create sampler
-    sampler = CFGSampler(lit_model, device)
-    
     # Evaluate
     all_results = []
-    guidance_scales = [1.0, 1.5, 2.0, 2.5, 3.0]
+    guidance_scales = [1.5, 2.0, 3.0]
     
     print(f"\nEvaluating {len(sample_indices)} samples...")
     print("="*70)
     
     for idx in tqdm(sample_indices):
         batch = zero_pad_collator([test_ds[idx]])
-        results = evaluate_sample(sampler, lit_model, batch, guidance_scales)
+        results = evaluate_sample(lit_model, batch, device, guidance_scales)
         
         for method, metrics in results.items():
             row = {'idx': idx, 'method': method}
@@ -352,7 +327,10 @@ def main():
     print("Key Comparisons:")
     print("-"*70)
     
-    methods_order = ['normal', 'sign_only'] + [f'cfg_past_{s}' for s in guidance_scales if s != 1.0] + ['cfg_sign_1.5', 'cfg_sign_2.0']
+    methods_order = ['normal', 'sign_only'] + \
+                    [f'cfg_sign_{s}' for s in guidance_scales] + \
+                    [f'cfg_past_{s}' for s in guidance_scales] + \
+                    [f'signonly_cfg_{s}' for s in guidance_scales]
     
     for method in methods_order:
         if method in df['method'].values:
@@ -366,11 +344,32 @@ def main():
     print("-"*70)
     
     normal_pck = df[df['method'] == 'normal']['pck_01'].mean()
-    for method in methods_order:
-        if method in df['method'].values and method != 'normal':
+    sign_only_pck = df[df['method'] == 'sign_only']['pck_01'].mean()
+    
+    print(f"{'Baseline:':<20s}")
+    print(f"  normal:            PCK = {normal_pck:.1f}%")
+    print(f"  sign_only:         PCK = {sign_only_pck:.1f}% (gap = {sign_only_pck - normal_pck:+.1f}%)")
+    
+    print(f"\n{'CFG on Sign (with past):':<30s}")
+    for s in guidance_scales:
+        method = f'cfg_sign_{s}'
+        if method in df['method'].values:
             method_pck = df[df['method'] == method]['pck_01'].mean()
-            gap = normal_pck - method_pck
-            print(f"{method:20s}: Gap = {gap:+5.1f}%")
+            print(f"  {method:18s}: PCK = {method_pck:.1f}% (vs normal: {method_pck - normal_pck:+.1f}%)")
+    
+    print(f"\n{'CFG on Past (with sign):':<30s}")
+    for s in guidance_scales:
+        method = f'cfg_past_{s}'
+        if method in df['method'].values:
+            method_pck = df[df['method'] == method]['pck_01'].mean()
+            print(f"  {method:18s}: PCK = {method_pck:.1f}% (vs normal: {method_pck - normal_pck:+.1f}%)")
+    
+    print(f"\n{'Sign-Only + CFG:':<30s}")
+    for s in guidance_scales:
+        method = f'signonly_cfg_{s}'
+        if method in df['method'].values:
+            method_pck = df[df['method'] == method]['pck_01'].mean()
+            print(f"  {method:18s}: PCK = {method_pck:.1f}% (vs sign_only: {method_pck - sign_only_pck:+.1f}%)")
     
     # Save results
     df.to_csv(args.output, index=False)
@@ -379,17 +378,11 @@ def main():
     # Also save summary
     summary_path = args.output.replace('.csv', '_summary.txt')
     with open(summary_path, 'w') as f:
-        f.write("CFG Evaluation Results\n")
+        f.write("CFG Evaluation Results (Fixed)\n")
         f.write("="*70 + "\n\n")
+        f.write(f"Normal:    PCK@0.1 = {normal_pck:.1f}%\n")
+        f.write(f"Sign-Only: PCK@0.1 = {sign_only_pck:.1f}%\n\n")
         f.write(summary.to_string())
-        f.write("\n\n")
-        f.write("Key Comparisons:\n")
-        f.write("-"*70 + "\n")
-        for method in methods_order:
-            if method in df['method'].values:
-                m = df[df['method'] == method]
-                f.write(f"{method:20s}: PCK@0.1 = {m['pck_01'].mean():5.1f}% ± {m['pck_01'].std():4.1f}, "
-                        f"ratio = {m['disp_ratio'].mean():.2f}\n")
     print(f"Summary saved to: {summary_path}")
 
 
