@@ -392,7 +392,8 @@ class LitDiffusionWithFSW(pl.LightningModule):
                  t_past=40, 
                  t_future=20,
                  freeze_clip=False,
-                 use_fsw=True):
+                 use_fsw=True,
+                 past_dropout=0.5):  # NEW: 50% chance to drop past
         super().__init__()
         self.save_hyperparameters()
 
@@ -400,6 +401,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
         self.use_fsw = use_fsw
+        self.past_dropout = past_dropout  # NEW
         self._step_count = 0
 
         stats = torch.load(stats_path, map_location="cpu")
@@ -458,6 +460,11 @@ class LitDiffusionWithFSW(pl.LightningModule):
 
         gt_bjct = self.btjc_to_bjct(gt_norm)
         past_bjct = self.btjc_to_bjct(past_norm)
+
+        # === PAST DROPOUT: Force model to learn SignWriting ===
+        if self.training and self.past_dropout > 0:
+            if torch.rand(1).item() < self.past_dropout:
+                past_bjct = torch.zeros_like(past_bjct)
 
         timestep = torch.randint(0, self.diffusion_steps, (batch_size,), device=device, dtype=torch.long)
         noise = torch.randn_like(gt_bjct)
@@ -571,23 +578,25 @@ def train_overfit():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_overfit_simple"
+    out_dir = "logs/fsw_past_dropout"  # NEW: better name
     
     NUM_SAMPLES = 4
-    MAX_EPOCHS = 500
+    MAX_EPOCHS = 1000  # More epochs since past dropout makes it harder
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
+    PAST_DROPOUT = 0.5  # NEW: 50% chance to drop past motion during training
     
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
-    print(" FSW + CLIP OVERFITTING (SIMPLIFIED)")
+    print(" FSW + CLIP + PAST DROPOUT OVERFITTING")
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  Samples: {NUM_SAMPLES}")
     print(f"  Epochs: {MAX_EPOCHS}")
     print(f"  Use FSW: {USE_FSW}")
+    print(f"  Past Dropout: {PAST_DROPOUT}")
     print("=" * 70)
 
     # Use ORIGINAL dataset (this is the key difference!)
@@ -670,6 +679,7 @@ def train_overfit():
         t_future=future_len,
         freeze_clip=False,
         use_fsw=USE_FSW,
+        past_dropout=PAST_DROPOUT,  # NEW
     )
 
     total_params = sum(p.numel() for p in lit_model.parameters())
