@@ -204,8 +204,8 @@ def main():
     print("=" * 70)
     
     checkpoints = [
-        ("p30", "logs/past_dropout_fixed_4sample_p30/checkpoints/last.ckpt"),
-        ("p70", "logs/past_dropout_fixed_4sample_p70/checkpoints/last.ckpt"),
+        ("p50", "logs/past_dropout_fixed_4sample_p50/checkpoints/last.ckpt"),
+        #("p70", "logs/past_dropout_fixed_4sample_p70/checkpoints/last.ckpt"),
     ]
     
     results = {}
