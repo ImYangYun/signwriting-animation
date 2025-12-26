@@ -93,34 +93,46 @@ class FSWEncoder(nn.Module):
         Returns:
             symbols: List of (base_id, var_id, x, y)
         """
+        if not fsw_string or not fsw_string.strip():
+            return [(0, 0, 0.0, 0.0)]  # Return dummy symbol instead of empty
+        
         try:
             sign = fsw_to_sign(fsw_string)
+            if not sign.symbols:
+                return [(0, 0, 0.0, 0.0)]
+            
             symbols = []
             for sym in sign.symbols:
                 # sym.symbol is like "S10000" 
-                # Extract base (first 2 digits) and variation (remaining)
                 symbol_str = sym.symbol
                 if symbol_str.startswith('S'):
                     symbol_str = symbol_str[1:]
                 
-                # Parse hex: e.g., "10011" -> base=10, var=011
+                # Parse: symbol_str is like "10011" (5 hex digits)
+                # base = first 3 digits (hand category), var = last 2 digits
                 try:
-                    base_id = int(symbol_str[:2], 16) % 100
-                    var_id = int(symbol_str[2:], 16) % 1000
+                    full_id = int(symbol_str, 16)
+                    base_id = (full_id >> 8) % 100   # Higher bits for category
+                    var_id = full_id % 1000          # Lower bits for variation
                 except:
                     base_id = 0
                     var_id = 0
                 
                 # Normalize position to [-1, 1]
-                x = (sym.position[0] - 500) / 250  # Assuming ~500 center, ~250 range
-                y = (sym.position[1] - 500) / 250
+                x = (sym.position[0] - 500) / 250.0
+                y = (sym.position[1] - 500) / 250.0
+                
+                # Clamp to avoid extreme values
+                x = max(-2.0, min(2.0, x))
+                y = max(-2.0, min(2.0, y))
                 
                 symbols.append((base_id, var_id, x, y))
             
-            return symbols
+            return symbols if symbols else [(0, 0, 0.0, 0.0)]
         except Exception as e:
-            # Return empty if parsing fails
-            return []
+            # Return dummy symbol if parsing fails
+            print(f"[WARNING] FSW parse failed for '{fsw_string[:30]}...': {e}")
+            return [(0, 0, 0.0, 0.0)]
     
     def forward(self, fsw_batch: list):
         """
@@ -349,6 +361,12 @@ class FSWPosePredictionDataset(Dataset):
         
         # Load pose
         pose_data = self._load_pose(record)  # (T, J, C)
+        
+        # Handle NaN values
+        if torch.isnan(pose_data).any():
+            print(f"[WARNING] NaN in pose data for idx {idx}, replacing with 0")
+            pose_data = torch.nan_to_num(pose_data, nan=0.0)
+        
         T_total, J, C = pose_data.shape
         
         # Split into past and future
@@ -676,9 +694,28 @@ class LitFSWDiffusion(pl.LightningModule):
         sign_img = cond["sign_image"].float()
         fsw_strings = cond["fsw_string"]
 
+        # DEBUG: Check for NaN in inputs
+        if torch.isnan(gt_btjc).any():
+            print(f"[ERROR] NaN in gt_btjc!")
+            gt_btjc = torch.nan_to_num(gt_btjc, nan=0.0)
+        if torch.isnan(past_btjc).any():
+            print(f"[ERROR] NaN in past_btjc!")
+            past_btjc = torch.nan_to_num(past_btjc, nan=0.0)
+        if torch.isnan(sign_img).any():
+            print(f"[ERROR] NaN in sign_img!")
+            sign_img = torch.nan_to_num(sign_img, nan=0.0)
+
         # Normalize
         gt_norm = self.normalize(gt_btjc)
         past_norm = self.normalize(past_btjc)
+        
+        # DEBUG: Check after normalize
+        if torch.isnan(gt_norm).any():
+            print(f"[ERROR] NaN in gt_norm after normalize!")
+            print(f"  gt_btjc range: [{gt_btjc.min():.4f}, {gt_btjc.max():.4f}]")
+            print(f"  mean_pose range: [{self.mean_pose.min():.4f}, {self.mean_pose.max():.4f}]")
+            print(f"  std_pose range: [{self.std_pose.min():.4f}, {self.std_pose.max():.4f}]")
+            gt_norm = torch.nan_to_num(gt_norm, nan=0.0)
 
         batch_size = gt_norm.shape[0]
         device = gt_norm.device
@@ -789,6 +826,31 @@ def train_overfit():
     
     os.makedirs(out_dir, exist_ok=True)
 
+    # ============================================================
+    # DEBUG: Test FSW parsing first
+    # ============================================================
+    print("=" * 70)
+    print(" DEBUG: Testing FSW parsing")
+    print("=" * 70)
+    
+    test_swu = "𝠃𝤕𝤳񅹁𝣿𝣙񀟣𝣯𝣱񁯡𝣾𝤅񀦁𝣸𝤙"
+    try:
+        test_fsw = swu2fsw(test_swu)
+        print(f"SWU: {test_swu}")
+        print(f"FSW: {test_fsw}")
+        
+        test_sign = fsw_to_sign(test_fsw)
+        print(f"Parsed {len(test_sign.symbols)} symbols:")
+        for sym in test_sign.symbols:
+            print(f"  {sym.symbol} @ {sym.position}")
+        print("FSW parsing: OK ✓")
+    except Exception as e:
+        print(f"FSW parsing ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print("=" * 70)
+
     print("=" * 70)
     print(" FSW + CLIP OVERFITTING EXPERIMENT")
     print("=" * 70)
@@ -833,6 +895,24 @@ def train_overfit():
     future_len = sample['data'].shape[0]
     
     print(f"\nDimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    
+    # DEBUG: Check data values
+    print("\nDEBUG - Data check:")
+    print(f"  data shape: {sample['data'].shape}")
+    print(f"  data range: [{sample['data'].min():.4f}, {sample['data'].max():.4f}]")
+    print(f"  data has NaN: {torch.isnan(sample['data']).any()}")
+    print(f"  past shape: {sample['conditions']['input_pose'].shape}")
+    print(f"  past has NaN: {torch.isnan(sample['conditions']['input_pose']).any()}")
+    
+    # Check stats file
+    stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
+    if os.path.exists(stats_path):
+        stats = torch.load(stats_path, map_location="cpu")
+        print(f"  stats mean shape: {stats['mean'].shape}")
+        print(f"  stats std shape: {stats['std'].shape}")
+        print(f"  stats std min: {stats['std'].min():.6f}")
+        if stats['std'].min() < 1e-6:
+            print(f"  [WARNING] Very small std values detected!")
 
     # Model
     print("\nInitializing FSW + CLIP model...")
