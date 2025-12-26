@@ -34,8 +34,8 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 # Config
 # ============================================================
 NUM_SAMPLES = 32
-EPOCHS = 500
-DROPOUT_RATES = [0.3, 0.7]  # p30 和 p70
+EPOCHS = 400
+DROPOUT_RATES = [0.3, 0.7]
 
 DATA_DIR = "/home/yayun/data/pose_data/"
 CSV_PATH = "/home/yayun/data/signwriting-animation/data_fixed.csv"
