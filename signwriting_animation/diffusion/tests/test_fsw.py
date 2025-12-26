@@ -544,6 +544,21 @@ def collate_with_fsw(batch, dataset):
     return collated, fsw_strings
 
 
+def simple_collate(samples):
+    """Simple collate for pre-processed cached samples."""
+    batch_data = torch.stack([s['data'] for s in samples])
+    batch_input = torch.stack([s['conditions']['input_pose'] for s in samples])
+    batch_sign = torch.stack([s['conditions']['sign_image'] for s in samples])
+    
+    return {
+        'data': batch_data,
+        'conditions': {
+            'input_pose': batch_input,
+            'sign_image': batch_sign,
+        }
+    }
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -586,11 +601,39 @@ def train_overfit():
         split="train",
     )
     
-    # Create subset
-    from torch.utils.data import Subset
-    subset_ds = Subset(full_ds, list(range(NUM_SAMPLES)))
+    print(f"Full dataset size: {len(full_ds)}")
     
-    print(f"Dataset size: {len(subset_ds)}")
+    # CACHE the samples to ensure we overfit to the SAME data each time!
+    # (DynamicPosePredictionDataset randomly samples time windows, so we need to fix them)
+    print("\nCaching fixed samples for overfitting...")
+    cached_samples = []
+    for i in range(NUM_SAMPLES):
+        sample = full_ds[i]
+        
+        # Extract tensors properly
+        data = sample['data']
+        if hasattr(data, 'zero_filled'):
+            data = data.zero_filled()
+        if hasattr(data, 'tensor'):
+            data = data.tensor
+        
+        input_pose = sample['conditions']['input_pose']
+        if hasattr(input_pose, 'zero_filled'):
+            input_pose = input_pose.zero_filled()
+        if hasattr(input_pose, 'tensor'):
+            input_pose = input_pose.tensor
+        
+        # Deep copy to prevent any mutation
+        cached = {
+            'data': data.clone().float(),
+            'conditions': {
+                'input_pose': input_pose.clone().float(),
+                'sign_image': sample['conditions']['sign_image'].clone().float(),
+            },
+            'idx': i,
+        }
+        cached_samples.append(cached)
+        print(f"  Cached sample {i}: data shape {cached['data'].shape}, input shape {cached['conditions']['input_pose'].shape}")
     
     # Check FSW for samples
     print("\nChecking FSW for samples:")
@@ -648,8 +691,8 @@ def train_overfit():
     for epoch in range(MAX_EPOCHS):
         lit_model.train()
         
-        # Get batch
-        batch = zero_pad_collator([full_ds[i] for i in range(NUM_SAMPLES)])
+        # Use CACHED samples (not re-sampling from dataset!)
+        batch = simple_collate(cached_samples)
         
         # Move to device
         batch["data"] = batch["data"].to(device)
@@ -681,7 +724,8 @@ def train_overfit():
     
     results = []
     for idx in range(NUM_SAMPLES):
-        batch = zero_pad_collator([full_ds[idx]])
+        # Use CACHED sample
+        batch = simple_collate([cached_samples[idx]])
         
         cond = batch["conditions"]
         past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
