@@ -513,9 +513,9 @@ def train_overfit(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_samples", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--past_drop_prob", type=float, default=0.5)
+    parser.add_argument("--num_samples", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--past_drop_prob", type=float, default=0.3)
     args = parser.parse_args()
     
     os.chdir("/home/yayun/data/signwriting-animation-fork")
