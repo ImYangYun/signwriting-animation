@@ -1,12 +1,9 @@
 """
-Sign-Only Training - FIXED VERSION
+Sign-Only Training - FIXED VERSION v2
 
-Key fix: 
-- Cache the EXACT (past, future, sign) samples during first epoch
-- Reuse the SAME samples for all training AND testing
-- This ensures we're testing on the EXACT same data we trained on
-
-Previous bug: DynamicPosePredictionDataset randomly samples pivot each time
+Fixes:
+- CachedDataset ensures train/test use SAME data
+- Fixed sanitize_btjc for MaskedTensor in test phase
 """
 import os
 import argparse
@@ -49,20 +46,28 @@ class CachedDataset(Dataset):
         
         print(f"Caching {len(indices)} samples...")
         for i, idx in enumerate(indices):
-            # Get sample (this calls random pivot selection ONCE)
             sample = base_ds[idx]
             batch = collate_fn([sample])
             
-            # Cache the tensors
+            # Extract and convert tensors properly
             past = batch["conditions"]["input_pose"]
             sign = batch["conditions"]["sign_image"]
             gt = batch["data"]
             
-            # Get metadata for this specific sample
+            # Handle MaskedTensor
+            if hasattr(past, "zero_filled"):
+                past = past.zero_filled()
+            if hasattr(past, "tensor"):
+                past = past.tensor
+            if hasattr(gt, "zero_filled"):
+                gt = gt.zero_filled()
+            if hasattr(gt, "tensor"):
+                gt = gt.tensor
+            
             record = base_ds.records[idx]
             
             self.samples.append({
-                "past": past[0],  # Remove batch dim
+                "past": past[0],
                 "sign": sign[0],
                 "gt": gt[0],
             })
@@ -95,7 +100,7 @@ class CachedDataset(Dataset):
 
 
 # ============================================================
-# Model Components (Same as before)
+# Model Components
 # ============================================================
 
 class EmbedSignWritingUnfrozen(nn.Module):
@@ -202,6 +207,7 @@ def sanitize_btjc(x):
     if hasattr(x, "zero_filled"): x = x.zero_filled()
     if hasattr(x, "tensor"): x = x.tensor
     if x.dim() == 5: x = x[:, :, 0]
+    if x.dim() == 3: x = x.unsqueeze(0)  # [T,J,C] -> [1,T,J,C]
     if x.dim() != 4: raise ValueError(f"Expected [B,T,J,C], got {tuple(x.shape)}")
     if x.shape[-1] != 3 and x.shape[-2] == 3: x = x.permute(0, 1, 3, 2)
     return x.contiguous().float()
@@ -297,8 +303,6 @@ class LitDiffusionSignOnly(pl.LightningModule):
         sign_img = batch["conditions"]["sign_image"].float()
 
         gt_norm = self.normalize(gt_btjc)
-        
-        # KEY: past_motion is ALWAYS ZERO
         past_norm = torch.zeros_like(self.normalize(past_btjc))
 
         batch_size, device = gt_norm.shape[0], gt_norm.device
@@ -356,17 +360,14 @@ def train_overfit(args):
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
-    print(" SIGN-ONLY TRAINING - FIXED VERSION")
-    print(" (Cached samples ensure train/test use SAME data)")
+    print(" SIGN-ONLY TRAINING - FIXED VERSION v2")
     print("=" * 70)
 
-    # Base dataset
     base_ds = DynamicPosePredictionDataset(
         data_dir=data_dir, csv_path=csv_path,
         num_past_frames=40, num_future_frames=20, with_metadata=True, split="train",
     )
 
-    # Select samples from different videos
     seen_poses, selected_indices = set(), []
     for idx in range(len(base_ds)):
         if len(selected_indices) >= args.num_samples: break
@@ -377,10 +378,16 @@ def train_overfit(args):
     
     print(f"Selected {len(selected_indices)} indices from different videos")
 
-    # ============================================================
-    # KEY FIX: Cache samples ONCE, reuse for train AND test
-    # ============================================================
     cached_ds = CachedDataset(base_ds, selected_indices, zero_pad_collator)
+    
+    # Get dimensions from cached data
+    sample_data = cached_ds.samples[0]["gt"]
+    if sample_data.dim() == 3:  # [T, J, C]
+        future_len, num_joints, num_dims = sample_data.shape
+    else:
+        raise ValueError(f"Unexpected shape: {sample_data.shape}")
+    
+    print(f"Data shape: T={future_len}, J={num_joints}, C={num_dims}")
     
     train_loader = DataLoader(
         cached_ds, 
@@ -389,19 +396,6 @@ def train_overfit(args):
         collate_fn=zero_pad_collator, 
         num_workers=0
     )
-
-    # Model
-    sample = cached_ds[0]["data"]
-    if hasattr(sample, 'zero_filled'): sample = sample.zero_filled()
-    if hasattr(sample, 'tensor'): sample = sample.tensor
-    
-    # Handle shape
-    if sample.dim() == 3:  # [T, J, C]
-        num_joints, num_dims, future_len = sample.shape[1], sample.shape[2], sample.shape[0]
-    else:  # [B, T, J, C] or other
-        num_joints, num_dims, future_len = sample.shape[-2], sample.shape[-1], sample.shape[-3] if sample.dim() > 3 else sample.shape[0]
-    
-    print(f"Data shape: T={future_len}, J={num_joints}, C={num_dims}")
 
     lit_model = LitDiffusionSignOnly(
         num_keypoints=num_joints, num_dims=num_dims, stats_path=stats_path,
@@ -416,7 +410,7 @@ def train_overfit(args):
     trainer = Trainer(
         max_epochs=args.epochs, accelerator="gpu" if torch.cuda.is_available() else "cpu", devices=1,
         callbacks=[checkpoint_callback], default_root_dir=out_dir,
-        log_every_n_steps=10, precision="16-mixed" if torch.cuda.is_available() else 32,
+        log_every_n_steps=1, precision="16-mixed" if torch.cuda.is_available() else 32,
     )
     trainer.fit(lit_model, train_loader)
 
@@ -433,12 +427,12 @@ def train_overfit(args):
 
     results = []
     for cache_idx in range(min(5, len(cached_ds))):
-        sample = cached_ds[cache_idx]
+        sample = cached_ds.samples[cache_idx]  # Direct access to cached tensors
         meta = cached_ds.get_metadata(cache_idx)
         
-        # Get cached data
-        gt = sanitize_btjc(sample["data"].unsqueeze(0)).to(device)
-        sign = sample["conditions"]["sign_image"].unsqueeze(0).float().to(device)
+        # Get cached data - already processed tensors
+        gt = sanitize_btjc(sample["gt"]).to(device)
+        sign = sample["sign"].unsqueeze(0).float().to(device)
         
         # Inference with ZERO past
         B = 1
@@ -480,13 +474,12 @@ def train_overfit(args):
     best = max(results, key=lambda x: x["pck"])
     best_cache_idx = best["cache_idx"]
     
-    sample = cached_ds[best_cache_idx]
+    sample = cached_ds.samples[best_cache_idx]
     meta = cached_ds.get_metadata(best_cache_idx)
     
-    gt = sanitize_btjc(sample["data"].unsqueeze(0)).to(device)
-    sign = sample["conditions"]["sign_image"].unsqueeze(0).float().to(device)
+    gt = sanitize_btjc(sample["gt"]).to(device)
+    sign = sample["sign"].unsqueeze(0).float().to(device)
     
-    # Re-run inference for best
     past_zero = torch.zeros(1, future_len, num_joints, num_dims, device=device)
     past_norm = lit_model.normalize(past_zero)
     past_bjct = lit_model.btjc_to_bjct(past_norm)
@@ -499,7 +492,6 @@ def train_overfit(args):
         )
         pred = lit_model.unnormalize(lit_model.bjct_to_btjc(pred_bjct))
 
-    # Load ref pose for saving
     ref_path = meta["pose_file"]
     if not ref_path.startswith("/"): ref_path = data_dir + ref_path
     with open(ref_path, "rb") as f:
