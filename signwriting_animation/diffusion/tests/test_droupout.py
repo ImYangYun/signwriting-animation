@@ -515,7 +515,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_samples", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--past_drop_prob", type=float, default=0.3)
+    parser.add_argument("--past_drop_prob", type=float, default=0.5)
     args = parser.parse_args()
     
     os.chdir("/home/yayun/data/signwriting-animation-fork")
