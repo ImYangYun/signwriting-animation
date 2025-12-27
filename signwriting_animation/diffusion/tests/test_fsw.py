@@ -578,7 +578,7 @@ def train_overfit():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_dropout_32s_p30"
+    out_dir = "logs/fsw_dropout_32s_p50"
     
 
     NUM_SAMPLES = 32
