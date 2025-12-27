@@ -578,9 +578,9 @@ def train_overfit():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_past_dropout"  # NEW: better name
+    out_dir = "logs/fsw_dropout_32s_p30"
     
-    
+
     NUM_SAMPLES = 32
     MAX_EPOCHS = 1000  # More epochs since past dropout makes it harder
     DIFFUSION_STEPS = 8
