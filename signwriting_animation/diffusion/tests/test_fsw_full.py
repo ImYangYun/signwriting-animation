@@ -271,21 +271,51 @@ class FullDatasetWrapper(torch.utils.data.Dataset):
 
 
 def full_collate_fn(batch):
-    """Collate function that handles FSW strings."""
-    data = torch.stack([s['data'] for s in batch])
-    input_pose = torch.stack([s['input_pose'] for s in batch])
-    sign_image = torch.stack([s['sign_image'] for s in batch])
-    fsw_strings = [s['fsw'] for s in batch]
-    indices = [s['idx'] for s in batch]
+    """Collate function that handles FSW strings and variable length sequences."""
+    TARGET_LEN = 20  # Force all sequences to 20 frames
+    
+    processed_data = []
+    processed_input = []
+    
+    for s in batch:
+        data = s['data']
+        inp = s['input_pose']
+        
+        # Truncate or pad data to TARGET_LEN
+        if data.shape[0] > TARGET_LEN:
+            data = data[:TARGET_LEN]
+        elif data.shape[0] < TARGET_LEN:
+            # Pad with last frame
+            pad_size = TARGET_LEN - data.shape[0]
+            if data.dim() == 4:
+                padding = data[-1:].repeat(pad_size, 1, 1, 1)
+            else:
+                padding = data[-1:].repeat(pad_size, 1, 1)
+            data = torch.cat([data, padding], dim=0)
+        
+        # Same for input_pose (40 frames)
+        INPUT_LEN = 40
+        if inp.shape[0] > INPUT_LEN:
+            inp = inp[:INPUT_LEN]
+        elif inp.shape[0] < INPUT_LEN:
+            pad_size = INPUT_LEN - inp.shape[0]
+            if inp.dim() == 4:
+                padding = inp[-1:].repeat(pad_size, 1, 1, 1)
+            else:
+                padding = inp[-1:].repeat(pad_size, 1, 1)
+            inp = torch.cat([inp, padding], dim=0)
+        
+        processed_data.append(data)
+        processed_input.append(inp)
     
     return {
-        'data': data,
+        'data': torch.stack(processed_data),
         'conditions': {
-            'input_pose': input_pose,
-            'sign_image': sign_image,
+            'input_pose': torch.stack(processed_input),
+            'sign_image': torch.stack([s['sign_image'] for s in batch]),
         },
-        'fsw_strings': fsw_strings,
-        'indices': indices,
+        'fsw_strings': [s['fsw'] for s in batch],
+        'indices': [s['idx'] for s in batch],
     }
 
 
