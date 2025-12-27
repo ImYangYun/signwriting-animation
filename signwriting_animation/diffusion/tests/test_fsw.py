@@ -748,14 +748,14 @@ def train_enhanced():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_enhanced_32s_p30_5000"
+    out_dir = "logs/fsw_enhanced_32s_p50_5000"
 
     NUM_SAMPLES = 32
     MAX_EPOCHS = 5000
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
-    PAST_DROPOUT = 0.3
+    PAST_DROPOUT = 0.5
     
     # LR Schedule config
     USE_LR_SCHEDULE = True
