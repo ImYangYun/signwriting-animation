@@ -578,7 +578,7 @@ def train_overfit():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_dropout_32s_p50_5000"
+    out_dir = "logs/fsw_dropout_32s_p30_5000"
     
 
     NUM_SAMPLES = 32
@@ -586,7 +586,7 @@ def train_overfit():
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
-    PAST_DROPOUT = 0.5  # NEW: 50% chance to drop past motion during training
+    PAST_DROPOUT = 0.3  # NEW: 50% chance to drop past motion during training
     
     os.makedirs(out_dir, exist_ok=True)
 
