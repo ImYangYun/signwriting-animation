@@ -1008,17 +1008,44 @@ def train_enhanced():
     print(f"\nModels saved to: {out_dir}/")
     
     # Save poses for visualization
+    # Save poses for visualization
     print("\n" + "="*70)
     print("SAVING POSES FOR VISUALIZATION...")
     print("="*70)
     
-    # Save for first 3 samples
-    for sample_idx in range(min(3, NUM_SAMPLES)):
-        print(f"\nSample {sample_idx}:")
+    # Sort by Sign-Only PCK and save best samples
+    sorted_results = sorted(results, key=lambda x: x['pck_signonly'], reverse=True)
+    
+    # Save top 5 best Sign-Only samples
+    print("\n[BEST SIGN-ONLY SAMPLES]")
+    for rank, r in enumerate(sorted_results[:5]):
+        sample_idx = r['idx']
+        print(f"\nRank {rank+1}: Sample {sample_idx} (Sign-Only: {r['pck_signonly']:.1f}%)")
         save_pose_for_visualization(
             lit_model, cached_samples, fsw_strings_cache, 
-            full_ds, f"{out_dir}/sample_{sample_idx}", device, sample_idx
+            full_ds, f"{out_dir}/best_signonly_{rank+1}_sample_{sample_idx}", device, sample_idx
         )
+    
+    # Save 2 medium samples (around median)
+    mid_idx = len(sorted_results) // 2
+    print("\n[MEDIUM SAMPLES]")
+    for rank, r in enumerate(sorted_results[mid_idx:mid_idx+2]):
+        sample_idx = r['idx']
+        print(f"\nMedium {rank+1}: Sample {sample_idx} (Sign-Only: {r['pck_signonly']:.1f}%)")
+        save_pose_for_visualization(
+            lit_model, cached_samples, fsw_strings_cache, 
+            full_ds, f"{out_dir}/medium_{rank+1}_sample_{sample_idx}", device, sample_idx
+        )
+    
+    # Save 1 poor sample (worst)
+    print("\n[POOR SAMPLE]")
+    r = sorted_results[-1]
+    sample_idx = r['idx']
+    print(f"\nWorst: Sample {sample_idx} (Sign-Only: {r['pck_signonly']:.1f}%)")
+    save_pose_for_visualization(
+        lit_model, cached_samples, fsw_strings_cache, 
+        full_ds, f"{out_dir}/poor_sample_{sample_idx}", device, sample_idx
+    )
     
     # Save results to CSV
     import pandas as pd
