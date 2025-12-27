@@ -629,11 +629,13 @@ def save_pose_for_visualization(lit_model, cached_samples, fsw_strings_cache, fu
         )
         pred_so_norm = lit_model.bjct_to_btjc(pred_so_bjct)
     
-    # Unnormalize
+    # Unnormalize predictions (model outputs are normalized)
     pred_unnorm = lit_model.unnormalize(pred_norm)[0].cpu()      # [T, J, C]
     pred_so_unnorm = lit_model.unnormalize(pred_so_norm)[0].cpu()
-    gt_unnorm = lit_model.unnormalize(gt_norm)[0].cpu()
-    past_unnorm = lit_model.unnormalize(past_raw)[0].cpu()
+    
+    # gt_raw and past_raw are already in original scale, don't unnormalize!
+    gt_unnorm = gt_raw[0].cpu()
+    past_unnorm = past_raw[0].cpu()
     
     # Get original pose header
     record = full_ds.records[sample_idx]
@@ -645,8 +647,10 @@ def save_pose_for_visualization(lit_model, cached_samples, fsw_strings_cache, fu
     reduced_pose = reduce_holistic(ref_pose)
     header = reduced_pose.header
     
-    def save_tensor_as_pose(tensor, filename, header, fps=25.0):
-        """Save tensor [T, J, C] as .pose file"""
+    def save_tensor_as_pose(tensor, filename, header, ref_pose, fps=25.0, scale_to_ref=True):
+        """Save tensor [T, J, C] as .pose file with proper scaling."""
+        from pose_anonymization.data.normalization import unshift_hands
+        
         data = tensor.numpy().astype(np.float32)
         # Add person dimension: [T, 1, J, C]
         data = data[:, np.newaxis, :, :]
@@ -656,6 +660,38 @@ def save_pose_for_visualization(lit_model, cached_samples, fsw_strings_cache, fu
         body = NumPyPoseBody(fps=fps, data=data, confidence=conf)
         pose = Pose(header=header, body=body)
         
+        # Fix hand positions (must be before scaling!)
+        unshift_hands(pose)
+        
+        if scale_to_ref:
+            # Get reference data for scaling
+            T_pred = data.shape[0]
+            T_ref_total = ref_pose.body.data.shape[0]
+            future_start = max(0, T_ref_total - T_pred)
+            ref_arr = np.asarray(
+                ref_pose.body.data[future_start:future_start+T_pred, 0], 
+                dtype=np.float32
+            )
+            
+            # Scale to reference variance
+            def _var(a):
+                center = a.mean(axis=(0, 1), keepdims=True)
+                return float(((a - center) ** 2).mean())
+            
+            pose_data = pose.body.data[:, 0, :, :]
+            var_input = _var(pose_data)
+            var_ref = _var(ref_arr)
+            
+            if var_input > 1e-8:
+                scale = np.sqrt(var_ref / var_input)
+                pose.body.data = pose.body.data * scale
+            
+            # Align center
+            pose_data = pose.body.data[:, 0, :, :].reshape(-1, 3)
+            input_center = pose_data.mean(axis=0)
+            ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+            pose.body.data = pose.body.data + (ref_center - input_center)
+        
         with open(filename, 'wb') as f:
             pose.write(f)
         print(f"  Saved: {filename}")
@@ -664,19 +700,19 @@ def save_pose_for_visualization(lit_model, cached_samples, fsw_strings_cache, fu
     pose_dir = f"{out_dir}/poses"
     os.makedirs(pose_dir, exist_ok=True)
     
-    save_tensor_as_pose(gt_unnorm, f"{pose_dir}/ground_truth.pose", header)
-    save_tensor_as_pose(pred_unnorm, f"{pose_dir}/pred_normal.pose", header)
-    save_tensor_as_pose(pred_so_unnorm, f"{pose_dir}/pred_sign_only.pose", header)
-    save_tensor_as_pose(past_unnorm, f"{pose_dir}/past_context.pose", header)
+    save_tensor_as_pose(gt_unnorm, f"{pose_dir}/ground_truth.pose", header, reduced_pose)
+    save_tensor_as_pose(pred_unnorm, f"{pose_dir}/pred_normal.pose", header, reduced_pose)
+    save_tensor_as_pose(pred_so_unnorm, f"{pose_dir}/pred_sign_only.pose", header, reduced_pose)
+    save_tensor_as_pose(past_unnorm, f"{pose_dir}/past_context.pose", header, reduced_pose)
     
     # Full sequences (past + future)
     full_pred = torch.cat([past_unnorm, pred_unnorm], dim=0)
     full_gt = torch.cat([past_unnorm, gt_unnorm], dim=0)
     full_so = torch.cat([torch.zeros_like(past_unnorm), pred_so_unnorm], dim=0)
     
-    save_tensor_as_pose(full_pred, f"{pose_dir}/full_pred.pose", header)
-    save_tensor_as_pose(full_gt, f"{pose_dir}/full_gt.pose", header)
-    save_tensor_as_pose(full_so, f"{pose_dir}/full_sign_only.pose", header)
+    save_tensor_as_pose(full_pred, f"{pose_dir}/full_pred.pose", header, reduced_pose)
+    save_tensor_as_pose(full_gt, f"{pose_dir}/full_gt.pose", header, reduced_pose)
+    save_tensor_as_pose(full_so, f"{pose_dir}/full_sign_only.pose", header, reduced_pose)
     
     # Also save the SignWriting image
     from PIL import Image
@@ -712,14 +748,14 @@ def train_enhanced():
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_enhanced_32s_p50_5000"
+    out_dir = "logs/fsw_enhanced_32s_p30_5000"
 
     NUM_SAMPLES = 32
     MAX_EPOCHS = 5000
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
-    PAST_DROPOUT = 0.5
+    PAST_DROPOUT = 0.3
     
     # LR Schedule config
     USE_LR_SCHEDULE = True
