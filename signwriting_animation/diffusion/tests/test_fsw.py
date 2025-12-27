@@ -1,28 +1,25 @@
 """
-FSW Encoder + Unfrozen CLIP Overfitting Experiment (Simplified)
+Enhanced FSW Encoder + Stronger Decoder Training Script
 
-Uses the original DynamicPosePredictionDataset and adds FSW extraction.
-This ensures data loading is consistent with the working training script.
+Improvements over train_fsw_overfit_simple.py:
+1. EnhancedFSWEncoder: Hierarchical symbol embedding + Transformer + Attention pooling
+2. Stronger Decoder: Deeper MLP with LayerNorm
+3. Cosine Annealing LR Schedule
+4. Save poses for visualization
 
 Usage:
-    python train_fsw_overfit_simple.py
+    python train_fsw_enhanced.py
 """
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import pandas as pd
 import lightning as pl
-from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
 
-from torch.utils.data import DataLoader
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
 from pose_format.utils.generic import reduce_holistic
-from pose_format.torch.masked.collator import zero_pad_collator
-from pose_anonymization.data.normalization import unshift_hands
 from transformers import CLIPModel
 
 from CAMDM.network.models import PositionalEncoding, TimestepEmbedder
@@ -30,56 +27,84 @@ from CAMDM.diffusion.gaussian_diffusion import (
     GaussianDiffusion, ModelMeanType, ModelVarType, LossType
 )
 
-# Use original dataset!
 from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
-
-# SignWriting parsing
 from signwriting.formats.swu_to_fsw import swu2fsw
 from signwriting.formats.fsw_to_sign import fsw_to_sign
 
 
 # ============================================================
-# FSW Encoder (Simplified - just extract features)
+# Enhanced FSW Encoder
 # ============================================================
 
-class SimpleFSWEncoder(nn.Module):
+class EnhancedFSWEncoder(nn.Module):
     """
-    Simple FSW encoder: parse FSW → embed symbols → mean pool.
+    Enhanced FSW encoder with:
+    1. Hierarchical symbol embedding (category + shape + variation)
+    2. Learnable position encoding
+    3. Transformer aggregation with attention pooling
     """
     
-    def __init__(self, num_latent_dims: int = 256):
+    def __init__(self, num_latent_dims: int = 256, max_symbols: int = 20):
         super().__init__()
         self.num_latent_dims = num_latent_dims
+        self.max_symbols = max_symbols
         
-        # Simple symbol embedding
-        self.symbol_embed = nn.Embedding(1000, num_latent_dims)
+        # === Hierarchical Symbol Embedding ===
+        # SignWriting符号结构: S + 基类(2位hex) + 变体(3位hex)
+        # e.g., S10000 → category=1, shape=0, variation=000
+        self.category_embed = nn.Embedding(64, num_latent_dims // 4)   # 第1位hex (0-3)
+        self.shape_embed = nn.Embedding(256, num_latent_dims // 4)     # 第2位hex  
+        self.variation_embed = nn.Embedding(4096, num_latent_dims // 2) # 后3位hex
         
-        # Position encoder
-        self.pos_encoder = nn.Linear(2, num_latent_dims)
-        
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.Linear(num_latent_dims * 2, num_latent_dims),
+        # === Position Encoding (learnable) ===
+        self.pos_encoder = nn.Sequential(
+            nn.Linear(2, num_latent_dims),
+            nn.LayerNorm(num_latent_dims),
             nn.GELU(),
             nn.Linear(num_latent_dims, num_latent_dims),
         )
         
+        # === Symbol Feature Fusion ===
+        self.symbol_fusion = nn.Sequential(
+            nn.Linear(num_latent_dims * 2, num_latent_dims),
+            nn.LayerNorm(num_latent_dims),
+            nn.GELU(),
+        )
+        
+        # === Transformer for symbol interaction ===
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=num_latent_dims,
+            nhead=4,
+            dim_feedforward=num_latent_dims * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        # === Attention Pooling ===
+        self.attn_query = nn.Parameter(torch.randn(1, 1, num_latent_dims))
+        
+        # === Output projection ===
+        self.output_proj = nn.Sequential(
+            nn.Linear(num_latent_dims, num_latent_dims),
+            nn.LayerNorm(num_latent_dims),
+        )
+        
     def parse_fsw(self, fsw_string: str):
-        """Parse FSW string into symbols."""
+        """Parse FSW into hierarchical symbol info."""
         if not fsw_string or not fsw_string.strip():
-            return [(0, 0.0, 0.0)]
+            return [(0, 0, 0, 0.0, 0.0)]  # (cat, shape, var, x, y)
         
         try:
             sign = fsw_to_sign(fsw_string)
-            
-            # Handle dict return type
             if isinstance(sign, dict):
                 symbols_list = sign.get('symbols', [])
             else:
                 symbols_list = getattr(sign, 'symbols', [])
             
             if not symbols_list:
-                return [(0, 0.0, 0.0)]
+                return [(0, 0, 0, 0.0, 0.0)]
             
             result = []
             for sym in symbols_list:
@@ -90,13 +115,21 @@ class SimpleFSWEncoder(nn.Module):
                     symbol_str = sym.symbol
                     position = sym.position
                 
-                # Get symbol ID (hash to embedding index)
+                # Parse symbol ID hierarchically
                 if symbol_str.startswith('S'):
                     symbol_str = symbol_str[1:]
+                
                 try:
-                    symbol_id = int(symbol_str, 16) % 1000
+                    # S + 5 hex digits: e.g., "2e748"
+                    # category = first digit (0-3 for hand/movement/dynamics/etc)
+                    # shape = second digit
+                    # variation = last 3 digits
+                    full_id = int(symbol_str, 16)
+                    category = (full_id >> 16) & 0xF  # top nibble
+                    shape = (full_id >> 12) & 0xFF    # next byte-ish
+                    variation = full_id & 0xFFF       # bottom 12 bits
                 except:
-                    symbol_id = 0
+                    category, shape, variation = 0, 0, 0
                 
                 # Normalize position
                 x = (position[0] - 500) / 250.0
@@ -104,46 +137,73 @@ class SimpleFSWEncoder(nn.Module):
                 x = max(-2.0, min(2.0, x))
                 y = max(-2.0, min(2.0, y))
                 
-                result.append((symbol_id, x, y))
+                result.append((category % 64, shape % 256, variation % 4096, x, y))
             
-            return result if result else [(0, 0.0, 0.0)]
+            return result if result else [(0, 0, 0, 0.0, 0.0)]
         except:
-            return [(0, 0.0, 0.0)]
+            return [(0, 0, 0, 0.0, 0.0)]
     
     def forward(self, fsw_batch: list):
-        """Encode batch of FSW strings."""
-        device = self.symbol_embed.weight.device
+        device = self.category_embed.weight.device
         batch_size = len(fsw_batch)
         
-        embeddings = []
+        batch_embeddings = []
+        batch_masks = []
+        
         for fsw in fsw_batch:
-            symbols = self.parse_fsw(fsw)
+            symbols = self.parse_fsw(fsw)[:self.max_symbols]
+            num_symbols = len(symbols)
             
-            # Embed each symbol
-            sym_embs = []
-            for sym_id, x, y in symbols:
-                sym_emb = self.symbol_embed(torch.tensor([sym_id], device=device))
-                pos_emb = self.pos_encoder(torch.tensor([[x, y]], device=device))
-                combined = torch.cat([sym_emb, pos_emb], dim=-1)
-                sym_embs.append(combined)
+            # Pad to max_symbols
+            while len(symbols) < self.max_symbols:
+                symbols.append((0, 0, 0, 0.0, 0.0))
             
-            # Mean pool
-            if sym_embs:
-                pooled = torch.stack(sym_embs).mean(dim=0)
-            else:
-                pooled = torch.zeros(1, self.num_latent_dims * 2, device=device)
+            # Create tensors
+            cats = torch.tensor([s[0] for s in symbols], device=device)
+            shapes = torch.tensor([s[1] for s in symbols], device=device)
+            vars_ = torch.tensor([s[2] for s in symbols], device=device)
+            positions = torch.tensor([[s[3], s[4]] for s in symbols], device=device, dtype=torch.float)
             
-            embeddings.append(pooled)
+            # Embed hierarchically
+            cat_emb = self.category_embed(cats)      # [N, D/4]
+            shape_emb = self.shape_embed(shapes)     # [N, D/4]
+            var_emb = self.variation_embed(vars_)    # [N, D/2]
+            
+            symbol_emb = torch.cat([cat_emb, shape_emb, var_emb], dim=-1)  # [N, D]
+            pos_emb = self.pos_encoder(positions)                          # [N, D]
+            
+            # Fuse symbol + position
+            combined = self.symbol_fusion(torch.cat([symbol_emb, pos_emb], dim=-1))  # [N, D]
+            
+            batch_embeddings.append(combined)
+            
+            # Mask for padding
+            mask = torch.zeros(self.max_symbols, device=device, dtype=torch.bool)
+            mask[num_symbols:] = True
+            batch_masks.append(mask)
         
         # Stack batch
-        batch_emb = torch.cat(embeddings, dim=0)  # (B, D*2)
-        output = self.output_proj(batch_emb)  # (B, D)
+        batch_emb = torch.stack(batch_embeddings)  # [B, N, D]
+        batch_mask = torch.stack(batch_masks)      # [B, N]
         
+        # Transformer with mask
+        transformed = self.transformer(batch_emb, src_key_padding_mask=batch_mask)  # [B, N, D]
+        
+        # Attention pooling
+        query = self.attn_query.expand(batch_size, -1, -1)  # [B, 1, D]
+        
+        # Simple attention
+        scores = torch.bmm(query, transformed.transpose(1, 2))  # [B, 1, N]
+        scores = scores.masked_fill(batch_mask.unsqueeze(1), float('-inf'))
+        attn_weights = F.softmax(scores, dim=-1)
+        pooled = torch.bmm(attn_weights, transformed).squeeze(1)  # [B, D]
+        
+        output = self.output_proj(pooled)
         return output
 
 
 # ============================================================
-# Utilities (from train_unfrozen_clip_full.py)
+# Utilities
 # ============================================================
 
 def sanitize_btjc(x):
@@ -178,47 +238,34 @@ def mean_frame_disp(x_btjc: torch.Tensor) -> float:
     return v.abs().mean().item()
 
 
-def tensor_to_pose(t_btjc: torch.Tensor, header, ref_pose: Pose, scale_to_ref: bool = True) -> Pose:
-    """Convert tensor to Pose format."""
-    if t_btjc.dim() == 4:
-        t = t_btjc[0]
-    else:
-        t = t_btjc
+def get_fsw_from_record(record):
+    """Extract FSW string from record."""
+    swu_text = record.get('text', '')
+    if not swu_text:
+        return ""
     
-    t_np = t.detach().cpu().numpy().astype(np.float32)
-    arr = t_np[:, None, :, :]
-    T = arr.shape[0]
-    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
-    fps = ref_pose.body.fps
+    swu_first = swu_text.split()[0] if ' ' in swu_text else swu_text
     
-    body = NumPyPoseBody(fps=fps, data=arr, confidence=conf)
-    pose_obj = Pose(header=header, body=body)
-    unshift_hands(pose_obj)
+    try:
+        fsw = swu2fsw(swu_first)
+        return fsw
+    except:
+        return ""
+
+
+def simple_collate(samples):
+    """Simple collate for pre-processed cached samples."""
+    batch_data = torch.stack([s['data'] for s in samples])
+    batch_input = torch.stack([s['conditions']['input_pose'] for s in samples])
+    batch_sign = torch.stack([s['conditions']['sign_image'] for s in samples])
     
-    if scale_to_ref:
-        T_pred = t_np.shape[0]
-        T_ref_total = ref_pose.body.data.shape[0]
-        future_start = max(0, T_ref_total - T_pred)
-        ref_arr = np.asarray(ref_pose.body.data[future_start:future_start+T_pred, 0], dtype=np.float32)
-        
-        def _var(a):
-            center = a.mean(axis=(0, 1), keepdims=True)
-            return float(((a - center) ** 2).mean())
-        
-        pose_data = pose_obj.body.data[:, 0, :, :]
-        var_input = _var(pose_data)
-        var_ref = _var(ref_arr)
-        
-        if var_input > 1e-8:
-            scale = np.sqrt(var_ref / var_input)
-            pose_obj.body.data = pose_obj.body.data * scale
-        
-        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
-        input_center = pose_data.mean(axis=0)
-        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
-        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
-    
-    return pose_obj
+    return {
+        'data': batch_data,
+        'conditions': {
+            'input_pose': batch_input,
+            'sign_image': batch_sign,
+        }
+    }
 
 
 # ============================================================
@@ -275,8 +322,12 @@ class ContextEncoder(nn.Module):
         return x_enc.mean(dim=1)
 
 
-class SignWritingToPoseDiffusionWithFSW(nn.Module):
-    """Diffusion model with CLIP + FSW encoder."""
+class SignWritingToPoseDiffusionEnhanced(nn.Module):
+    """
+    Enhanced Diffusion model with:
+    - CLIP + Enhanced FSW encoder
+    - Stronger decoder with LayerNorm
+    """
     
     def __init__(self, num_keypoints: int, num_dims_per_keypoint: int,
                  embedding_arch: str = 'openai/clip-vit-base-patch32',
@@ -301,14 +352,16 @@ class SignWritingToPoseDiffusionWithFSW(nn.Module):
             num_latent_dims, embedding_arch, freeze_clip=freeze_clip
         )
         
-        # FSW encoder
-        self.fsw_encoder = SimpleFSWEncoder(num_latent_dims)
+        # Enhanced FSW encoder
+        self.fsw_encoder = EnhancedFSWEncoder(num_latent_dims, max_symbols=20)
         
-        # Fusion: CLIP + FSW
+        # Fusion: CLIP + FSW (with gating)
         self.sign_fusion = nn.Sequential(
-            nn.Linear(num_latent_dims * 2, num_latent_dims),
+            nn.Linear(num_latent_dims * 2, num_latent_dims * 2),
+            nn.LayerNorm(num_latent_dims * 2),
             nn.GELU(),
-            nn.Linear(num_latent_dims, num_latent_dims),
+            nn.Linear(num_latent_dims * 2, num_latent_dims),
+            nn.LayerNorm(num_latent_dims),
         )
         
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
@@ -316,16 +369,25 @@ class SignWritingToPoseDiffusionWithFSW(nn.Module):
 
         self.xt_frame_encoder = nn.Sequential(
             nn.Linear(input_feats, num_latent_dims),
+            nn.LayerNorm(num_latent_dims),
             nn.GELU(),
             nn.Linear(num_latent_dims, num_latent_dims),
         )
         self.output_pos_embed = nn.Embedding(512, num_latent_dims)
 
+        # === ENHANCED DECODER: Deeper with LayerNorm ===
         decoder_input_dim = num_latent_dims * 3
         self.decoder = nn.Sequential(
-            nn.Linear(decoder_input_dim, 512),
+            nn.Linear(decoder_input_dim, 768),
+            nn.LayerNorm(768),
             nn.GELU(),
-            nn.Linear(512, 512),
+            nn.Dropout(dropout),
+            nn.Linear(768, 768),
+            nn.LayerNorm(768),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(768, 512),
+            nn.LayerNorm(512),
             nn.GELU(),
             nn.Linear(512, input_feats),
         )
@@ -378,8 +440,8 @@ class SignWritingToPoseDiffusionWithFSW(nn.Module):
 # Lightning Module
 # ============================================================
 
-class LitDiffusionWithFSW(pl.LightningModule):
-    """Lightning module with CLIP + FSW."""
+class LitDiffusionEnhanced(pl.LightningModule):
+    """Enhanced Lightning module with CLIP + FSW + LR schedule."""
     
     def __init__(self, 
                  num_keypoints=178, 
@@ -393,7 +455,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
                  t_future=20,
                  freeze_clip=False,
                  use_fsw=True,
-                 past_dropout=0.5):  # NEW: 50% chance to drop past
+                 past_dropout=0.3):
         super().__init__()
         self.save_hyperparameters()
 
@@ -401,7 +463,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
         self.vel_weight = vel_weight
         self.acc_weight = acc_weight
         self.use_fsw = use_fsw
-        self.past_dropout = past_dropout  # NEW
+        self.past_dropout = past_dropout
         self._step_count = 0
 
         stats = torch.load(stats_path, map_location="cpu")
@@ -410,7 +472,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
         self.register_buffer("mean_pose", mean.clone())
         self.register_buffer("std_pose", std.clone())
 
-        self.model = SignWritingToPoseDiffusionWithFSW(
+        self.model = SignWritingToPoseDiffusionEnhanced(
             num_keypoints=num_keypoints,
             num_dims_per_keypoint=num_dims,
             t_past=t_past,
@@ -428,8 +490,6 @@ class LitDiffusionWithFSW(pl.LightningModule):
         )
 
         self.lr = lr
-        
-        # Store FSW strings for current batch
         self.current_fsw_strings = None
 
     def normalize(self, x):
@@ -461,7 +521,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
         gt_bjct = self.btjc_to_bjct(gt_norm)
         past_bjct = self.btjc_to_bjct(past_norm)
 
-        # === PAST DROPOUT: Force model to learn SignWriting ===
+        # === PAST DROPOUT ===
         if self.training and self.past_dropout > 0:
             if torch.rand(1).item() < self.past_dropout:
                 past_bjct = torch.zeros_like(past_bjct)
@@ -470,7 +530,6 @@ class LitDiffusionWithFSW(pl.LightningModule):
         noise = torch.randn_like(gt_bjct)
         x_noisy = self.diffusion.q_sample(gt_bjct, timestep, noise=noise)
 
-        # Get FSW strings if available
         fsw_strings = self.current_fsw_strings if self.use_fsw else None
         
         pred_x0_bjct = self.model(x_noisy, timestep, past_bjct, sign_img, fsw_strings)
@@ -496,7 +555,7 @@ class LitDiffusionWithFSW(pl.LightningModule):
             gt_disp = gt_vel.abs().mean().item()
             disp_ratio = pred_disp / (gt_disp + 1e-8)
 
-        if self._step_count % 50 == 0:
+        if self._step_count % 100 == 0:
             print(f"[Step {self._step_count}] loss={loss.item():.4f}, mse={loss_mse.item():.4f}, "
                   f"vel={loss_vel.item():.4f}, disp_ratio={disp_ratio:.4f}")
 
@@ -515,93 +574,172 @@ class LitDiffusionWithFSW(pl.LightningModule):
 
 
 # ============================================================
-# Custom collate that extracts FSW
+# Pose Saving Utilities
 # ============================================================
 
-def get_fsw_from_record(record):
-    """Extract FSW string from record."""
-    swu_text = record.get('text', '')
-    if not swu_text:
-        return ""
+def save_pose_for_visualization(lit_model, cached_samples, fsw_strings_cache, full_ds, out_dir, device, sample_idx=0):
+    """Save generated poses for visualization."""
     
-    swu_first = swu_text.split()[0] if ' ' in swu_text else swu_text
+    lit_model.eval()
     
-    try:
-        fsw = swu2fsw(swu_first)
-        return fsw
-    except:
-        return ""
-
-
-def collate_with_fsw(batch, dataset):
-    """Custom collate that adds FSW strings."""
-    # Use original collator
-    collated = zero_pad_collator(batch)
+    # Get sample
+    batch = simple_collate([cached_samples[sample_idx]])
     
-    # Extract FSW strings from records
-    indices = [b.get('idx', i) for i, b in enumerate(batch)]
-    fsw_strings = []
-    for idx in indices:
-        if hasattr(dataset, 'records') and idx < len(dataset.records):
-            fsw = get_fsw_from_record(dataset.records[idx])
-        else:
-            fsw = ""
-        fsw_strings.append(fsw)
+    cond = batch["conditions"]
+    past_raw = sanitize_btjc(cond["input_pose"][:1]).to(device)
+    sign = cond["sign_image"][:1].float().to(device)
+    gt_raw = sanitize_btjc(batch["data"][:1]).to(device)
     
-    return collated, fsw_strings
-
-
-def simple_collate(samples):
-    """Simple collate for pre-processed cached samples."""
-    batch_data = torch.stack([s['data'] for s in samples])
-    batch_input = torch.stack([s['conditions']['input_pose'] for s in samples])
-    batch_sign = torch.stack([s['conditions']['sign_image'] for s in samples])
+    past_norm = lit_model.normalize(past_raw)
+    gt_norm = lit_model.normalize(gt_raw)
+    
+    past_bjct = lit_model.btjc_to_bjct(past_norm)
+    B, J, C, _ = past_bjct.shape
+    T_future = gt_norm.shape[1]
+    target_shape = (B, J, C, T_future)
+    
+    with torch.no_grad():
+        # Normal inference
+        class _Wrapper(nn.Module):
+            def __init__(self, model, past, sign, fsw):
+                super().__init__()
+                self.model, self.past, self.sign, self.fsw = model, past, sign, fsw
+            def forward(self, x, t, **kwargs):
+                return self.model(x, t, self.past, self.sign, self.fsw)
+        
+        wrapped = _Wrapper(lit_model.model, past_bjct, sign, [fsw_strings_cache[sample_idx]])
+        pred_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
+        pred_norm = lit_model.bjct_to_btjc(pred_bjct)
+        
+        # Sign-Only (drop past)
+        zeros_past = torch.zeros_like(past_bjct)
+        wrapped_so = _Wrapper(lit_model.model, zeros_past, sign, [fsw_strings_cache[sample_idx]])
+        pred_so_bjct = lit_model.diffusion.p_sample_loop(
+            model=wrapped_so,
+            shape=target_shape,
+            clip_denoised=True,
+            model_kwargs={"y": {}},
+            progress=False,
+        )
+        pred_so_norm = lit_model.bjct_to_btjc(pred_so_bjct)
+    
+    # Unnormalize
+    pred_unnorm = lit_model.unnormalize(pred_norm)[0].cpu()      # [T, J, C]
+    pred_so_unnorm = lit_model.unnormalize(pred_so_norm)[0].cpu()
+    gt_unnorm = lit_model.unnormalize(gt_norm)[0].cpu()
+    past_unnorm = lit_model.unnormalize(past_raw)[0].cpu()
+    
+    # Get original pose header
+    record = full_ds.records[sample_idx]
+    pose_path = os.path.join(full_ds.data_dir, record['pose'])
+    with open(pose_path, 'rb') as f:
+        ref_pose = Pose.read(f.read())
+    
+    # Get reduced header
+    reduced_pose = reduce_holistic(ref_pose)
+    header = reduced_pose.header
+    
+    def save_tensor_as_pose(tensor, filename, header, fps=25.0):
+        """Save tensor [T, J, C] as .pose file"""
+        data = tensor.numpy().astype(np.float32)
+        # Add person dimension: [T, 1, J, C]
+        data = data[:, np.newaxis, :, :]
+        T = data.shape[0]
+        conf = np.ones((T, 1, data.shape[2]), dtype=np.float32)
+        
+        body = NumPyPoseBody(fps=fps, data=data, confidence=conf)
+        pose = Pose(header=header, body=body)
+        
+        with open(filename, 'wb') as f:
+            pose.write(f)
+        print(f"  Saved: {filename}")
+    
+    # Save all poses
+    pose_dir = f"{out_dir}/poses"
+    os.makedirs(pose_dir, exist_ok=True)
+    
+    save_tensor_as_pose(gt_unnorm, f"{pose_dir}/ground_truth.pose", header)
+    save_tensor_as_pose(pred_unnorm, f"{pose_dir}/pred_normal.pose", header)
+    save_tensor_as_pose(pred_so_unnorm, f"{pose_dir}/pred_sign_only.pose", header)
+    save_tensor_as_pose(past_unnorm, f"{pose_dir}/past_context.pose", header)
+    
+    # Full sequences (past + future)
+    full_pred = torch.cat([past_unnorm, pred_unnorm], dim=0)
+    full_gt = torch.cat([past_unnorm, gt_unnorm], dim=0)
+    full_so = torch.cat([torch.zeros_like(past_unnorm), pred_so_unnorm], dim=0)
+    
+    save_tensor_as_pose(full_pred, f"{pose_dir}/full_pred.pose", header)
+    save_tensor_as_pose(full_gt, f"{pose_dir}/full_gt.pose", header)
+    save_tensor_as_pose(full_so, f"{pose_dir}/full_sign_only.pose", header)
+    
+    # Also save the SignWriting image
+    from PIL import Image
+    sign_img = sign[0].cpu().permute(1, 2, 0).numpy()
+    sign_img = ((sign_img - sign_img.min()) / (sign_img.max() - sign_img.min() + 1e-8) * 255).astype(np.uint8)
+    Image.fromarray(sign_img).save(f"{pose_dir}/signwriting.png")
+    
+    print(f"\n✅ Poses saved to {pose_dir}/")
+    print(f"   - ground_truth.pose: GT future frames")
+    print(f"   - pred_normal.pose: Normal prediction (past + sign)")
+    print(f"   - pred_sign_only.pose: Sign-only prediction (zeros + sign)")
+    print(f"   - full_pred.pose: Past + predicted future")
+    print(f"   - full_gt.pose: Past + GT future")
+    print(f"   - signwriting.png: Input SignWriting image")
     
     return {
-        'data': batch_data,
-        'conditions': {
-            'input_pose': batch_input,
-            'sign_image': batch_sign,
-        }
+        'pred_normal': pred_unnorm,
+        'pred_sign_only': pred_so_unnorm,
+        'ground_truth': gt_unnorm,
+        'past': past_unnorm,
     }
 
 
 # ============================================================
-# Main
+# Main Training
 # ============================================================
 
-def train_overfit():
-    """Overfitting experiment with FSW + CLIP encoder."""
+def train_enhanced():
+    """Enhanced training with FSW encoder and pose saving."""
     pl.seed_everything(42)
 
     # Config
     data_dir = "/home/yayun/data/pose_data/"
     csv_path = "/home/yayun/data/signwriting-animation/data_fixed.csv"
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
-    out_dir = "logs/fsw_dropout_32s_p30_5000"
-    
+    out_dir = "logs/fsw_enhanced_32s_p30_5000"
 
     NUM_SAMPLES = 32
-    MAX_EPOCHS = 5000  # More epochs since past dropout makes it harder
+    MAX_EPOCHS = 5000
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
-    PAST_DROPOUT = 0.3  # NEW: 50% chance to drop past motion during training
+    PAST_DROPOUT = 0.3
+    
+    # LR Schedule config
+    USE_LR_SCHEDULE = True
+    LR_T0 = 500  # First restart period
     
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 70)
-    print(" FSW + CLIP + PAST DROPOUT OVERFITTING")
+    print(" ENHANCED FSW + CLIP TRAINING")
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  Samples: {NUM_SAMPLES}")
     print(f"  Epochs: {MAX_EPOCHS}")
-    print(f"  Use FSW: {USE_FSW}")
+    print(f"  Use FSW: {USE_FSW} (Enhanced Encoder)")
     print(f"  Past Dropout: {PAST_DROPOUT}")
+    print(f"  LR Schedule: CosineAnnealingWarmRestarts (T0={LR_T0})")
     print("=" * 70)
 
-    # Use ORIGINAL dataset (this is the key difference!)
-    print("\nLoading dataset (using original DynamicPosePredictionDataset)...")
+    # Load dataset
+    print("\nLoading dataset...")
     full_ds = DynamicPosePredictionDataset(
         data_dir=data_dir,
         csv_path=csv_path,
@@ -613,14 +751,12 @@ def train_overfit():
     
     print(f"Full dataset size: {len(full_ds)}")
     
-    # CACHE the samples to ensure we overfit to the SAME data each time!
-    # (DynamicPosePredictionDataset randomly samples time windows, so we need to fix them)
+    # Cache samples
     print("\nCaching fixed samples for overfitting...")
     cached_samples = []
     for i in range(NUM_SAMPLES):
         sample = full_ds[i]
         
-        # Extract tensors properly
         data = sample['data']
         if hasattr(data, 'zero_filled'):
             data = data.zero_filled()
@@ -633,7 +769,6 @@ def train_overfit():
         if hasattr(input_pose, 'tensor'):
             input_pose = input_pose.tensor
         
-        # Deep copy to prevent any mutation
         cached = {
             'data': data.clone().float(),
             'conditions': {
@@ -643,16 +778,18 @@ def train_overfit():
             'idx': i,
         }
         cached_samples.append(cached)
-        print(f"  Cached sample {i}: data shape {cached['data'].shape}, input shape {cached['conditions']['input_pose'].shape}")
     
-    # Check FSW for samples
-    print("\nChecking FSW for samples:")
+    print(f"  Cached {NUM_SAMPLES} samples")
+    
+    # Extract FSW strings
+    print("\nExtracting FSW strings...")
     fsw_strings_cache = []
     for i in range(NUM_SAMPLES):
         record = full_ds.records[i]
         fsw = get_fsw_from_record(record)
         fsw_strings_cache.append(fsw)
-        print(f"  [{i}] FSW: {fsw[:60]}..." if len(fsw) > 60 else f"  [{i}] FSW: {fsw}")
+        if i < 5:
+            print(f"  [{i}] FSW: {fsw[:50]}..." if len(fsw) > 50 else f"  [{i}] FSW: {fsw}")
 
     # Get dimensions
     sample = full_ds[0]["data"]
@@ -664,11 +801,11 @@ def train_overfit():
     num_dims = sample.shape[-1]
     future_len = sample.shape[0]
     
-    print(f"\nDimensions: J={num_joints}, D={num_dims}, T={future_len}")
+    print(f"\nDimensions: J={num_joints}, D={num_dims}, T_future={future_len}")
 
-    # Model
-    print("\nInitializing model...")
-    lit_model = LitDiffusionWithFSW(
+    # Initialize model
+    print("\nInitializing enhanced model...")
+    lit_model = LitDiffusionEnhanced(
         num_keypoints=num_joints,
         num_dims=num_dims,
         stats_path=stats_path,
@@ -680,7 +817,7 @@ def train_overfit():
         t_future=future_len,
         freeze_clip=False,
         use_fsw=USE_FSW,
-        past_dropout=PAST_DROPOUT,  # NEW
+        past_dropout=PAST_DROPOUT,
     )
 
     total_params = sum(p.numel() for p in lit_model.parameters())
@@ -688,42 +825,54 @@ def train_overfit():
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
 
-    # Custom training loop to pass FSW strings
+    # Training
     print(f"\n{'='*70}")
     print("STARTING TRAINING...")
     print("="*70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
     lit_model = lit_model.to(device)
     
     optimizer = torch.optim.AdamW(lit_model.parameters(), lr=LEARNING_RATE)
     
+    # LR Scheduler
+    if USE_LR_SCHEDULE:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=LR_T0, T_mult=2, eta_min=1e-6
+        )
+    
     # Training loop
+    best_loss = float('inf')
     for epoch in range(MAX_EPOCHS):
         lit_model.train()
         
-        # Use CACHED samples (not re-sampling from dataset!)
         batch = simple_collate(cached_samples)
         
-        # Move to device
         batch["data"] = batch["data"].to(device)
         batch["conditions"]["input_pose"] = batch["conditions"]["input_pose"].to(device)
         batch["conditions"]["sign_image"] = batch["conditions"]["sign_image"].to(device)
         
-        # Set FSW strings
         lit_model.current_fsw_strings = fsw_strings_cache
         
-        # Forward
         optimizer.zero_grad()
         loss = lit_model.training_step(batch, 0)
         
-        # Backward
         loss.backward()
         torch.nn.utils.clip_grad_norm_(lit_model.parameters(), 1.0)
         optimizer.step()
         
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch}/{MAX_EPOCHS}")
+        if USE_LR_SCHEDULE:
+            scheduler.step()
+        
+        # Save best
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            torch.save(lit_model.state_dict(), f"{out_dir}/best_model.pt")
+        
+        if epoch % 500 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch}/{MAX_EPOCHS}, LR: {current_lr:.2e}, Best Loss: {best_loss:.4f}")
 
     print(f"\n{'='*70}")
     print("TRAINING COMPLETE!")
@@ -735,7 +884,6 @@ def train_overfit():
     
     results = []
     for idx in range(NUM_SAMPLES):
-        # Use CACHED sample
         batch = simple_collate([cached_samples[idx]])
         
         cond = batch["conditions"]
@@ -752,7 +900,6 @@ def train_overfit():
         target_shape = (B, J, C, T_future)
         
         with torch.no_grad():
-            # Normal inference
             class _Wrapper(nn.Module):
                 def __init__(self, model, past, sign, fsw):
                     super().__init__()
@@ -760,6 +907,7 @@ def train_overfit():
                 def forward(self, x, t, **kwargs):
                     return self.model(x, t, self.past, self.sign, self.fsw)
             
+            # Normal
             wrapped = _Wrapper(lit_model.model, past_bjct, sign, [fsw_strings_cache[idx]])
             pred_bjct = lit_model.diffusion.p_sample_loop(
                 model=wrapped,
@@ -770,7 +918,7 @@ def train_overfit():
             )
             pred_norm = lit_model.bjct_to_btjc(pred_bjct)
             
-            # Sign-Only (drop past)
+            # Sign-Only
             zeros_past = torch.zeros_like(past_bjct)
             wrapped_so = _Wrapper(lit_model.model, zeros_past, sign, [fsw_strings_cache[idx]])
             pred_so_bjct = lit_model.diffusion.p_sample_loop(
@@ -816,15 +964,37 @@ def train_overfit():
     print(f"  Average Normal PCK@0.1: {avg_normal:.1f}%")
     print(f"  Average Sign-Only PCK@0.1: {avg_so:.1f}%")
     print(f"  Average Disp Ratio: {avg_ratio:.3f}")
-    print(f"  Gap: {avg_normal - avg_so:.1f}%")
+    print(f"  Gap (Normal - SignOnly): {avg_normal - avg_so:.1f}%")
+    print(f"  Ratio (SignOnly/Normal): {avg_so/avg_normal:.3f}")
     
-    # Save checkpoint
-    torch.save(lit_model.state_dict(), f"{out_dir}/model.pt")
-    print(f"\nModel saved to: {out_dir}/model.pt")
+    # Save final checkpoint
+    torch.save(lit_model.state_dict(), f"{out_dir}/final_model.pt")
+    print(f"\nModels saved to: {out_dir}/")
     
-    print("=" * 70)
+    # Save poses for visualization
+    print("\n" + "="*70)
+    print("SAVING POSES FOR VISUALIZATION...")
+    print("="*70)
+    
+    # Save for first 3 samples
+    for sample_idx in range(min(3, NUM_SAMPLES)):
+        print(f"\nSample {sample_idx}:")
+        save_pose_for_visualization(
+            lit_model, cached_samples, fsw_strings_cache, 
+            full_ds, f"{out_dir}/sample_{sample_idx}", device, sample_idx
+        )
+    
+    # Save results to CSV
+    import pandas as pd
+    df = pd.DataFrame(results)
+    df.to_csv(f"{out_dir}/results.csv", index=False)
+    print(f"\nResults saved to: {out_dir}/results.csv")
+    
+    print("\n" + "="*70)
+    print("ALL DONE!")
+    print("="*70)
 
 
 if __name__ == "__main__":
     os.chdir("/home/yayun/data/signwriting-animation-fork")
-    train_overfit()
+    train_enhanced()
