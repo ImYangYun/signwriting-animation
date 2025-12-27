@@ -582,7 +582,7 @@ def train_overfit():
     
 
     NUM_SAMPLES = 32
-    MAX_EPOCHS = 1000  # More epochs since past dropout makes it harder
+    MAX_EPOCHS = 5000  # More epochs since past dropout makes it harder
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
