@@ -585,7 +585,7 @@ def train_overfit():
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
     USE_FSW = True
-    PAST_DROPOUT = 0.5  # NEW: 50% chance to drop past motion during training
+    PAST_DROPOUT = 0.3  # NEW: 50% chance to drop past motion during training
     
     os.makedirs(out_dir, exist_ok=True)
 
