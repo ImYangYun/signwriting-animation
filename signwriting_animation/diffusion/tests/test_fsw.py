@@ -580,7 +580,8 @@ def train_overfit():
     stats_path = f"{data_dir}/mean_std_178_with_preprocess.pt"
     out_dir = "logs/fsw_past_dropout"  # NEW: better name
     
-    NUM_SAMPLES = 4
+    
+    NUM_SAMPLES = 32
     MAX_EPOCHS = 1000  # More epochs since past dropout makes it harder
     DIFFUSION_STEPS = 8
     LEARNING_RATE = 1e-4
