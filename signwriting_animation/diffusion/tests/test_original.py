@@ -1,18 +1,14 @@
 """
-Overfit Training: Unfrozen CLIP + Contrastive Learning (32 samples)
+Clean Overfit Test: Unfrozen CLIP, NO contrastive, fixed data
 
-This script trains on 32 samples to verify the model architecture works.
-Then saves pose files for visualization.
-
-Usage:
-    python train_overfit_unfrozen_clip.py
+目的：验证基础架构能否 overfit 32 个固定样本
 """
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 
 from pose_format import Pose
 from pose_format.numpy.pose_body import NumPyPoseBody
@@ -37,28 +33,39 @@ os.chdir("/home/yayun/data/signwriting-animation-fork")
 DATA_DIR = '/home/yayun/data/pose_data/'
 CSV_PATH = '/home/yayun/data/signwriting-animation/data_fixed.csv'
 STATS_PATH = f"{DATA_DIR}/mean_std_178_with_preprocess.pt"
-OUT_DIR = 'logs/overfit_unfrozen_clip_32s'
+OUT_DIR = 'logs/overfit_clean_32s'
 
 NUM_SAMPLES = 32
-MAX_EPOCHS = 2000
+MAX_EPOCHS = 3000
 DIFFUSION_STEPS = 8
 LEARNING_RATE = 1e-4
-CONTRASTIVE_WEIGHT = 0.5
-FREEZE_CLIP = False
 
 # ============================================================
-# Model Components
+# Fixed Dataset - 关键修改：预先缓存所有样本
+# ============================================================
+
+class FixedDataset(Dataset):
+    """预先缓存样本，确保训练和评估用完全相同的数据"""
+    def __init__(self, samples):
+        self.samples = samples
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+# ============================================================
+# Model Components (和之前一样)
 # ============================================================
 
 class EmbedSignWritingUnfrozen(nn.Module):
     def __init__(self, num_latent_dims: int, 
-                 embedding_arch: str = 'openai/clip-vit-base-patch32',
-                 freeze_clip: bool = False):
+                 embedding_arch: str = 'openai/clip-vit-base-patch32'):
         super().__init__()
         self.model = CLIPModel.from_pretrained(embedding_arch)
-        if freeze_clip:
-            for param in self.model.parameters():
-                param.requires_grad = False
+        # Unfrozen - 不冻结
         self.proj = None
         if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
             self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
@@ -96,15 +103,14 @@ class ContextEncoder(nn.Module):
 
 class SignWritingToPoseDiffusion(nn.Module):
     def __init__(self, num_keypoints: int, num_dims_per_keypoint: int,
-                 num_latent_dims: int = 256, num_heads: int = 4, dropout: float = 0.1,
-                 t_past: int = 40, t_future: int = 20, freeze_clip: bool = False):
+                 num_latent_dims: int = 256, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.num_dims_per_keypoint = num_dims_per_keypoint
         input_feats = num_keypoints * num_dims_per_keypoint
 
         self.past_context_encoder = ContextEncoder(input_feats, num_latent_dims)
-        self.embed_signwriting = EmbedSignWritingUnfrozen(num_latent_dims, freeze_clip=freeze_clip)
+        self.embed_signwriting = EmbedSignWritingUnfrozen(num_latent_dims)
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
         self.time_embed = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
 
@@ -223,99 +229,12 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
 
 
 # ============================================================
-# Training
+# Main
 # ============================================================
-
-class OverfitTrainer:
-    def __init__(self, model, diffusion, mean_pose, std_pose, device):
-        self.model = model
-        self.diffusion = diffusion
-        self.mean_pose = mean_pose
-        self.std_pose = std_pose
-        self.device = device
-    
-    def normalize(self, x):
-        return (x - self.mean_pose) / (self.std_pose + 1e-6)
-    
-    def unnormalize(self, x):
-        return x * self.std_pose + self.mean_pose
-    
-    @staticmethod
-    def btjc_to_bjct(x):
-        return x.permute(0, 2, 3, 1).contiguous()
-    
-    @staticmethod
-    def bjct_to_btjc(x):
-        return x.permute(0, 3, 1, 2).contiguous()
-    
-    def train_step(self, batch):
-        cond = batch["conditions"]
-        gt_btjc = sanitize_btjc(batch["data"]).to(self.device)
-        past_btjc = sanitize_btjc(cond["input_pose"]).to(self.device)
-        sign_img = cond["sign_image"].float().to(self.device)
-        
-        gt_norm = self.normalize(gt_btjc)
-        past_norm = self.normalize(past_btjc)
-        
-        B = gt_norm.shape[0]
-        gt_bjct = self.btjc_to_bjct(gt_norm)
-        past_bjct = self.btjc_to_bjct(past_norm)
-        
-        timestep = torch.randint(0, DIFFUSION_STEPS, (B,), device=self.device, dtype=torch.long)
-        noise = torch.randn_like(gt_bjct)
-        x_noisy = self.diffusion.q_sample(gt_bjct, timestep, noise=noise)
-        
-        pred_x0 = self.model(x_noisy, timestep, past_bjct, sign_img)
-        
-        # Losses
-        loss_mse = F.mse_loss(pred_x0, gt_bjct)
-        
-        pred_vel = pred_x0[..., 1:] - pred_x0[..., :-1]
-        gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
-        loss_vel = F.mse_loss(pred_vel, gt_vel)
-        
-        # Contrastive
-        loss_contrastive = torch.tensor(0.0, device=self.device)
-        if B > 1 and CONTRASTIVE_WEIGHT > 0:
-            sign_embs = self.model.embed_signwriting(sign_img)
-            sign_embs_norm = F.normalize(sign_embs, p=2, dim=-1)
-            cos_sim = torch.mm(sign_embs_norm, sign_embs_norm.t())
-            mask = ~torch.eye(B, dtype=torch.bool, device=self.device)
-            loss_contrastive = cos_sim[mask].mean()
-        
-        loss = loss_mse + loss_vel + CONTRASTIVE_WEIGHT * loss_contrastive
-        
-        # Disp ratio
-        with torch.no_grad():
-            disp_ratio = pred_vel.abs().mean().item() / (gt_vel.abs().mean().item() + 1e-8)
-        
-        return loss, loss_mse.item(), loss_vel.item(), disp_ratio
-    
-    @torch.no_grad()
-    def inference(self, past_btjc, sign_img, future_len=20):
-        past_norm = self.normalize(past_btjc)
-        past_bjct = self.btjc_to_bjct(past_norm)
-        B, J, C, _ = past_bjct.shape
-        
-        class Wrapper(nn.Module):
-            def __init__(self, m, p, s):
-                super().__init__()
-                self.m, self.p, self.s = m, p, s
-            def forward(self, x, t, **kw):
-                return self.m(x, t, self.p, self.s)
-        
-        wrapped = Wrapper(self.model, past_bjct, sign_img)
-        pred_bjct = self.diffusion.p_sample_loop(
-            wrapped, (B, J, C, future_len), clip_denoised=True,
-            model_kwargs={'y': {}}, progress=False
-        )
-        pred_norm = self.bjct_to_btjc(pred_bjct)
-        return self.unnormalize(pred_norm)
-
 
 def main():
     print("=" * 70)
-    print("OVERFIT TRAINING: Unfrozen CLIP + Contrastive (32 samples)")
+    print("CLEAN OVERFIT TEST: Unfrozen CLIP, NO contrastive, FIXED data")
     print("=" * 70)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -333,7 +252,8 @@ def main():
     )
     print(f"Full dataset: {len(full_ds)} samples")
     
-    # Select 32 unique samples (by pose file)
+    # === 关键：预先缓存固定样本 ===
+    print("\nCaching fixed samples...")
     seen_poses, train_indices = set(), []
     for idx in range(len(full_ds)):
         if len(train_indices) >= NUM_SAMPLES:
@@ -343,19 +263,26 @@ def main():
             seen_poses.add(pose_path)
             train_indices.append(idx)
     
-    print(f"Selected {len(train_indices)} unique samples")
+    # 缓存样本 - 每个样本只采样一次，之后固定
+    cached_samples = []
+    for idx in train_indices:
+        sample = full_ds[idx]  # 这里会触发 dynamic windowing，但只调用一次
+        cached_samples.append(sample)
+    
+    print(f"Cached {len(cached_samples)} fixed samples")
     print(f"Indices: {train_indices}")
     
-    # Save indices for reproducibility
+    # 保存 indices
     with open(f"{OUT_DIR}/train_indices.txt", "w") as f:
         for idx in train_indices:
             f.write(f"{idx}\n")
     
-    train_ds = Subset(full_ds, train_indices)
-    train_loader = DataLoader(train_ds, batch_size=NUM_SAMPLES, shuffle=True, collate_fn=zero_pad_collator)
+    # 使用固定数据集
+    fixed_ds = FixedDataset(cached_samples)
+    train_loader = DataLoader(fixed_ds, batch_size=NUM_SAMPLES, shuffle=True, collate_fn=zero_pad_collator)
     
     # Get dimensions
-    sample = full_ds[0]["data"]
+    sample = cached_samples[0]["data"]
     if hasattr(sample, 'zero_filled'):
         sample = sample.zero_filled()
     if hasattr(sample, 'tensor'):
@@ -375,8 +302,6 @@ def main():
     model = SignWritingToPoseDiffusion(
         num_keypoints=num_joints,
         num_dims_per_keypoint=num_dims,
-        t_past=40, t_future=future_len,
-        freeze_clip=FREEZE_CLIP,
     ).to(device)
     
     betas = cosine_beta_schedule(DIFFUSION_STEPS).numpy()
@@ -391,49 +316,104 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
     
-    trainer = OverfitTrainer(model, diffusion, mean_pose, std_pose, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    
+    # Normalize helper
+    def normalize(x):
+        return (x - mean_pose) / (std_pose + 1e-6)
+    
+    def unnormalize(x):
+        return x * std_pose + mean_pose
     
     # === Training ===
     print(f"\n{'='*70}")
-    print("TRAINING...")
+    print("TRAINING (no contrastive loss)...")
     print("=" * 70)
     
     best_loss = float('inf')
     for epoch in range(MAX_EPOCHS):
         model.train()
         for batch in train_loader:
+            cond = batch["conditions"]
+            gt_btjc = sanitize_btjc(batch["data"]).to(device)
+            past_btjc = sanitize_btjc(cond["input_pose"]).to(device)
+            sign_img = cond["sign_image"].float().to(device)
+            
+            gt_norm = normalize(gt_btjc)
+            past_norm = normalize(past_btjc)
+            
+            B = gt_norm.shape[0]
+            gt_bjct = gt_norm.permute(0, 2, 3, 1).contiguous()
+            past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
+            
+            timestep = torch.randint(0, DIFFUSION_STEPS, (B,), device=device, dtype=torch.long)
+            noise = torch.randn_like(gt_bjct)
+            x_noisy = diffusion.q_sample(gt_bjct, timestep, noise=noise)
+            
+            pred_x0 = model(x_noisy, timestep, past_bjct, sign_img)
+            
+            # Simple MSE + velocity loss, NO contrastive
+            loss_mse = F.mse_loss(pred_x0, gt_bjct)
+            
+            pred_vel = pred_x0[..., 1:] - pred_x0[..., :-1]
+            gt_vel = gt_bjct[..., 1:] - gt_bjct[..., :-1]
+            loss_vel = F.mse_loss(pred_vel, gt_vel)
+            
+            loss = loss_mse + loss_vel
+            
             optimizer.zero_grad()
-            loss, mse, vel, ratio = trainer.train_step(batch)
             loss.backward()
             optimizer.step()
+            
+            # Disp ratio for monitoring
+            with torch.no_grad():
+                disp_ratio = pred_vel.abs().mean().item() / (gt_vel.abs().mean().item() + 1e-8)
         
         if epoch % 500 == 0 or epoch == MAX_EPOCHS - 1:
-            print(f"[Epoch {epoch:5d}] loss={loss.item():.4f}, mse={mse:.4f}, vel={vel:.4f}, ratio={ratio:.3f}")
+            print(f"[Epoch {epoch:5d}] loss={loss.item():.6f}, mse={loss_mse.item():.6f}, vel={loss_vel.item():.6f}, ratio={disp_ratio:.3f}")
         
         if loss.item() < best_loss:
             best_loss = loss.item()
             torch.save(model.state_dict(), f"{OUT_DIR}/best_model.pt")
     
-    # Save final model
     torch.save(model.state_dict(), f"{OUT_DIR}/final_model.pt")
     print(f"\nModels saved to {OUT_DIR}/")
     
-    # === Evaluation ===
+    # === Evaluation on SAME fixed samples ===
     print(f"\n{'='*70}")
-    print("EVALUATION...")
+    print("EVALUATION (on same fixed samples)...")
     print("=" * 70)
     
     model.eval()
     results = []
     
-    for i, idx in enumerate(train_indices):
-        batch = zero_pad_collator([full_ds[idx]])
+    for i, sample in enumerate(cached_samples):
+        # 用完全相同的缓存样本
+        batch = zero_pad_collator([sample])
         past = sanitize_btjc(batch['conditions']['input_pose'][:1]).to(device)
         sign = batch['conditions']['sign_image'][:1].float().to(device)
         gt = sanitize_btjc(batch['data'][:1]).to(device)
         
-        pred = trainer.inference(past, sign, future_len)
+        # Inference
+        with torch.no_grad():
+            past_norm = normalize(past)
+            past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
+            B, J, C, _ = past_bjct.shape
+            
+            class Wrapper(nn.Module):
+                def __init__(self, m, p, s):
+                    super().__init__()
+                    self.m, self.p, self.s = m, p, s
+                def forward(self, x, t, **kw):
+                    return self.m(x, t, self.p, self.s)
+            
+            wrapped = Wrapper(model, past_bjct, sign)
+            pred_bjct = diffusion.p_sample_loop(
+                wrapped, (B, J, C, future_len), clip_denoised=True,
+                model_kwargs={'y': {}}, progress=False
+            )
+            pred_norm = pred_bjct.permute(0, 3, 1, 2).contiguous()
+            pred = unnormalize(pred_norm)
         
         # Metrics
         gt_disp = (gt[:, 1:] - gt[:, :-1]).abs().mean().item()
@@ -444,14 +424,14 @@ def main():
         per_joint_err = np.sqrt((diff ** 2).sum(-1))
         pck = (per_joint_err < 0.1).mean() * 100
         
-        results.append({'idx': idx, 'ratio': ratio, 'pck': pck})
+        results.append({'idx': train_indices[i], 'ratio': ratio, 'pck': pck})
         
-        if i < 10:  # Print first 10
-            print(f"  [{i}] idx={idx}: ratio={ratio:.2f}, PCK={pck:.1f}%")
+        if i < 10:
+            print(f"  [{i}] idx={train_indices[i]}: ratio={ratio:.2f}, PCK={pck:.1f}%")
         
         # Save pose files for first 5 samples
         if i < 5:
-            ref_path = full_ds.records[idx]['pose']
+            ref_path = full_ds.records[train_indices[i]]['pose']
             if not ref_path.startswith('/'):
                 ref_path = DATA_DIR + ref_path
             with open(ref_path, 'rb') as f:
@@ -463,9 +443,9 @@ def main():
             gt_pose = tensor_to_pose(gt, ref_pose.header, ref_pose)
             pred_pose = tensor_to_pose(pred, ref_pose.header, ref_pose)
             
-            with open(f'{OUT_DIR}/poses/sample{i}_idx{idx}_gt.pose', 'wb') as f:
+            with open(f'{OUT_DIR}/poses/sample{i}_idx{train_indices[i]}_gt.pose', 'wb') as f:
                 gt_pose.write(f)
-            with open(f'{OUT_DIR}/poses/sample{i}_idx{idx}_pred.pose', 'wb') as f:
+            with open(f'{OUT_DIR}/poses/sample{i}_idx{train_indices[i]}_pred.pose', 'wb') as f:
                 pred_pose.write(f)
     
     # Summary
