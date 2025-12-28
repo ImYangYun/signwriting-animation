@@ -1,7 +1,7 @@
 """
-Clean Overfit Test: Unfrozen CLIP, NO contrastive, fixed data
+Clean Overfit Test: FROZEN CLIP, NO contrastive, fixed data
 
-目的：验证基础架构能否 overfit 32 个固定样本
+目的：与 Unfrozen CLIP 对比，验证 freeze vs unfreeze 的影响
 """
 import os
 import torch
@@ -33,7 +33,7 @@ os.chdir("/home/yayun/data/signwriting-animation-fork")
 DATA_DIR = '/home/yayun/data/pose_data/'
 CSV_PATH = '/home/yayun/data/signwriting-animation/data_fixed.csv'
 STATS_PATH = f"{DATA_DIR}/mean_std_178_with_preprocess.pt"
-OUT_DIR = 'logs/overfit_clean_32s'
+OUT_DIR = 'logs/overfit_frozen_32s'  # 改了输出目录
 
 NUM_SAMPLES = 32
 MAX_EPOCHS = 3000
@@ -41,7 +41,7 @@ DIFFUSION_STEPS = 8
 LEARNING_RATE = 1e-4
 
 # ============================================================
-# Fixed Dataset - 关键修改：预先缓存所有样本
+# Fixed Dataset
 # ============================================================
 
 class FixedDataset(Dataset):
@@ -57,15 +57,20 @@ class FixedDataset(Dataset):
 
 
 # ============================================================
-# Model Components (和之前一样)
+# Model Components - FROZEN CLIP
 # ============================================================
 
-class EmbedSignWritingUnfrozen(nn.Module):
+class EmbedSignWritingFrozen(nn.Module):
+    """FROZEN CLIP - 不训练 CLIP 参数"""
     def __init__(self, num_latent_dims: int, 
                  embedding_arch: str = 'openai/clip-vit-base-patch32'):
         super().__init__()
         self.model = CLIPModel.from_pretrained(embedding_arch)
-        # Unfrozen - 不冻结
+        
+        # === 关键：冻结 CLIP 所有参数 ===
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
         self.proj = None
         if (num_embedding_dims := self.model.visual_projection.out_features) != num_latent_dims:
             self.proj = nn.Linear(num_embedding_dims, num_latent_dims)
@@ -110,7 +115,7 @@ class SignWritingToPoseDiffusion(nn.Module):
         input_feats = num_keypoints * num_dims_per_keypoint
 
         self.past_context_encoder = ContextEncoder(input_feats, num_latent_dims)
-        self.embed_signwriting = EmbedSignWritingUnfrozen(num_latent_dims)
+        self.embed_signwriting = EmbedSignWritingFrozen(num_latent_dims)  # 用 Frozen 版本
         self.sequence_pos_encoder = PositionalEncoding(num_latent_dims, dropout)
         self.time_embed = TimestepEmbedder(num_latent_dims, self.sequence_pos_encoder)
 
@@ -234,7 +239,7 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
 
 def main():
     print("=" * 70)
-    print("CLEAN OVERFIT TEST: Unfrozen CLIP, NO contrastive, FIXED data")
+    print("CLEAN OVERFIT TEST: FROZEN CLIP, NO contrastive, FIXED data")
     print("=" * 70)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -263,10 +268,10 @@ def main():
             seen_poses.add(pose_path)
             train_indices.append(idx)
     
-    # 缓存样本 - 每个样本只采样一次，之后固定
+    # 缓存样本
     cached_samples = []
     for idx in train_indices:
-        sample = full_ds[idx]  # 这里会触发 dynamic windowing，但只调用一次
+        sample = full_ds[idx]
         cached_samples.append(sample)
     
     print(f"Cached {len(cached_samples)} fixed samples")
@@ -298,7 +303,7 @@ def main():
     std_pose = stats["std"].float().view(1, 1, -1, 3).to(device)
     
     # === Create Model ===
-    print("\nCreating model...")
+    print("\nCreating model (FROZEN CLIP)...")
     model = SignWritingToPoseDiffusion(
         num_keypoints=num_joints,
         num_dims_per_keypoint=num_dims,
@@ -315,8 +320,9 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
+    print(f"  (CLIP is FROZEN, so trainable << total)")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE)
     
     # Normalize helper
     def normalize(x):
@@ -327,7 +333,7 @@ def main():
     
     # === Training ===
     print(f"\n{'='*70}")
-    print("TRAINING (no contrastive loss)...")
+    print("TRAINING (FROZEN CLIP, no contrastive loss)...")
     print("=" * 70)
     
     best_loss = float('inf')
@@ -352,7 +358,7 @@ def main():
             
             pred_x0 = model(x_noisy, timestep, past_bjct, sign_img)
             
-            # Simple MSE + velocity loss, NO contrastive
+            # Simple MSE + velocity loss
             loss_mse = F.mse_loss(pred_x0, gt_bjct)
             
             pred_vel = pred_x0[..., 1:] - pred_x0[..., :-1]
@@ -365,7 +371,6 @@ def main():
             loss.backward()
             optimizer.step()
             
-            # Disp ratio for monitoring
             with torch.no_grad():
                 disp_ratio = pred_vel.abs().mean().item() / (gt_vel.abs().mean().item() + 1e-8)
         
@@ -379,7 +384,7 @@ def main():
     torch.save(model.state_dict(), f"{OUT_DIR}/final_model.pt")
     print(f"\nModels saved to {OUT_DIR}/")
     
-    # === Evaluation on SAME fixed samples ===
+    # === Evaluation ===
     print(f"\n{'='*70}")
     print("EVALUATION (on same fixed samples)...")
     print("=" * 70)
@@ -388,13 +393,11 @@ def main():
     results = []
     
     for i, sample in enumerate(cached_samples):
-        # 用完全相同的缓存样本
         batch = zero_pad_collator([sample])
         past = sanitize_btjc(batch['conditions']['input_pose'][:1]).to(device)
         sign = batch['conditions']['sign_image'][:1].float().to(device)
         gt = sanitize_btjc(batch['data'][:1]).to(device)
         
-        # Inference
         with torch.no_grad():
             past_norm = normalize(past)
             past_bjct = past_norm.permute(0, 2, 3, 1).contiguous()
@@ -462,6 +465,7 @@ def main():
     
     # Save summary
     with open(f"{OUT_DIR}/results.txt", "w") as f:
+        f.write(f"Configuration: FROZEN CLIP, NO contrastive, 32 samples\n")
         f.write(f"Avg Ratio: {avg_ratio:.3f}\n")
         f.write(f"Avg PCK@0.1: {avg_pck:.1f}%\n")
         f.write(f"\nPer-sample results:\n")
