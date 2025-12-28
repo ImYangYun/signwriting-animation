@@ -40,7 +40,7 @@ STATS_PATH = f"{DATA_DIR}/mean_std_178_with_preprocess.pt"
 OUT_DIR = 'logs/overfit_unfrozen_clip_32s'
 
 NUM_SAMPLES = 32
-MAX_EPOCHS = 5000
+MAX_EPOCHS = 2000
 DIFFUSION_STEPS = 8
 LEARNING_RATE = 1e-4
 CONTRASTIVE_WEIGHT = 0.5
