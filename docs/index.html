@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Animating SignWriting - Supplementary Material</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #1e293b;
+            background: #f8fafc;
+        }
+        .container { max-width: 1000px; margin: 0 auto; padding: 2rem; }
+        header {
+            text-align: center;
+            padding: 2rem 0;
+            background: white;
+            border-bottom: 1px solid #e2e8f0;
+            margin-bottom: 2rem;
+        }
+        h1 { font-size: 1.8rem; margin-bottom: 0.5rem; color: #2563eb; }
+        .subtitle { color: #64748b; margin-bottom: 0.5rem; }
+        .links a {
+            display: inline-block;
+            padding: 0.4rem 0.8rem;
+            margin: 0.5rem 0.3rem;
+            background: #2563eb;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        section {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        h2 {
+            font-size: 1.2rem;
+            margin-bottom: 1rem;
+            color: #1e293b;
+            border-bottom: 2px solid #2563eb;
+            padding-bottom: 0.3rem;
+        }
+        .comparison-row {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 1rem 0;
+        }
+        .comparison-item {
+            text-align: center;
+            flex: 1;
+            min-width: 150px;
+            max-width: 250px;
+        }
+        .comparison-item img {
+            max-width: 100%;
+            border-radius: 4px;
+            border: 1px solid #e2e8f0;
+        }
+        .comparison-item p {
+            margin-top: 0.3rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+        .metrics {
+            text-align: center;
+            color: #64748b;
+            font-size: 0.8rem;
+            margin: 0.5rem 0;
+        }
+        footer {
+            text-align: center;
+            padding: 1.5rem;
+            color: #64748b;
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Animating SignWriting</h1>
+        <p class="subtitle">A Diffusion-based Approach to Pose Generation</p>
+        <p class="subtitle" style="font-size: 0.9rem;">Yang Yun · University of Zurich · Supervised by <a href="https://sign.mt" style="color:#2563eb;">Amit Moryossef</a></p>
+        <div class="links">
+            <a href="https://github.com/ImYangYun/signwriting-animation">Code</a>
+        </div>
+    </header>
+    
+    <div class="container">
+        <!-- Overfitting Validation -->
+        <section>
+            <h2>Architecture Validation (4-sample Overfitting)</h2>
+            <p style="margin-bottom:1rem;">Perfect reconstruction validates the model architecture.</p>
+            <div class="comparison-row">
+                <div class="comparison-item">
+                    <img src="videos/4sample_gt.gif" alt="Ground Truth">
+                    <p>Ground Truth</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/4sample_pred.gif" alt="Prediction">
+                    <p>Prediction</p>
+                </div>
+            </div>
+            <p class="metrics">PCK@0.1 = 100% | Displacement Ratio = 1.02</p>
+        </section>
+
+        <!-- Full Dataset -->
+        <section>
+            <h2>Full Dataset Results</h2>
+            <p style="margin-bottom:1rem;">Main model (Unfrozen CLIP + Contrastive) on full training data.</p>
+            <div class="comparison-row">
+                <div class="comparison-item">
+                    <img src="videos/idx3300_gt.gif" alt="Ground Truth">
+                    <p>Ground Truth</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/idx3300_pred.gif" alt="Prediction">
+                    <p>Prediction</p>
+                </div>
+            </div>
+            <p class="metrics">Sample idx=3300 | PCK@0.1 = 89% | Ratio = 0.93</p>
+        </section>
+
+        <!-- Sign-Only Comparison -->
+        <section>
+            <h2>Sign-Only Generation (Past Dropout)</h2>
+            <p style="margin-bottom:1rem;">Comparison of Normal (with past context) vs Sign-Only (SignWriting only) inference.</p>
+            
+            <p style="font-weight:500; margin:1rem 0 0.5rem;">Good Case: Sample 28 (Sign-Only PCK = 79.5%)</p>
+            <div class="comparison-row">
+                <div class="comparison-item">
+                    <img src="videos/fsw_s28_gt.gif" alt="GT">
+                    <p>Ground Truth</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_s28_normal.gif" alt="Normal">
+                    <p>Normal</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_s28_signonly.gif" alt="Sign-Only">
+                    <p>Sign-Only</p>
+                </div>
+            </div>
+            
+            <p style="font-weight:500; margin:1.5rem 0 0.5rem;">Challenging Case: Sample 26 (Sign-Only PCK = 10.8%)</p>
+            <div class="comparison-row">
+                <div class="comparison-item">
+                    <img src="videos/fsw_s26_gt.gif" alt="GT">
+                    <p>Ground Truth</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_s26_normal.gif" alt="Normal">
+                    <p>Normal</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_s26_signonly.gif" alt="Sign-Only">
+                    <p>Sign-Only</p>
+                </div>
+            </div>
+            <p class="metrics">FSW Encoder + Past Dropout (p=0.5) | 32 samples | Sign-Only Avg = 59.5%</p>
+        </section>
+
+        <!-- Citation -->
+        <section>
+            <h2>Citation</h2>
+            <pre style="background:#f8fafc; padding:0.8rem; border-radius:4px; font-size:0.8rem; overflow-x:auto;">
+@mastersthesis{yun2025signwriting,
+    title={Animating SignWriting: A Diffusion-based Approach to Pose Generation},
+    author={Yang Yun},
+    school={University of Zurich},
+    year={2025}
+}</pre>
+        </section>
+    </div>
+    
+    <footer>
+        <p>© 2025 Yang Yun · University of Zurich</p>
+    </footer>
+</body>
+</html>
