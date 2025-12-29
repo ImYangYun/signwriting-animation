@@ -4,14 +4,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import lightning as pl
+
+# Safe matplotlib import for headless environments
+HAS_MATPLOTLIB = False
+plt = None
 try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    plt = None
+except (ImportError, AttributeError):
+    pass
 
 from pose_evaluation.metrics.dtw_metric import DTWDTAIImplementationDistanceMeasure as PE_DTW
 from CAMDM.diffusion.gaussian_diffusion import (
@@ -196,6 +199,7 @@ class LitDiffusion(pl.LightningModule):
         acc_weight: Weight for acceleration loss term
         t_past: Number of past frames for conditioning
         t_future: Number of future frames to predict
+        freeze_clip: Whether to freeze CLIP parameters (default: True)
     """
 
     def __init__(
@@ -209,6 +213,7 @@ class LitDiffusion(pl.LightningModule):
         acc_weight: float = 0.5,
         t_past: int = 40,
         t_future: int = 20,
+        freeze_clip: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -230,6 +235,7 @@ class LitDiffusion(pl.LightningModule):
             num_dims_per_keypoint=num_dims,
             t_past=t_past,
             t_future=t_future,
+            freeze_clip=freeze_clip,
         )
 
         # Create Gaussian diffusion process with cosine schedule
@@ -414,6 +420,10 @@ class LitDiffusion(pl.LightningModule):
 
     def on_train_end(self):
         """Save training curves after training completes."""
+        if not HAS_MATPLOTLIB:
+            print("[WARN] matplotlib not available, skipping training curve plot")
+            return
+
         out_dir = "logs/diffusion"
         os.makedirs(out_dir, exist_ok=True)
 
