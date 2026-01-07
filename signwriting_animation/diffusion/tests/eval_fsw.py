@@ -33,7 +33,7 @@ from signwriting.formats.fsw_to_sign import fsw_to_sign
 from pose_format.numpy.pose_body import NumPyPoseBody
 
 
-def tensor_to_pose(t_btjc, header, ref_pose):
+def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     """Convert tensor to Pose object."""
     if t_btjc.dim() == 4:
         t = t_btjc[0]
@@ -45,7 +45,39 @@ def tensor_to_pose(t_btjc, header, ref_pose):
     conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
     body = NumPyPoseBody(fps=ref_pose.body.fps, data=arr, confidence=conf)
     pose_obj = Pose(header=header, body=body)
+    
+    # Fix hand positions (must be before scaling!)
     unshift_hands(pose_obj)
+    
+    if scale_to_ref:
+        # Get reference data
+        T_pred = t_np.shape[0]
+        T_ref_total = ref_pose.body.data.shape[0]
+        future_start = max(0, T_ref_total - T_pred)
+        ref_arr = np.asarray(
+            ref_pose.body.data[future_start:future_start+T_pred, 0], 
+            dtype=np.float32
+        )
+        
+        # Scale to reference variance
+        def _var(a):
+            center = a.mean(axis=(0, 1), keepdims=True)
+            return float(((a - center) ** 2).mean())
+        
+        pose_data = pose_obj.body.data[:, 0, :, :]
+        var_input = _var(pose_data)
+        var_ref = _var(ref_arr)
+        
+        if var_input > 1e-8:
+            scale = np.sqrt(var_ref / var_input)
+            pose_obj.body.data = pose_obj.body.data * scale
+        
+        # Align center
+        pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
+        input_center = pose_data.mean(axis=0)
+        ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
+        pose_obj.body.data = pose_obj.body.data + (ref_center - input_center)
+    
     return pose_obj
 
 
@@ -513,20 +545,27 @@ def evaluate():
             
             idx = best_sample_data["idx"]
             
-            # Save GT
-            gt_pose = tensor_to_pose(best_sample_data["gt"], ref_pose.header, ref_pose)
+            # Debug: print data ranges
+            gt_data = best_sample_data["gt"].numpy()
+            pred_data = best_sample_data["pred_normal"].numpy()
+            print(f"   DEBUG: GT shape={gt_data.shape}, range=[{gt_data.min():.4f}, {gt_data.max():.4f}]")
+            print(f"   DEBUG: Pred shape={pred_data.shape}, range=[{pred_data.min():.4f}, {pred_data.max():.4f}]")
+            print(f"   DEBUG: Ref pose shape={ref_pose.body.data.shape}")
+            
+            # Save GT (scale_to_ref=True to match training script)
+            gt_pose = tensor_to_pose(best_sample_data["gt"], ref_pose.header, ref_pose, scale_to_ref=True)
             gt_path = f"{OUT_DIR}/best_idx{idx}_gt.pose"
             with open(gt_path, "wb") as f:
                 gt_pose.write(f)
             
-            # Save Normal prediction
-            pred_normal_pose = tensor_to_pose(best_sample_data["pred_normal"], ref_pose.header, ref_pose)
+            # Save Normal prediction (scale_to_ref=True)
+            pred_normal_pose = tensor_to_pose(best_sample_data["pred_normal"], ref_pose.header, ref_pose, scale_to_ref=True)
             pred_normal_path = f"{OUT_DIR}/best_idx{idx}_pred_normal.pose"
             with open(pred_normal_path, "wb") as f:
                 pred_normal_pose.write(f)
             
-            # Save Sign-Only prediction
-            pred_signonly_pose = tensor_to_pose(best_sample_data["pred_signonly"], ref_pose.header, ref_pose)
+            # Save Sign-Only prediction (scale_to_ref=True)
+            pred_signonly_pose = tensor_to_pose(best_sample_data["pred_signonly"], ref_pose.header, ref_pose, scale_to_ref=True)
             pred_signonly_path = f"{OUT_DIR}/best_idx{idx}_pred_signonly.pose"
             with open(pred_signonly_path, "wb") as f:
                 pred_signonly_pose.write(f)
