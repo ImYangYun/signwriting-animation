@@ -29,6 +29,25 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting.formats.swu_to_fsw import swu2fsw
 from signwriting.formats.fsw_to_sign import fsw_to_sign
 
+# For saving poses
+from pose_format.numpy.pose_body import NumPyPoseBody
+
+
+def tensor_to_pose(t_btjc, header, ref_pose):
+    """Convert tensor to Pose object."""
+    if t_btjc.dim() == 4:
+        t = t_btjc[0]
+    else:
+        t = t_btjc
+    t_np = t.detach().cpu().numpy().astype(np.float32)
+    arr = t_np[:, None, :, :]  # [T, 1, J, C]
+    T = arr.shape[0]
+    conf = np.ones((T, 1, arr.shape[2]), dtype=np.float32)
+    body = NumPyPoseBody(fps=ref_pose.body.fps, data=arr, confidence=conf)
+    pose_obj = Pose(header=header, body=body)
+    unshift_hands(pose_obj)
+    return pose_obj
+
 
 # ============================================================
 # Config
@@ -305,6 +324,12 @@ class CachedDataset(Dataset):
 # Main Evaluation
 # ============================================================
 def evaluate():
+    # CRITICAL: Fix random seed to get same pivot as training
+    import random
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
     os.chdir("/home/yayun/data/signwriting-animation-fork")
     os.makedirs(OUT_DIR, exist_ok=True)
     
@@ -377,6 +402,10 @@ def evaluate():
     
     results_normal, results_signonly = [], []
     
+    # Track best sample for saving pose
+    best_signonly_pck = -1
+    best_sample_data = None
+    
     class ModelWrapper(nn.Module):
         def __init__(self, model, past, sign, fsw):
             super().__init__()
@@ -425,6 +454,19 @@ def evaluate():
             results_normal.append({"idx": meta["idx"], "pck": pck_normal, "ratio": ratio})
             results_signonly.append({"idx": meta["idx"], "pck": pck_signonly})
             
+            # Track best Sign-Only sample
+            if pck_signonly > best_signonly_pck:
+                best_signonly_pck = pck_signonly
+                best_sample_data = {
+                    "idx": meta["idx"],
+                    "pose_file": meta["pose_file"],
+                    "gt": gt.cpu(),
+                    "pred_normal": pred_normal.cpu(),
+                    "pred_signonly": pred_signonly.cpu(),
+                    "pck_normal": pck_normal,
+                    "pck_signonly": pck_signonly,
+                }
+            
             print(f"[{i+1}/{len(cached_ds)}] idx={meta['idx']}: Normal={pck_normal:.1f}%, Sign-Only={pck_signonly:.1f}%, Ratio={ratio:.2f}")
     
     # Summary
@@ -452,6 +494,48 @@ def evaluate():
     print("=" * 70)
     
     print(f"\n✅ Evaluation complete! Results saved to: {OUT_DIR}/")
+    
+    # Save best sample poses
+    if best_sample_data is not None:
+        print(f"\n📁 Saving best sample poses (idx={best_sample_data['idx']}, Sign-Only={best_sample_data['pck_signonly']:.1f}%)...")
+        
+        # Load reference pose for header
+        pose_file = best_sample_data["pose_file"]
+        if not pose_file.startswith("/"):
+            pose_file = DATA_DIR + pose_file
+        
+        try:
+            with open(pose_file, "rb") as f:
+                ref_pose = Pose.read(f)
+            ref_pose = reduce_holistic(ref_pose)
+            if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+                ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+            
+            idx = best_sample_data["idx"]
+            
+            # Save GT
+            gt_pose = tensor_to_pose(best_sample_data["gt"], ref_pose.header, ref_pose)
+            gt_path = f"{OUT_DIR}/best_idx{idx}_gt.pose"
+            with open(gt_path, "wb") as f:
+                gt_pose.write(f)
+            
+            # Save Normal prediction
+            pred_normal_pose = tensor_to_pose(best_sample_data["pred_normal"], ref_pose.header, ref_pose)
+            pred_normal_path = f"{OUT_DIR}/best_idx{idx}_pred_normal.pose"
+            with open(pred_normal_path, "wb") as f:
+                pred_normal_pose.write(f)
+            
+            # Save Sign-Only prediction
+            pred_signonly_pose = tensor_to_pose(best_sample_data["pred_signonly"], ref_pose.header, ref_pose)
+            pred_signonly_path = f"{OUT_DIR}/best_idx{idx}_pred_signonly.pose"
+            with open(pred_signonly_path, "wb") as f:
+                pred_signonly_pose.write(f)
+            
+            print(f"   ✅ Saved: {gt_path}")
+            print(f"   ✅ Saved: {pred_normal_path}")
+            print(f"   ✅ Saved: {pred_signonly_path}")
+        except Exception as e:
+            print(f"   ❌ Failed to save poses: {e}")
 
 
 if __name__ == "__main__":
