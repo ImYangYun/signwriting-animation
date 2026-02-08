@@ -45,7 +45,7 @@ OUT_DIR = "logs/fsw_full_32sample_eval_v2"
 
 # ---- NEW: Save config ----
 SAVE_TOP_N = 5              # Save top N pose sets (prioritize both_ok + high PCK)
-HAND_STD_THRESHOLD = 0.02    # Left/right hand std below this = collapsed
+HAND_STD_THRESHOLD = 0.5    # Left/right hand std below this = collapsed
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
@@ -572,69 +572,83 @@ def evaluate():
     print(f"SAVE CANDIDATES (top {SAVE_TOP_N}, sorted by both_ok + Sign-Only PCK)")
     print("=" * 70)
     
-    # Sort: both_ok first, then by sign-only PCK descending
-    save_candidates.sort(key=lambda x: (-x["hand_info"]["both_ok"], -x["pck_signonly"]))
-    
-    both_ok_count = sum(1 for c in save_candidates if c["hand_info"]["both_ok"])
-    print(f"  Total samples:    {len(save_candidates)}")
-    print(f"  Both hands OK:    {both_ok_count}")
-    print(f"  Hand issues:      {len(save_candidates) - both_ok_count}")
-    print(f"  Will save top:    {SAVE_TOP_N}")
-    
-    print(f"\n{'Rank':<5} {'idx':<6} {'Normal':>7} {'SignOnly':>9} {'Ratio':>6} {'LH_std':>7} {'RH_std':>7} {'Hands':<18} {'Saved':<6}")
-    print("-" * 80)
-    
-    saved_count = 0
-    for rank, cand in enumerate(save_candidates):
-        idx = cand["idx"]
-        hi = cand["hand_info"]
+    try:
+        # Sort: both_ok first, then by sign-only PCK descending
+        save_candidates.sort(key=lambda x: (-(1 if x["hand_info"]["both_ok"] else 0), -x["pck_signonly"]))
         
-        hand_tag = "✅ BOTH_OK" if hi["both_ok"] else ("⚠️ LH_BAD" if not hi["left_ok"] else "⚠️ RH_BAD")
+        both_ok_count = sum(1 for c in save_candidates if c["hand_info"]["both_ok"])
+        print(f"  Total samples:    {len(save_candidates)}")
+        print(f"  Both hands OK:    {both_ok_count}")
+        print(f"  Hand issues:      {len(save_candidates) - both_ok_count}")
+        print(f"  Will save top:    {SAVE_TOP_N}")
         
-        # Only save top SAVE_TOP_N
-        saved = False
-        if saved_count < SAVE_TOP_N:
-            pose_file = cand["pose_file"]
-            if not pose_file.startswith("/"):
-                pose_file = DATA_DIR + pose_file
+        print(f"\n{'Rank':<5} {'idx':<6} {'Normal':>7} {'SignOnly':>9} {'Ratio':>6} {'LH_std':>7} {'RH_std':>7} {'Hands':<18} {'Saved':<6}")
+        print("-" * 80)
+        
+        saved_count = 0
+        for rank, cand in enumerate(save_candidates):
+            idx = cand["idx"]
+            hi = cand["hand_info"]
             
-            try:
-                with open(pose_file, "rb") as f:
-                    ref_pose = Pose.read(f)
-                ref_pose = reduce_holistic(ref_pose)
-                if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
-                    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+            if hi["both_ok"]:
+                hand_tag = "BOTH_OK"
+            elif not hi["left_ok"]:
+                hand_tag = "LH_BAD"
+            else:
+                hand_tag = "RH_BAD"
+            
+            # Only save top SAVE_TOP_N
+            saved = False
+            if saved_count < SAVE_TOP_N:
+                pose_file = cand["pose_file"]
+                if not pose_file.startswith("/"):
+                    pose_file = DATA_DIR + pose_file
                 
-                for label, tensor_data in [("gt", cand["gt"]), ("pred_normal", cand["pred_normal"]), ("pred_signonly", cand["pred_signonly"])]:
-                    pose_obj = tensor_to_pose(tensor_data, ref_pose.header, ref_pose, scale_to_ref=True)
-                    out_path = f"{OUT_DIR}/idx{idx}_{label}.pose"
-                    with open(out_path, "wb") as f:
-                        pose_obj.write(f)
-                
-                saved = True
-                saved_count += 1
-            except Exception as e:
-                print(f"  ❌ Failed to save idx={idx}: {e}")
+                try:
+                    with open(pose_file, "rb") as f:
+                        ref_pose = Pose.read(f)
+                    ref_pose = reduce_holistic(ref_pose)
+                    comp_names = [comp.name for comp in ref_pose.header.components]
+                    if "POSE_WORLD_LANDMARKS" in comp_names:
+                        ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+                    
+                    for label, tensor_data in [("gt", cand["gt"]), ("pred_normal", cand["pred_normal"]), ("pred_signonly", cand["pred_signonly"])]:
+                        pose_obj = tensor_to_pose(tensor_data, ref_pose.header, ref_pose, scale_to_ref=True)
+                        out_path = f"{OUT_DIR}/idx{idx}_{label}.pose"
+                        with open(out_path, "wb") as f:
+                            pose_obj.write(f)
+                    
+                    saved = True
+                    saved_count += 1
+                except Exception as e:
+                    import traceback
+                    print(f"  ❌ Failed to save idx={idx}: {e}")
+                    traceback.print_exc()
+            
+            print(f"{rank+1:<5} {idx:<6} {cand['pck_normal']:6.1f}% {cand['pck_signonly']:8.1f}% {cand['ratio']:5.2f} {hi['left_std']:7.2f} {hi['right_std']:7.2f} {hand_tag:<18} {'YES' if saved else '-'}")
         
-        print(f"{rank+1:<5} {idx:<6} {cand['pck_normal']:6.1f}% {cand['pck_signonly']:8.1f}% {cand['ratio']:5.2f} {hi['left_std']:7.2f} {hi['right_std']:7.2f} {hand_tag:<18} {'✅' if saved else '❌'}")
+        print(f"\n  Saved {saved_count}/{SAVE_TOP_N} sets of pose files to: {OUT_DIR}/")
+        print(f"  Each set: idx{{N}}_gt.pose, idx{{N}}_pred_normal.pose, idx{{N}}_pred_signonly.pose")
+        
+        # Recommend best sample for demo
+        best_demo = None
+        for cand in save_candidates:
+            if cand["hand_info"]["both_ok"]:
+                best_demo = cand
+                break
+        
+        if best_demo:
+            print(f"\n  RECOMMENDED FOR DEMO: idx={best_demo['idx']}")
+            print(f"  Normal={best_demo['pck_normal']:.1f}%, Sign-Only={best_demo['pck_signonly']:.1f}%")
+            print(f"  Both hands OK (LH={best_demo['hand_info']['left_std']:.2f}, RH={best_demo['hand_info']['right_std']:.2f})")
+        else:
+            print(f"\n  No candidate with both hands OK found.")
+            print(f"  Consider using overfitting experiment samples instead.")
     
-    print(f"\n✅ Saved {saved_count}/{SAVE_TOP_N} sets of pose files to: {OUT_DIR}/")
-    print(f"   Each set contains: idx{{N}}_gt.pose, idx{{N}}_pred_normal.pose, idx{{N}}_pred_signonly.pose")
-    
-    # ---- NEW: Recommend best sample for demo ----
-    best_demo = None
-    for cand in save_candidates:
-        if cand["hand_info"]["both_ok"]:
-            best_demo = cand
-            break
-    
-    if best_demo:
-        print(f"\n🏆 RECOMMENDED FOR DEMO: idx={best_demo['idx']}")
-        print(f"   Normal={best_demo['pck_normal']:.1f}%, Sign-Only={best_demo['pck_signonly']:.1f}%")
-        print(f"   Both hands OK (LH={best_demo['hand_info']['left_std']:.2f}, RH={best_demo['hand_info']['right_std']:.2f})")
-    else:
-        print(f"\n⚠️  No candidate with both hands OK found above threshold.")
-        print(f"   Consider using overfitting experiment samples instead.")
+    except Exception as e:
+        import traceback
+        print(f"\n❌ SAVE SECTION CRASHED: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
