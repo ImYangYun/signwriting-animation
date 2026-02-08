@@ -1,10 +1,13 @@
 """
-Evaluate FSW Full Model on 32 Fixed Samples
+Evaluate FSW Full Model on 32 Fixed Samples (v2)
 
-Compare with overfitting results to show generalization gap.
+Changes from v1:
+- Save ALL samples with Sign-Only PCK > threshold
+- Check left/right hand quality (detect collapsed joints)
+- Print hand quality report for each sample
 
 Usage:
-    python eval_fsw_full_32sample.py
+    python eval_fsw_full_32sample_v2.py
 """
 import os
 import torch
@@ -29,8 +32,20 @@ from signwriting_animation.data.data_loader import DynamicPosePredictionDataset
 from signwriting.formats.swu_to_fsw import swu2fsw
 from signwriting.formats.fsw_to_sign import fsw_to_sign
 
-# For saving poses
-from pose_format.numpy.pose_body import NumPyPoseBody
+
+# ============================================================
+# Config
+# ============================================================
+NUM_SAMPLES = 32
+DATA_DIR = "/home/yayun/data/pose_data/"
+CSV_PATH = "/home/yayun/data/signwriting-animation/data_fixed.csv"
+STATS_PATH = f"{DATA_DIR}/mean_std_178_with_preprocess.pt"
+MODEL_PATH = "logs/fsw_full_p30/final_model.pt"
+OUT_DIR = "logs/fsw_full_32sample_eval_v2"
+
+# ---- NEW: Save config ----
+SAVE_TOP_N = 5              # Save top N pose sets (prioritize both_ok + high PCK)
+HAND_STD_THRESHOLD = 0.5    # Left/right hand std below this = collapsed
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
@@ -50,7 +65,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
     unshift_hands(pose_obj)
     
     if scale_to_ref:
-        # Get reference data
         T_pred = t_np.shape[0]
         T_ref_total = ref_pose.body.data.shape[0]
         future_start = max(0, T_ref_total - T_pred)
@@ -59,7 +73,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
             dtype=np.float32
         )
         
-        # Scale to reference variance
         def _var(a):
             center = a.mean(axis=(0, 1), keepdims=True)
             return float(((a - center) ** 2).mean())
@@ -72,7 +85,6 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
             scale = np.sqrt(var_ref / var_input)
             pose_obj.body.data = pose_obj.body.data * scale
         
-        # Align center
         pose_data = pose_obj.body.data[:, 0, :, :].reshape(-1, 3)
         input_center = pose_data.mean(axis=0)
         ref_center = ref_arr.reshape(-1, 3).mean(axis=0)
@@ -82,14 +94,28 @@ def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
 
 
 # ============================================================
-# Config
+# NEW: Hand quality check
 # ============================================================
-NUM_SAMPLES = 32
-DATA_DIR = "/home/yayun/data/pose_data/"
-CSV_PATH = "/home/yayun/data/signwriting-animation/data_fixed.csv"
-STATS_PATH = f"{DATA_DIR}/mean_std_178_with_preprocess.pt"
-MODEL_PATH = "logs/fsw_full_p30/final_model.pt"
-OUT_DIR = "logs/fsw_full_32sample_eval"
+def check_hand_quality(gt_np, threshold=HAND_STD_THRESHOLD):
+    """
+    Check if left/right hand joints are collapsed.
+    gt_np: (T, J, C) numpy array
+    Returns: dict with left_ok, right_ok, left_std, right_std
+    """
+    left_hand = gt_np[:, 136:157, :2]   # (T, 21, 2)
+    right_hand = gt_np[:, 157:178, :2]  # (T, 21, 2)
+    
+    # Per-frame std of joint positions, averaged across frames
+    left_std = left_hand.std(axis=1).mean()
+    right_std = right_hand.std(axis=1).mean()
+    
+    return {
+        "left_ok": left_std > threshold,
+        "right_ok": right_std > threshold,
+        "left_std": float(left_std),
+        "right_std": float(right_std),
+        "both_ok": left_std > threshold and right_std > threshold,
+    }
 
 
 # ============================================================
@@ -356,7 +382,6 @@ class CachedDataset(Dataset):
 # Main Evaluation
 # ============================================================
 def evaluate():
-    # CRITICAL: Fix random seed to get same pivot as training
     import random
     random.seed(42)
     np.random.seed(42)
@@ -366,7 +391,9 @@ def evaluate():
     os.makedirs(OUT_DIR, exist_ok=True)
     
     print("=" * 70)
-    print(f" EVALUATING FSW FULL MODEL ON {NUM_SAMPLES} FIXED SAMPLES")
+    print(f" EVALUATING FSW FULL MODEL ON {NUM_SAMPLES} FIXED SAMPLES (v2)")
+    print(f" Save top {SAVE_TOP_N} candidates (prioritizing both hands OK)")
+    print(f" Hand collapse threshold: std < {HAND_STD_THRESHOLD}")
     print("=" * 70)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -379,7 +406,6 @@ def evaluate():
         num_past_frames=40, num_future_frames=20, with_metadata=True, split="train",
     )
     
-    # Select same 32 samples as overfitting experiments
     seen_poses, selected_indices = set(), []
     for idx in range(len(base_ds)):
         if len(selected_indices) >= NUM_SAMPLES: break
@@ -409,8 +435,6 @@ def evaluate():
     
     state_dict = torch.load(MODEL_PATH, map_location=device)
     if 'model_state_dict' in state_dict: state_dict = state_dict['model_state_dict']
-    
-    # Remove 'model.' prefix if present
     new_state_dict = {(k[6:] if k.startswith('model.') else k): v for k, v in state_dict.items()}
     model.load_state_dict(new_state_dict, strict=False)
     model.eval()
@@ -434,9 +458,8 @@ def evaluate():
     
     results_normal, results_signonly = [], []
     
-    # Track best sample for saving pose
-    best_signonly_pck = -1
-    best_sample_data = None
+    # ---- NEW: Collect candidates for saving ----
+    save_candidates = []
     
     class ModelWrapper(nn.Module):
         def __init__(self, model, past, sign, fsw):
@@ -471,7 +494,9 @@ def evaluate():
             pred_signonly = unnormalize(bjct_to_btjc(pred_bjct_signonly))
             
             # Compute metrics
-            gt_np, pred_normal_np, pred_signonly_np = gt.cpu().numpy()[0], pred_normal.cpu().numpy()[0], pred_signonly.cpu().numpy()[0]
+            gt_np = gt.cpu().numpy()[0]
+            pred_normal_np = pred_normal.cpu().numpy()[0]
+            pred_signonly_np = pred_signonly.cpu().numpy()[0]
             
             err_normal = np.sqrt(((pred_normal_np - gt_np) ** 2).sum(-1))
             err_signonly = np.sqrt(((pred_signonly_np - gt_np) ** 2).sum(-1))
@@ -483,23 +508,38 @@ def evaluate():
             pred_disp = np.abs(np.diff(pred_normal_np, axis=0)).mean()
             ratio = pred_disp / (gt_disp + 1e-8)
             
+            # ---- NEW: Hand quality check ----
+            hand_info = check_hand_quality(gt_np)
+            hand_tag = ""
+            if hand_info["both_ok"]:
+                hand_tag = "✅ BOTH_OK"
+            elif hand_info["left_ok"]:
+                hand_tag = "⚠️  RIGHT_COLLAPSED"
+            elif hand_info["right_ok"]:
+                hand_tag = "⚠️  LEFT_COLLAPSED"
+            else:
+                hand_tag = "❌ BOTH_COLLAPSED"
+            
             results_normal.append({"idx": meta["idx"], "pck": pck_normal, "ratio": ratio})
             results_signonly.append({"idx": meta["idx"], "pck": pck_signonly})
             
-            # Track best Sign-Only sample
-            if pck_signonly > best_signonly_pck:
-                best_signonly_pck = pck_signonly
-                best_sample_data = {
-                    "idx": meta["idx"],
-                    "pose_file": meta["pose_file"],
-                    "gt": gt.cpu(),
-                    "pred_normal": pred_normal.cpu(),
-                    "pred_signonly": pred_signonly.cpu(),
-                    "pck_normal": pck_normal,
-                    "pck_signonly": pck_signonly,
-                }
+            print(f"[{i+1}/{len(cached_ds)}] idx={meta['idx']:>5d}: "
+                  f"Normal={pck_normal:5.1f}%, Sign-Only={pck_signonly:5.1f}%, Ratio={ratio:.2f}  "
+                  f"LH_std={hand_info['left_std']:.2f} RH_std={hand_info['right_std']:.2f}  {hand_tag}")
             
-            print(f"[{i+1}/{len(cached_ds)}] idx={meta['idx']}: Normal={pck_normal:.1f}%, Sign-Only={pck_signonly:.1f}%, Ratio={ratio:.2f}")
+            # ---- NEW: Collect ALL candidates (will sort & trim later) ----
+            save_candidates.append({
+                "sample_i": i,
+                "idx": meta["idx"],
+                "pose_file": meta["pose_file"],
+                "gt": gt.cpu(),
+                "pred_normal": pred_normal.cpu(),
+                "pred_signonly": pred_signonly.cpu(),
+                "pck_normal": pck_normal,
+                "pck_signonly": pck_signonly,
+                "ratio": ratio,
+                "hand_info": hand_info,
+            })
     
     # Summary
     avg_normal = np.mean([r["pck"] for r in results_normal])
@@ -525,56 +565,76 @@ def evaluate():
     print(f"{'FSW Full (p0.3, on same 32s)':<35} {f'{avg_normal:.1f}%':<12} {f'{avg_signonly:.1f}%':<12} {f'{avg_normal-avg_signonly:.1f}%':<10}")
     print("=" * 70)
     
-    print(f"\n✅ Evaluation complete! Results saved to: {OUT_DIR}/")
+    # ============================================================
+    # NEW: Save candidates report & pose files
+    # ============================================================
+    print("\n" + "=" * 70)
+    print(f"SAVE CANDIDATES (top {SAVE_TOP_N}, sorted by both_ok + Sign-Only PCK)")
+    print("=" * 70)
     
-    # Save best sample poses
-    if best_sample_data is not None:
-        print(f"\n📁 Saving best sample poses (idx={best_sample_data['idx']}, Sign-Only={best_sample_data['pck_signonly']:.1f}%)...")
+    # Sort: both_ok first, then by sign-only PCK descending
+    save_candidates.sort(key=lambda x: (-x["hand_info"]["both_ok"], -x["pck_signonly"]))
+    
+    both_ok_count = sum(1 for c in save_candidates if c["hand_info"]["both_ok"])
+    print(f"  Total samples:    {len(save_candidates)}")
+    print(f"  Both hands OK:    {both_ok_count}")
+    print(f"  Hand issues:      {len(save_candidates) - both_ok_count}")
+    print(f"  Will save top:    {SAVE_TOP_N}")
+    
+    print(f"\n{'Rank':<5} {'idx':<6} {'Normal':>7} {'SignOnly':>9} {'Ratio':>6} {'LH_std':>7} {'RH_std':>7} {'Hands':<18} {'Saved':<6}")
+    print("-" * 80)
+    
+    saved_count = 0
+    for rank, cand in enumerate(save_candidates):
+        idx = cand["idx"]
+        hi = cand["hand_info"]
         
-        # Load reference pose for header
-        pose_file = best_sample_data["pose_file"]
-        if not pose_file.startswith("/"):
-            pose_file = DATA_DIR + pose_file
+        hand_tag = "✅ BOTH_OK" if hi["both_ok"] else ("⚠️ LH_BAD" if not hi["left_ok"] else "⚠️ RH_BAD")
         
-        try:
-            with open(pose_file, "rb") as f:
-                ref_pose = Pose.read(f)
-            ref_pose = reduce_holistic(ref_pose)
-            if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
-                ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+        # Only save top SAVE_TOP_N
+        saved = False
+        if saved_count < SAVE_TOP_N:
+            pose_file = cand["pose_file"]
+            if not pose_file.startswith("/"):
+                pose_file = DATA_DIR + pose_file
             
-            idx = best_sample_data["idx"]
-            
-            # Debug: print data ranges
-            gt_data = best_sample_data["gt"].numpy()
-            pred_data = best_sample_data["pred_normal"].numpy()
-            print(f"   DEBUG: GT shape={gt_data.shape}, range=[{gt_data.min():.4f}, {gt_data.max():.4f}]")
-            print(f"   DEBUG: Pred shape={pred_data.shape}, range=[{pred_data.min():.4f}, {pred_data.max():.4f}]")
-            print(f"   DEBUG: Ref pose shape={ref_pose.body.data.shape}")
-            
-            # Save GT (scale_to_ref=True to match training script)
-            gt_pose = tensor_to_pose(best_sample_data["gt"], ref_pose.header, ref_pose, scale_to_ref=True)
-            gt_path = f"{OUT_DIR}/best_idx{idx}_gt.pose"
-            with open(gt_path, "wb") as f:
-                gt_pose.write(f)
-            
-            # Save Normal prediction (scale_to_ref=True)
-            pred_normal_pose = tensor_to_pose(best_sample_data["pred_normal"], ref_pose.header, ref_pose, scale_to_ref=True)
-            pred_normal_path = f"{OUT_DIR}/best_idx{idx}_pred_normal.pose"
-            with open(pred_normal_path, "wb") as f:
-                pred_normal_pose.write(f)
-            
-            # Save Sign-Only prediction (scale_to_ref=True)
-            pred_signonly_pose = tensor_to_pose(best_sample_data["pred_signonly"], ref_pose.header, ref_pose, scale_to_ref=True)
-            pred_signonly_path = f"{OUT_DIR}/best_idx{idx}_pred_signonly.pose"
-            with open(pred_signonly_path, "wb") as f:
-                pred_signonly_pose.write(f)
-            
-            print(f"   ✅ Saved: {gt_path}")
-            print(f"   ✅ Saved: {pred_normal_path}")
-            print(f"   ✅ Saved: {pred_signonly_path}")
-        except Exception as e:
-            print(f"   ❌ Failed to save poses: {e}")
+            try:
+                with open(pose_file, "rb") as f:
+                    ref_pose = Pose.read(f)
+                ref_pose = reduce_holistic(ref_pose)
+                if "POSE_WORLD_LANDMARKS" in [c.name for c in ref_pose.header.components]:
+                    ref_pose = ref_pose.remove_components(["POSE_WORLD_LANDMARKS"])
+                
+                for label, tensor_data in [("gt", cand["gt"]), ("pred_normal", cand["pred_normal"]), ("pred_signonly", cand["pred_signonly"])]:
+                    pose_obj = tensor_to_pose(tensor_data, ref_pose.header, ref_pose, scale_to_ref=True)
+                    out_path = f"{OUT_DIR}/idx{idx}_{label}.pose"
+                    with open(out_path, "wb") as f:
+                        pose_obj.write(f)
+                
+                saved = True
+                saved_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed to save idx={idx}: {e}")
+        
+        print(f"{rank+1:<5} {idx:<6} {cand['pck_normal']:6.1f}% {cand['pck_signonly']:8.1f}% {cand['ratio']:5.2f} {hi['left_std']:7.2f} {hi['right_std']:7.2f} {hand_tag:<18} {'✅' if saved else '❌'}")
+    
+    print(f"\n✅ Saved {saved_count}/{SAVE_TOP_N} sets of pose files to: {OUT_DIR}/")
+    print(f"   Each set contains: idx{{N}}_gt.pose, idx{{N}}_pred_normal.pose, idx{{N}}_pred_signonly.pose")
+    
+    # ---- NEW: Recommend best sample for demo ----
+    best_demo = None
+    for cand in save_candidates:
+        if cand["hand_info"]["both_ok"]:
+            best_demo = cand
+            break
+    
+    if best_demo:
+        print(f"\n🏆 RECOMMENDED FOR DEMO: idx={best_demo['idx']}")
+        print(f"   Normal={best_demo['pck_normal']:.1f}%, Sign-Only={best_demo['pck_signonly']:.1f}%")
+        print(f"   Both hands OK (LH={best_demo['hand_info']['left_std']:.2f}, RH={best_demo['hand_info']['right_std']:.2f})")
+    else:
+        print(f"\n⚠️  No candidate with both hands OK found above threshold.")
+        print(f"   Consider using overfitting experiment samples instead.")
 
 
 if __name__ == "__main__":
