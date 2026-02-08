@@ -45,7 +45,7 @@ OUT_DIR = "logs/fsw_full_32sample_eval_v2"
 
 # ---- NEW: Save config ----
 SAVE_TOP_N = 5              # Save top N pose sets (prioritize both_ok + high PCK)
-HAND_STD_THRESHOLD = 0.5    # Left/right hand std below this = collapsed
+HAND_STD_THRESHOLD = 0.02    # Left/right hand std below this = collapsed
 
 
 def tensor_to_pose(t_btjc, header, ref_pose, scale_to_ref=True):
