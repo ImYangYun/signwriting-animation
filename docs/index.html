@@ -75,6 +75,52 @@
             font-size: 0.8rem;
             margin: 0.5rem 0;
         }
+        /* New styles for FSW Full Dataset section */
+        .obs-box {
+            background: #eff6ff;
+            border-left: 3px solid #2563eb;
+            padding: 0.8rem 1rem;
+            margin: 1rem 0;
+            font-size: 0.85rem;
+            border-radius: 0 4px 4px 0;
+            color: #1e40af;
+        }
+        .metrics-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+            margin: 0.8rem 0;
+        }
+        .metrics-table th, .metrics-table td {
+            padding: 0.5rem 0.8rem;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .metrics-table th {
+            background: #f1f5f9;
+            font-weight: 600;
+            font-size: 0.8rem;
+        }
+        .metrics-table td.num { text-align: right; }
+        .comparison-wide {
+            margin: 1rem 0;
+            text-align: center;
+        }
+        .comparison-wide img {
+            max-width: 100%;
+            border-radius: 4px;
+            border: 1px solid #e2e8f0;
+        }
+        .tag {
+            display: inline-block;
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-weight: 500;
+            margin-left: 6px;
+        }
+        .tag-blue { background: #eff6ff; color: #2563eb; }
+        .tag-green { background: #f0fdf4; color: #16a34a; }
         footer {
             text-align: center;
             padding: 1.5rem;
@@ -89,7 +135,7 @@
         <p class="subtitle">A Diffusion-based Approach to Pose Generation</p>
         <p class="subtitle" style="font-size: 0.9rem;">Yang Yun · University of Zurich · Supervised by <a href="https://scholar.google.com/citations?user=Aaj_RBEAAAAJ" style="color:#2563eb;">Amit Moryossef</a></p>
         <div class="links">
-            <a href="https://github.com/ImYangYun/signwriting-animation" >Code</a>
+            <a href="https://github.com/ImYangYun/signwriting-animation">Code</a>
         </div>
     </header>
     
@@ -167,11 +213,80 @@
             <p class="metrics">FSW Encoder + Past Dropout (p=0.5) | 32 samples | Sign-Only Avg = 59.5%</p>
         </section>
 
+        <!-- ============================================================ -->
+        <!-- NEW: FSW Full Dataset Results -->
+        <!-- ============================================================ -->
+        <section>
+            <h2>FSW Full Dataset Results (Enhanced FSW Encoder)</h2>
+            <p style="margin-bottom:1rem;">
+                Enhanced FSW Encoder + Past Dropout (p=0.3) trained on ~101k SignBank-Plus samples.
+                Evaluated on 32 fixed samples comparing Normal (with past motion) vs Sign-Only (past motion zeroed).
+            </p>
+
+            <table class="metrics-table">
+                <tr>
+                    <th>Setting</th>
+                    <th class="num">Normal PCK@0.1</th>
+                    <th class="num">Sign-Only PCK@0.1</th>
+                    <th class="num">Gap</th>
+                </tr>
+                <tr>
+                    <td>32-sample Overfit (p=0.5)</td>
+                    <td class="num">76.2%</td>
+                    <td class="num">59.5%</td>
+                    <td class="num">16.7%</td>
+                </tr>
+                <tr>
+                    <td><strong>Full Dataset (p=0.3)</strong></td>
+                    <td class="num"><strong>75.9%</strong></td>
+                    <td class="num"><strong>41.4%</strong></td>
+                    <td class="num"><strong>34.5%</strong></td>
+                </tr>
+            </table>
+
+            <div class="obs-box">
+                Full dataset training maintains Normal PCK (75.9% ≈ 76.2%) while Sign-Only drops to 41.4%.
+                The model relies more on past motion context when learning from diverse data.
+            </div>
+
+            <p style="font-weight:500; margin:1.5rem 0 0.5rem;">
+                Demo: idx=2142
+                <span class="tag tag-green">Both hands intact</span>
+                <span class="tag tag-blue">Normal PCK: 86.4%</span>
+                <span class="tag tag-blue">Sign-Only PCK: 76.3%</span>
+            </p>
+            <div class="comparison-row">
+                <div class="comparison-item">
+                    <img src="videos/fsw_full_gt.gif" alt="Ground Truth">
+                    <p>Ground Truth</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_full_normal.gif" alt="Normal prediction">
+                    <p>Normal (w/ past)</p>
+                </div>
+                <div class="comparison-item">
+                    <img src="videos/fsw_full_signonly.gif" alt="Sign-Only prediction">
+                    <p>Sign-Only (no past)</p>
+                </div>
+            </div>
+
+            <p style="font-weight:500; margin:1.5rem 0 0.5rem;">Side-by-Side Comparison</p>
+            <div class="comparison-wide">
+                <img src="videos/fsw_full_comparison.gif" alt="Three-way comparison: GT vs Normal vs Sign-Only">
+            </div>
+
+            <div class="obs-box">
+                <strong>Right hand</strong>: Normal displacement ratio = 1.03× GT, Sign-Only = 1.12× GT — sign information effectively guides the dominant hand.<br>
+                <strong>Left hand</strong>: Normal = 1.35× GT (reasonable), Sign-Only = 9.79× GT — without past context, the non-dominant hand shows ~10× over-motion.
+            </div>
+
+            <p class="metrics">FSW Enhanced Encoder + Past Dropout (p=0.3) | ~101k samples | idx=2142</p>
+        </section>
+
         <!-- Citation -->
         <section>
             <h2>Citation</h2>
-            <pre style="background:#f8fafc; padding:0.8rem; border-radius:4px; font-size:0.8rem; overflow-x:auto;">
-@mastersthesis{yun2025signwriting,
+            <pre style="background:#f8fafc; padding:0.8rem; border-radius:4px; font-size:0.8rem; overflow-x:auto;">@mastersthesis{yun2025signwriting,
     title={Animating SignWriting: A Diffusion-based Approach to Pose Generation},
     author={Yang Yun},
     school={University of Zurich},
@@ -183,5 +298,6 @@
     <footer>
         <p>© 2025 Yang Yun · University of Zurich</p>
     </footer>
+
 </body>
 </html>
